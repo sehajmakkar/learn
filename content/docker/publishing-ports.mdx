@@ -1,0 +1,131 @@
+export const meta = {
+  summary: "How a request on your machine reaches a process inside a container, the three ways to write -p, and the bind-address bug everyone hits once.",
+  uses: ["01.03", "02.01"],
+  usedIn: ["05.01", "05.04"],
+};
+
+<BeforeYouStart>
+  You know each container has its own network namespace (<L id="01.03" />) and that `EXPOSE` doesn't publish anything
+  (<L id="02.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+A container has its own network stack, so a server listening on port 3000 inside it is listening on the
+**container's** port 3000, not your machine's. **Publishing** a port (`-p`) tells Docker to forward traffic from a port
+on the host to a port in the container.
+
+<Anatomy
+  title="Reading -p"
+  parts={[
+    { text: "-p " },
+    { text: "127.0.0.1", label: "host address (optional)" },
+    { text: ":" },
+    { text: "8080", label: "host port" },
+    { text: ":" },
+    { text: "3000", label: "container port" },
+  ]}
+  caption="Host side first, container side last. Leave out the address and Docker listens on every interface."
+/>
+
+## Three ways to publish
+
+<Terminal>{`
+$ docker run -d --name p1 -p 8080:3000 notes-api
+$ docker run -d --name p2 -p 127.0.0.1:8081:3000 notes-api
+$ docker run -d --name p3 -P notes-api
+$ docker ps --format 'table {{.Names}}\\t{{.Ports}}'
+NAMES   PORTS
+p3      0.0.0.0:55000->3000/tcp
+p2      127.0.0.1:8081->3000/tcp
+p1      0.0.0.0:8080->3000/tcp, [::]:8080->3000/tcp
+`}</Terminal>
+
+- **`-p 8080:3000`** listens on every interface of your machine, so anything that can reach your machine can reach
+  the app. Convenient, and often more open than you meant.
+- **`-p 127.0.0.1:8081:3000`** listens only on localhost. Use this for databases and admin tools on a laptop or server.
+- **`-P`** publishes every `EXPOSE`d port to a random high port. `docker port p3` tells you which.
+
+`docker port NAME` lists a container's mappings at any time.
+
+<Aside title="Linux servers and firewalls">
+  On Linux, Docker publishes ports by writing its own firewall rules, which take effect before rules from tools like
+  `ufw`. So `-p 5432:5432` on a server can expose Postgres to the internet even when `ufw` says the port is closed. Bind
+  to `127.0.0.1`, or don't publish ports that only other containers need; containers on the same network can reach
+  each other without `-p` at all (<L id="05.02" />).
+</Aside>
+
+## The bind-address bug
+
+Here's a server that listens on `127.0.0.1` inside its container:
+
+<Terminal>{`
+$ docker run -d --name loopy -p 8085:3000 node:22-slim \\
+    node -e 'require("http").createServer((q,s)=>s.end("hi")).listen(3000,"127.0.0.1")'
+$ curl localhost:8085
+curl: (56) Recv failure: Connection reset by peer
+$ docker exec loopy node -e 'fetch("http://127.0.0.1:3000").then(r=>r.text()).then(console.log)'
+hi
+`}</Terminal>
+
+It works from inside and fails from outside. `127.0.0.1` inside the container is the **container's** loopback, which
+forwarded traffic never arrives on. Docker delivers published traffic to the container's network interface, so the app
+must listen on `0.0.0.0` (all interfaces). The notes API does this by not passing an address to `listen`.
+
+Many frameworks default to `127.0.0.1` in development mode, which is why this bites so often: Vite needs `--host`,
+Flask needs `--host=0.0.0.0`, Rails needs `-b 0.0.0.0`.
+
+<Quiz
+  question="You run -p 8080:3000. Inside the container the app logs 'listening on http://localhost:3000'. curl localhost:8080 gets 'connection reset'. What's the fix?"
+  options={[
+    { text: "Add EXPOSE 3000 to the Dockerfile", why: "EXPOSE is documentation. It doesn't change where the app listens." },
+    { text: "Make the app listen on 0.0.0.0 instead of localhost", correct: true, why: "localhost inside the container is the container's own loopback. Published traffic arrives on the container's network interface, so the app has to listen on all interfaces." },
+    { text: "Swap to -p 3000:8080", why: "That would forward to container port 8080, where nothing is listening." },
+    { text: "Use --network host", why: "That works around it on Linux by dropping network isolation, but it doesn't fix the app, and behaves differently on Docker Desktop." },
+  ]}
+/>
+
+<Checkpoint
+  title="Publish three ways"
+  solution={<p><code>port is already allocated</code>: another container or program has that host port. <code>docker ps</code> shows which container; <code>lsof -i :8080</code> shows any program.</p>}
+>
+  <p>Run the notes API three times with the three forms above. Hit each with <code>curl</code>. Then reproduce the bind-address bug with the one-liner and fix it by changing <code>"127.0.0.1"</code> to <code>"0.0.0.0"</code>.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Reversing the order.** It's always host first: `-p HOST:CONTAINER`.</li>
+    <li>**Publishing databases on all interfaces.** Use `127.0.0.1:` or a private network.</li>
+    <li>**Apps listening on localhost inside the container.** They must listen on `0.0.0.0`.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`-p HOST:CONTAINER` forwards a host port into the container.</li>
+    <li>Add `127.0.0.1:` to keep it local; `-P` picks random ports.</li>
+    <li>The app must listen on `0.0.0.0`, not `127.0.0.1`.</li>
+    <li>On Linux, published ports can bypass `ufw`.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Your container is running and the port is published, but you can't reach the app from the host. How do you debug it?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Debugging" }}
+  followUps={["How would you check what address the app is listening on?"]}
+>
+  <p>Check `docker ps` or `docker port` to confirm the mapping and that the host and container ports aren't reversed. Check `docker logs` that the app started and which port it reports. Then test from inside: `docker exec` a request to the container port. If it works inside but not outside, the app is almost certainly bound to 127.0.0.1 instead of 0.0.0.0. If it fails inside too, the app isn't listening on that port at all.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "What's the difference between EXPOSE and -p?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+>
+  <p>`EXPOSE` is metadata in the image documenting which ports the app listens on; it doesn't make anything reachable. `-p` (publish) at run time actually creates the forwarding from a host port to a container port. `-P` publishes all exposed ports to random host ports, which is the one place `EXPOSE` has an effect.</p>
+</InterviewCard>

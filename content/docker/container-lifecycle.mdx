@@ -1,0 +1,142 @@
+export const meta = {
+  summary: "Created, running, paused, exited: what each state means, which command moves a container between them, and what the exit code is telling you.",
+  uses: ["01.03", "01.06"],
+  usedIn: ["03.05", "03.07"],
+};
+
+<BeforeYouStart>
+  You know `run`, `start` and `exec` (<L id="01.06" />) and why PID 1 has to handle signals (<L id="01.03" />).
+</BeforeYouStart>
+
+## The core idea
+
+A container is always in one of a few states, and every lifecycle command moves it from one to another. Knowing the
+states, and what a stopped container's exit code means, is most of what you need to debug "why isn't my container
+running?"
+
+<Flow
+  title="The lifecycle"
+  steps={[
+    { label: "Created", detail: "docker create: filesystem and config exist, no process yet." },
+    { label: "Running", detail: "docker start: the main process is up. docker pause freezes it." },
+    { label: "Exited", detail: "The main process ended, or docker stop / kill ended it. Files remain." },
+    { label: "Removed", detail: "docker rm: the container and its writable layer are gone." },
+  ]}
+  caption="docker run is just create + start. A running container can also be Paused, and a crashing one can be Restarting."
+/>
+
+## Walk through it
+
+<Terminal>{`
+$ docker create --name life nginx:alpine
+$ docker ps -a --filter name=life --format '{{.Names}} {{.Status}}'
+life Created
+$ docker start life
+life Up Less than a second
+$ docker pause life
+life Up Less than a second (Paused)
+$ docker unpause life
+$ docker stop life
+life Exited (0) Less than a second ago
+$ docker rm life
+`}</Terminal>
+
+(Each status line is the same `docker ps -a` command, run after the step above it.)
+
+`docker pause` freezes every process in the container using the cgroup freezer: they stop getting CPU time but keep
+their memory. It's rarely what you want in production, but useful to know it exists.
+
+## Stopping: polite, then forceful
+
+There are two ways to end a container:
+
+- **`docker stop`** sends `SIGTERM` (or the image's `STOPSIGNAL`), waits for the stop timeout, then sends `SIGKILL`.
+- **`docker kill`** sends `SIGKILL` immediately. No cleanup, no flushing.
+
+The stop timeout is 10 seconds by default on Docker Engine. Check what a container uses with
+`docker inspect -f '{{.Config.StopTimeout}}' NAME`, and override it per command with `docker stop -t 30` or per container
+with `docker run --stop-timeout 30`.
+
+What happens next depends on whether PID 1 handles the signal. `sleep` doesn't:
+
+<Terminal>{`
+$ docker run -d --name sleeper alpine sleep 1000
+$ docker stop -t 10 sleeper              # waits the full 10s
+$ docker inspect -f '{{.State.ExitCode}}' sleeper
+137
+$ docker run -d --init --name sleeper2 alpine sleep 1000
+$ docker stop sleeper2                   # returns immediately
+$ docker inspect -f '{{.State.ExitCode}}' sleeper2
+143
+`}</Terminal>
+
+Without `--init`, `sleep` is PID 1 and ignores `SIGTERM`, so Docker waits out the timeout and kills it. With `--init`, a
+tiny init process is PID 1; it forwards `SIGTERM` to `sleep`, which dies from it straight away.
+
+## Reading exit codes
+
+| Code | Usually means |
+| --- | --- |
+| `0` | the process finished normally |
+| `1` (or any small number) | the app exited with an error; check `docker logs` |
+| `125` | `docker run` itself failed (bad flag, name taken) |
+| `126` / `127` | the command couldn't run / wasn't found in the image |
+| `137` | killed with `SIGKILL` (128 + 9): `docker kill`, a stop timeout, or the OOM killer |
+| `143` | ended by `SIGTERM` (128 + 15) without handling it more gracefully |
+
+For `137`, `docker inspect -f '{{.State.OOMKilled}}'` tells you whether memory was the reason (<L id="03.06" />).
+
+<Quiz
+  question="A container shows Exited (137). OOMKilled is false. What's the most likely explanation?"
+  options={[
+    { text: "The app crashed with an error", why: "App errors usually exit with a small code like 1. 137 means a signal killed it." },
+    { text: "It was sent SIGKILL: docker kill, or docker stop after the app ignored SIGTERM", correct: true, why: "137 is 128 + 9. With OOMKilled false, the kernel didn't kill it for memory, so something sent SIGKILL, most often a stop that timed out." },
+    { text: "The image's CMD wasn't found", why: "That gives 127." },
+    { text: "It finished successfully", why: "Success is 0." },
+  ]}
+/>
+
+<Checkpoint
+  title="Make a container exit every way"
+  solution={<p>If <code>docker stop</code> on the notes API gives 137 instead of 0, the app didn't get <code>SIGTERM</code>: check the <code>CMD</code> is the exec form.</p>}
+>
+  <p>Produce each of these and confirm the code with <code>docker inspect -f '&#123;&#123;.State.ExitCode&#125;&#125;'</code>: 0 (<code>alpine true</code>), 1 (<code>alpine false</code>), 127 (<code>alpine nosuchcommand</code>), 137 (<code>docker kill</code> on nginx). Then stop the notes API and check it exits with 0, because it handles <code>SIGTERM</code> itself.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Using `docker kill` as a habit.** Databases and queues lose in-flight work. Use `stop`, and fix apps that don't shut down.</li>
+    <li>**Leaving exited containers around.** They hold disk and names. Use `--rm` for one-off runs.</li>
+    <li>**Reading 137 as "crash".** It means a signal killed it. Find out who sent it.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>States: created → running (↔ paused) → exited → removed.</li>
+    <li>`stop` = SIGTERM, wait, SIGKILL. `kill` = SIGKILL now.</li>
+    <li>Exit 137 = SIGKILL, 143 = SIGTERM, 127 = command not found.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between docker stop and docker kill?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What exit code would you expect from each?"]}
+>
+  <p>`docker stop` asks the main process to exit by sending SIGTERM (or the image's STOPSIGNAL), waits for the stop timeout (10 seconds by default on Docker Engine), and only then sends SIGKILL. `docker kill` sends SIGKILL (or a signal you choose) immediately, giving the app no chance to clean up.</p>
+  <p>A well-behaved app exits 0 on stop. A SIGKILL shows up as 137; an unhandled SIGTERM as 143.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "A container keeps exiting with code 137. How do you find out why?", level: "Mid", frequency: 2, importance: "Must-know", kind: "Debugging" }}
+>
+  <p>137 means SIGKILL. Check `docker inspect` for `State.OOMKilled`: if true, it hit its memory limit, so look at usage and limits. If false, something sent SIGKILL: a `docker kill`, an orchestrator, or a `docker stop` that timed out because the app ignored SIGTERM, which shows up as slow stops. Check `docker events` around the time and the app's shutdown handling.</p>
+</InterviewCard>

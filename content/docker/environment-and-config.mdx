@@ -1,0 +1,137 @@
+export const meta = {
+  summary: "Build one image and run it anywhere by moving configuration into environment variables, and learn where those variables leak.",
+  uses: ["02.01"],
+  usedIn: ["03.07", "06.04", "07.02"],
+};
+
+<BeforeYouStart>
+  You've built the notes API image (<L id="02.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+The same image should run in development, staging and production. What changes between them (database address,
+log level, feature limits) is **configuration**, and the standard way to hand it to a container is environment
+variables. Build once, configure at run time.
+
+## Setting variables
+
+<Terminal>{`
+$ docker run --rm -e GREETING=hi alpine env
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+GREETING=hi
+HOME=/root
+...
+`}</Terminal>
+
+Four ways in, from least to most specific:
+
+| Where | Example | Notes |
+| --- | --- | --- |
+| `ENV` in the Dockerfile | `ENV NODE_ENV=production` | a default baked into the image |
+| `--env-file` | `--env-file app.env` | one `KEY=value` per line; `#` lines are comments |
+| `-e KEY=value` | `-e LOG_LEVEL=debug` | wins over `ENV` and the env file |
+| `-e KEY` | `-e PORT` | copies `PORT` from your shell; if it isn't set there, nothing is passed |
+
+Run-time values override image defaults:
+
+<Terminal>{`
+$ docker run --rm notes-api node -e 'console.log(process.env.NODE_ENV)'
+production
+$ docker run --rm -e NODE_ENV=development notes-api node -e 'console.log(process.env.NODE_ENV)'
+development
+`}</Terminal>
+
+## Making the notes API configurable
+
+The notes API now reads two settings, with defaults, and **refuses to start** if one is invalid:
+
+<Code lang="ts" file="src/server.ts">{`
+function intFromEnv(name: string, fallback: number) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    console.error(\`config error: \${name} must be a positive integer, got "\${raw}"\`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const port = intFromEnv("PORT", 3000);
+const maxNoteLength = intFromEnv("MAX_NOTE_LENGTH", 280);
+`}</Code>
+
+<Terminal>{`
+$ docker run --name bad -e MAX_NOTE_LENGTH=lots notes-api
+config error: MAX_NOTE_LENGTH must be a positive integer, got "lots"
+$ echo $?
+1
+`}</Terminal>
+
+Failing fast matters more in containers than anywhere else: a restart policy or orchestrator will notice the exit
+immediately, while a service that starts with bad config and limps along can go unnoticed for days.
+
+## Where environment variables leak
+
+Environment variables are convenient, not secret. Anyone who can talk to the Docker daemon can read them:
+
+<Terminal>{`
+$ docker run -d --name envy --env-file app.env alpine sleep 100
+$ docker inspect -f '{{json .Config.Env}}' envy
+["DB_HOST=db","DB_PASSWORD=s3cret","PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+`}</Terminal>
+
+They also end up in crash reports, debug pages and child processes. And `ENV` or `ARG` with a secret in a Dockerfile is
+worse: it's saved in the image itself. For real secrets, use mounted secret files and build secrets
+(<L id="07.02" />).
+
+<Quiz
+  question="The image has ENV LOG_LEVEL=info. You run docker run --env-file prod.env -e LOG_LEVEL=debug, and prod.env contains LOG_LEVEL=warn. What does the app see?"
+  options={[
+    { text: "info, from the image", why: "Image ENV values are only defaults; anything passed at run time overrides them." },
+    { text: "warn, from the env file", why: "The env file overrides the image, but -e on the command line is more specific still." },
+    { text: "debug, from -e", correct: true, why: "Explicit -e flags win over --env-file, which wins over the image's ENV defaults." },
+    { text: "All three, comma-separated", why: "A variable has one value; the most specific source wins." },
+  ]}
+/>
+
+<Checkpoint
+  title="Configure without rebuilding"
+  solution={<p>If the limit doesn't change, check you rebuilt the image after pulling the new <code>server.ts</code>; the startup log line should say <code>(max note length 50)</code>.</p>}
+>
+  <p>Run the notes API with <code>-e MAX_NOTE_LENGTH=50</code> and post a 60-character note: you should get a 400. Then put <code>MAX_NOTE_LENGTH=500</code> in a file and run with <code>--env-file</code>. Finally pass an invalid value and confirm the container exits with code 1.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Baking environment-specific values into the image.** Then you need a separate image per environment.</li>
+    <li>**Putting secrets in `ENV` or `ARG`.** They're stored in the image's history and config.</li>
+    <li>**Committing `.env` files.** Add them to `.gitignore` and `.dockerignore`.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>One image, many environments: configuration comes in at run time.</li>
+    <li>Precedence: `-e` beats `--env-file` beats `ENV`.</li>
+    <li>Validate config at startup and exit non-zero if it's wrong.</li>
+    <li>Env vars are visible to anyone with Docker access. They're not for secrets.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How should a containerised app get its configuration?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["Where would you put secrets instead?", "What should the app do with invalid config?"]}
+>
+  <p>From the environment at run time, so the same image is promoted unchanged from staging to production: the twelve-factor approach. Non-sensitive settings go in environment variables with sensible defaults in code or `ENV`; the app validates them at startup and exits non-zero if they're invalid.</p>
+  <p>Secrets shouldn't be plain env vars where avoidable, because they're visible via `docker inspect`, logs and child processes. Mount them as files from a secret store or the orchestrator's secrets feature instead.</p>
+</InterviewCard>

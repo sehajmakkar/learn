@@ -1,0 +1,135 @@
+export const meta = {
+  summary: "Give each container a budget so one runaway process can't take down everything else on the machine, and make sure your app knows about the budget.",
+  uses: ["01.03", "03.01"],
+  usedIn: ["06.02", "07.07"],
+};
+
+<BeforeYouStart>
+  You know cgroups enforce limits (<L id="01.03" />) and what exit code 137 means (<L id="03.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+Without limits, a container can use all of the host's memory and CPU. One leaking process then slows or kills
+everything else on the server. Limits are set per container with `docker run` flags, and the kernel enforces them
+through cgroups. The two that matter most behave very differently: **memory is a hard wall, CPU is a throttle**.
+
+## Memory: a hard wall
+
+<Terminal>{`
+$ docker run --name hog --memory 32m node:22-slim node -e 'const a=[];while(true)a.push(Buffer.alloc(1e6,1))'
+$ docker inspect -f '{{.State.Status}} {{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}' hog
+exited 137 OOMKilled=true
+`}</Terminal>
+
+At the limit, the kernel can't give out more memory, so its OOM killer ends a process in the container. There's no
+slowing down first.
+
+| Flag | Means |
+| --- | --- |
+| `--memory 512m` | hard limit on RAM |
+| `--memory-swap 512m` | RAM + swap combined; set it equal to `--memory` to allow no swap |
+| `--memory-reservation 256m` | a soft target the kernel pushes towards when the host is short on memory |
+
+## CPU: a throttle
+
+<Terminal>{`
+$ docker run -d --name burner --cpus 0.5 node:22-slim node -e 'for(;;){}'
+$ docker stats --no-stream burner --format 'table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}'
+NAME      CPU %     MEM USAGE / LIMIT
+burner    50.53%    7.484MiB / 7.653GiB
+`}</Terminal>
+
+An infinite loop would happily use a whole core. With `--cpus 0.5` it gets half of one, and is simply made to wait
+for the rest. Nothing is killed; the app just runs slower.
+
+| Flag | Means |
+| --- | --- |
+| `--cpus 1.5` | at most one and a half cores' worth of CPU time |
+| `--cpu-shares 512` | relative weight when CPUs are contended (default 1024); no effect when the host is idle |
+| `--cpuset-cpus 0,1` | pin to specific cores |
+
+Note the memory column: with no `--memory`, the limit shown is everything Docker has, here the Docker Desktop VM's
+7.65 GiB.
+
+## Processes: a fork-bomb guard
+
+<Terminal>{`
+$ docker run --rm --pids-limit 20 alpine sh -c 'for i in $(seq 1 30); do sleep 5 & done; wait'
+sh: can't fork: Resource temporarily unavailable
+`}</Terminal>
+
+`--pids-limit` caps how many processes and threads a container can create.
+
+## Does your app know about the limit?
+
+A limit only helps if the runtime inside respects it. Node sizes its heap from available memory, and recent versions
+read the cgroup limit:
+
+<Terminal>{`
+$ docker run --rm node:22-slim node -e 'console.log(Math.round(require("v8").getHeapStatistics().heap_size_limit/1048576))'
+2096
+$ docker run --rm --memory 512m node:22-slim node -e 'console.log(Math.round(require("v8").getHeapStatistics().heap_size_limit/1048576), Math.round(process.constrainedMemory()/1048576))'
+259 512
+`}</Terminal>
+
+Under a 512 MB limit, Node 22 caps its heap at 259 MB, leaving room for buffers and native memory. Not every runtime
+does this: older Java (before 10) and older Node versions ignored the cgroup limit and sized themselves from the
+**host's** memory, then got OOM-killed. Check yours the same way before trusting it. If yours does, set it explicitly: `NODE_OPTIONS=--max-old-space-size=384`, Java's
+`-XX:MaxRAMPercentage`, or a worker count tied to `--cpus`.
+
+<Quiz
+  question="A container with --memory 256m --cpus 0.25 starts doing heavy work. Which is true?"
+  options={[
+    { text: "Both limits slow it down gracefully", why: "Only CPU is a throttle. Memory has no slow mode." },
+    { text: "Exceeding CPU slows it down; exceeding memory gets a process killed", correct: true, why: "CPU time is rationed, so the work just takes longer. Memory can't be rationed that way, so at the limit the OOM killer steps in." },
+    { text: "Exceeding either one kills the container", why: "CPU limits never kill anything." },
+    { text: "The limits only apply when the host is busy", why: "That's --cpu-shares and --memory-reservation. --cpus and --memory always apply." },
+  ]}
+/>
+
+<Checkpoint
+  title="Budget the notes API"
+  solution={<p><code>docker stats</code> shows no limit: you passed the flags after the image name, so they went to Node instead of Docker. Flags go before the image.</p>}
+>
+  <p>Run the notes API with <code>--memory 128m --cpus 0.5 --pids-limit 100</code> and check all three in <code>docker stats --no-stream</code> and <code>docker inspect</code>. Then use <code>docker update --memory 256m --memory-swap 256m notes</code> to raise the memory limit on the running container.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**No limits on shared servers.** One leak takes everything down with it.</li>
+    <li>**Limits tighter than real peak usage.** Measure with `docker stats` under load first, then add headroom.</li>
+    <li>**Ignoring the runtime's own settings.** Heap and worker counts must fit inside the limit.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`--memory`: a hard limit; exceeding it means an OOM kill (exit 137).</li>
+    <li>`--cpus`: a throttle; exceeding it means waiting.</li>
+    <li>`--pids-limit`: caps process count.</li>
+    <li>Check the runtime inside sizes itself from the container's limit.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do memory and CPU limits behave differently when a container exceeds them?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How would you choose the numbers?"]}
+>
+  <p>Both are enforced by cgroups. CPU is compressible: a container over its `--cpus` quota is throttled and waits for its next slice, so it slows down but keeps running. Memory isn't compressible: when a container hits `--memory` and the kernel can't reclaim pages, the OOM killer kills a process, and if it's the main one the container exits with 137 and `OOMKilled` true.</p>
+  <p>To choose values, measure real usage under load with `docker stats` or metrics, set memory above observed peak with headroom, and make sure the runtime's heap or worker settings fit inside it.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "A Java (or old Node) service keeps getting OOM-killed in a container even though its heap setting looks fine. Why?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Debugging" }}
+>
+  <p>Older runtimes sized default heaps from the host's total memory, not the cgroup limit, so they assumed far more RAM than the container had. Even with container-aware runtimes, total memory includes more than the heap: thread stacks, native buffers, JIT and metaspace. Fix it by using a container-aware version, setting heap as a percentage of the limit (`-XX:MaxRAMPercentage`, `--max-old-space-size`), and leaving headroom for non-heap memory.</p>
+</InterviewCard>

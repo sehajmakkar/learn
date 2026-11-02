@@ -1,0 +1,138 @@
+export const meta = {
+  summary: "Tell Docker what to do when a container's process dies: nothing, retry a few times, or keep it up forever.",
+  uses: ["03.01"],
+  usedIn: ["03.07", "07.07"],
+};
+
+<BeforeYouStart>
+  You know the container lifecycle and exit codes (<L id="03.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+By default, when a container's main process exits, the container just stays exited. A **restart policy** tells the
+Docker daemon to start it again, depending on how it exited and whether you stopped it on purpose. It's the simplest
+form of self-healing, and on a single server it's often all you need.
+
+## The four policies
+
+| Policy | Restarts when… |
+| --- | --- |
+| `no` (default) | never |
+| `on-failure[:N]` | it exits with a non-zero code, up to N times if you give a number |
+| `always` | it exits for any reason, and when the Docker daemon starts |
+| `unless-stopped` | like `always`, except a container you stopped stays stopped across daemon restarts |
+
+`docker stop` never triggers a restart: a manual stop always wins until the next daemon restart. The difference
+between `always` and `unless-stopped` only shows up then: after a reboot, `always` brings back containers you'd
+stopped, and `unless-stopped` leaves them alone.
+
+## See them work
+
+`on-failure:3` retries a failing container three times, then gives up:
+
+<Terminal>{`
+$ docker run -d --name flaky --restart on-failure:3 alpine sh -c 'echo starting; exit 1'
+$ docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}' flaky
+status=exited exit=1 restarts=3
+$ docker logs flaky
+starting
+starting
+starting
+starting
+`}</Terminal>
+
+One run plus three restarts: four lines of output.
+
+`always` restarts even after a clean exit, but respects a manual stop:
+
+<Terminal>{`
+$ docker run -d --name always1 --restart always alpine sh -c 'sleep 1; exit 0'
+$ docker inspect -f 'status={{.State.Status}} restarts={{.RestartCount}}' always1
+status=running restarts=4
+$ docker stop always1
+$ docker inspect -f 'status={{.State.Status}} restarts={{.RestartCount}}' always1
+status=exited restarts=4
+`}</Terminal>
+
+## Crash loops and backoff
+
+A container that dies instantly under `always` doesn't restart in a tight loop. Docker waits between attempts,
+doubling the delay each time (starting at 100 ms), and resets it once the container has stayed up for a while:
+
+<Terminal>{`
+$ docker run -d --name crashy --restart always alpine sh -c 'exit 1'
+$ docker ps -a --filter name=crashy --format '{{.Status}}'
+Restarting (1) 4 seconds ago
+`}</Terminal>
+
+`Restarting (1)` means "exited with code 1, waiting to try again". If you see it, read `docker logs`: the reason is
+almost always in the last few lines.
+
+<Quiz
+  question="A web API should come back after a crash and after the server reboots, but stay down if an engineer stops it to investigate. Which policy?"
+  options={[
+    { text: "no", why: "Nothing would bring it back after a crash or reboot." },
+    { text: "on-failure", why: "It wouldn't restart after a clean exit, and it's less suited to a service meant to always be up." },
+    { text: "always", why: "Close, but after a reboot it would also restart the container the engineer had deliberately stopped." },
+    { text: "unless-stopped", correct: true, why: "It restarts after crashes and reboots, but remembers that someone stopped it on purpose." },
+  ]}
+/>
+
+## Changing a running container's policy
+
+You don't need to recreate a container to change its policy:
+
+<Code lang="bash" file="update">{`
+docker update --restart unless-stopped notes
+`}</Code>
+
+<Aside title="What restart policies don't do">
+  They only react to the process **exiting**. A process that's still running but stuck, deadlocked or returning errors
+  won't be restarted, even if its healthcheck says it's unhealthy (<L id="03.07" />). Restart policies are also per
+  machine: if the server dies, nothing moves your containers elsewhere. That's an orchestrator's job.
+</Aside>
+
+<Checkpoint
+  title="Crash it on purpose"
+  solution={<p>No restarts with <code>on-failure</code>: the app exited with 0. Use <code>always</code> or make sure the failure exits non-zero, as the notes API's config check does.</p>}
+>
+  <p>Run the notes API with <code>--restart on-failure:5 -e MAX_NOTE_LENGTH=0</code>. The invalid config makes it exit with 1 on every start. Watch <code>docker ps -a</code> show it restarting, then check <code>RestartCount</code> settle at 5. Then run it properly with <code>unless-stopped</code>, restart Docker Desktop (or the daemon), and check it came back.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**`always` on one-off jobs.** A migration that exits 0 runs again, and again.</li>
+    <li>**Treating restarts as a fix.** A crash loop is a symptom. Read the logs.</li>
+    <li>**Expecting unhealthy containers to restart.** Plain Docker doesn't do that.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`no`, `on-failure[:N]`, `always`, `unless-stopped`.</li>
+    <li>A manual `docker stop` is always respected; `unless-stopped` also respects it after reboots.</li>
+    <li>Restarts back off exponentially; `Restarting (code)` means a crash loop.</li>
+    <li>Policies react to exits only, on one machine only.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between the always and unless-stopped restart policies?", level: "Junior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+>
+  <p>Both restart a container whenever its process exits, and neither overrides a manual `docker stop` while the daemon keeps running. The difference is after the daemon or host restarts: `always` starts every container with that policy, including ones you had stopped, while `unless-stopped` leaves manually stopped containers stopped.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "A container is stuck in 'Restarting'. Walk through how you'd debug it.", level: "Mid", frequency: 2, importance: "Must-know", kind: "Debugging" }}
+>
+  <p>`docker ps -a` shows the last exit code in `Restarting (N)`. `docker logs --tail 50` shows why the process died: usually bad config, a missing dependency like a database, or a crash at startup. `docker inspect` gives `RestartCount`, `OOMKilled` and the full state. To experiment, `docker update --restart no` stops the loop, then run the same image interactively with a shell as the command to reproduce the startup.</p>
+</InterviewCard>

@@ -1,0 +1,145 @@
+export const meta = {
+  summary: "Running isn't the same as working. Add a healthcheck to the notes API, watch it go healthy and unhealthy, and learn what Docker does (and doesn't do) about it.",
+  uses: ["03.03", "03.05", "02.07"],
+  usedIn: ["06.03", "07.07", "docker-step-02"],
+};
+
+<BeforeYouStart>
+  You've made the notes API configurable (<L id="03.03" />) and know what restart policies react to
+  (<L id="03.05" />). This lesson finishes project step 2, tagged `docker-step-02`.
+</BeforeYouStart>
+
+## The core idea
+
+Docker knows whether a container's process is **running**. It has no idea whether the app inside is **working**: it
+could be deadlocked, out of database connections, or returning 500 for everything. A **healthcheck** is a command
+Docker runs inside the container on a schedule. Exit code 0 means healthy, 1 means unhealthy.
+
+## Add one to the notes API
+
+`node:22-slim` has no `curl` (<L id="02.07" />), so the check asks Node itself to call `/healthz`:
+
+<Code lang="dockerfile" file="Dockerfile">{`
+USER node
+EXPOSE 3000
+# slim has no curl, so ask Node to call /healthz. Exit 0 = healthy, 1 = unhealthy.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \\
+  CMD ["node", "-e", "fetch(\`http://127.0.0.1:\${process.env.PORT || 3000}/healthz\`).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+CMD ["node", "dist/server.js"]
+`}</Code>
+
+| Option | Means |
+| --- | --- |
+| `--interval=10s` | run the check every 10 seconds |
+| `--timeout=3s` | a check that takes longer counts as a failure |
+| `--start-period=5s` | failures during startup don't count against the container |
+| `--retries=3` | three failures in a row before it's marked unhealthy |
+
+Calling `127.0.0.1` is right here: the check runs **inside** the container, next to the app. And it reads `PORT`, so
+the check still works if someone reconfigures the port (<L id="03.03" />).
+
+## Watch it
+
+<Terminal>{`
+$ docker build -t notes-api .
+$ docker run -d --name notes -p 8080:3000 notes-api
+$ docker ps --filter name=notes --format '{{.Names}} {{.Status}}'
+notes Up Less than a second (health: starting)
+$ sleep 12
+$ docker ps --filter name=notes --format '{{.Names}} {{.Status}}'
+notes Up 12 seconds (healthy)
+`}</Terminal>
+
+`docker inspect -f '{{json .State.Health}}' notes` shows the status, the current failing streak, and the output and
+exit code of the last few checks, which is where to look when one fails.
+
+## What unhealthy does (and doesn't) do
+
+Here's the API with a healthcheck that always fails, and a restart policy:
+
+<Terminal>{`
+$ docker run -d --name sick --restart unless-stopped \\
+    --health-cmd 'exit 1' --health-interval 2s --health-retries 2 notes-api
+$ docker ps --filter name=sick --format '{{.Names}} {{.Status}}'
+sick Up 9 seconds (unhealthy)
+$ docker inspect -f 'status={{.State.Status}} health={{.State.Health.Status}} restarts={{.RestartCount}}' sick
+status=running health=unhealthy restarts=0
+`}</Terminal>
+
+Unhealthy, still running, zero restarts. **Plain Docker reports health; it doesn't act on it.** The value comes from
+the things that read it:
+
+- **Compose** can wait for a dependency to be healthy before starting a service (<L id="06.03" />).
+- **Docker Swarm** replaces unhealthy tasks; **Kubernetes** has its own liveness and readiness probes.
+- **Deploy scripts** can wait for `healthy` before switching traffic to a new container (<L id="07.07" />).
+- **Monitoring** can alert on it.
+
+<Quiz
+  question="Your notes API container shows (unhealthy) but the process is still running, and it has --restart always. What will Docker do?"
+  options={[
+    { text: "Restart it, because of --restart always", why: "Restart policies only react to the process exiting. An unhealthy process is still running." },
+    { text: "Nothing on its own; it keeps running and stays marked unhealthy", correct: true, why: "Docker records health status. Acting on it is up to Compose, an orchestrator, or your own tooling." },
+    { text: "Stop it, then wait for you to start it", why: "Docker never stops a container because of a healthcheck." },
+    { text: "Remove it", why: "Healthchecks never remove containers." },
+  ]}
+/>
+
+## What a good health endpoint checks
+
+- **Cheap and fast.** It runs every few seconds; it shouldn't run real queries or allocate much.
+- **The app's own ability to serve**: event loop responsive, server accepting requests.
+- **Careful with dependencies.** If `/healthz` fails whenever the database is down, every replica goes unhealthy at
+  once, and an orchestrator may restart all of them, which doesn't fix the database. Many teams split "am I alive?"
+  (liveness) from "can I serve traffic right now?" (readiness).
+
+<Checkpoint
+  title="Project step 2: configure and health-check"
+  solution={<p>Stuck on <code>health: starting</code>: look at <code>docker inspect -f '&#123;&#123;json .State.Health&#125;&#125;'</code>. An <code>ECONNREFUSED</code> in the output means the check is calling the wrong port; make sure it reads <code>PORT</code> the same way the app does. Compare with the reference: <code>git diff docker-step-02 -- project/docker/api</code>.</p>}
+>
+  <p>Bring your notes API up to step 2:</p>
+  <ul>
+    <li>Read <code>PORT</code> and <code>MAX_NOTE_LENGTH</code> from the environment, with defaults, and exit 1 on invalid values (<L id="03.03" />).</li>
+    <li>Add the <code>HEALTHCHECK</code> above to the final stage.</li>
+    <li>Run it with <code>--restart unless-stopped --memory 128m --cpus 0.5 --log-opt max-size=10m</code>.</li>
+    <li>Confirm it reports <code>(healthy)</code>, then run a second copy with <code>-e PORT=4000 -p 8090:4000</code> and confirm that's healthy too.</li>
+  </ul>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Using `curl` in a healthcheck on an image that doesn't have it.** The check fails forever and the app looks broken.</li>
+    <li>**Expecting Docker to restart unhealthy containers.** It won't without an orchestrator.</li>
+    <li>**Heavy health endpoints.** A check that runs a big query every 10 seconds becomes load.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A healthcheck is a command run inside the container: exit 0 healthy, 1 unhealthy.</li>
+    <li>Tune `interval`, `timeout`, `start-period` and `retries`.</li>
+    <li>Docker only reports health; Compose, orchestrators and deploy scripts act on it.</li>
+    <li>Keep health endpoints cheap, and think hard before making them depend on other services.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What does a Docker HEALTHCHECK do, and what happens when a container becomes unhealthy?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How is this different from Kubernetes liveness and readiness probes?"]}
+>
+  <p>It defines a command the daemon runs inside the container on an interval; exit 0 is healthy and non-zero unhealthy after a number of retries, with a start period to allow for boot time. The status shows in `docker ps` and `docker inspect`.</p>
+  <p>Standalone Docker takes no action on unhealthy containers, not even with a restart policy. Swarm replaces them, Compose can use health to order startup, and Kubernetes ignores HEALTHCHECK entirely in favour of its own probes: liveness restarts the container, readiness removes it from load balancing.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "Should a service's health endpoint check its database connection?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+>
+  <p>It depends what acts on the result. For a liveness-style check that triggers restarts, usually no: a database outage would make every replica fail at once and get restarted, which doesn't help and can cause a thundering herd on recovery. For readiness, which only takes an instance out of rotation, checking critical dependencies can make sense. Keeping the two separate lets you restart only what's actually broken.</p>
+</InterviewCard>

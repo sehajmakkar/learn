@@ -1,0 +1,146 @@
+export const meta = {
+  summary: "Where container logs come from, how to read them without drowning, and how to get a shell inside a running container when you need one.",
+  uses: ["01.06", "03.01"],
+  usedIn: ["03.07", "05.04", "07.07"],
+};
+
+<BeforeYouStart>
+  You can run and stop containers (<L id="03.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+Docker captures whatever a container's main process writes to **stdout** and **stderr**. That's all a container log is.
+So the rule for apps in containers is simple: log to the console, not to files, and let Docker (or whatever collects
+Docker's logs) handle storage.
+
+## Reading logs
+
+<Terminal>{`
+$ docker run -d --name talky alpine sh -c 'for i in 1 2 3; do echo "out $i"; echo "err $i" >&2; sleep 1; done'
+$ docker logs talky
+out 1
+err 1
+out 2
+err 2
+out 3
+err 3
+$ docker logs talky 2>&1 >/dev/null
+err 1
+err 2
+err 3
+$ docker logs -t --tail 2 talky
+2026-11-02T20:22:14.462506211Z out 3
+2026-11-02T20:22:14.462563711Z err 3
+`}</Terminal>
+
+`docker logs` keeps stdout and stderr separate, so your shell can split them. The flags you'll use most:
+
+| Flag | Does |
+| --- | --- |
+| `-f` | follow new lines as they arrive, like `tail -f` |
+| `--tail 50` | start from the last 50 lines instead of the beginning |
+| `--since 10m` | only lines from the last 10 minutes (also takes timestamps) |
+| `-t` | prefix each line with its timestamp |
+
+Logs survive a container stopping; they're deleted with `docker rm`.
+
+## Where logs are stored, and why they fill disks
+
+By default Docker uses the `json-file` logging driver: one JSON file per container on the host, **with no size limit**.
+A chatty container left running for months can fill a server's disk.
+
+<Terminal>{`
+$ docker info -f '{{.LoggingDriver}}'
+json-file
+$ docker inspect -f '{{.LogPath}}' talky
+/var/lib/docker/containers/a6e2d74169.../a6e2d74169...-json.log
+`}</Terminal>
+
+Cap it per container:
+
+<Terminal>{`
+$ docker run -d --name rotated --log-opt max-size=10m --log-opt max-file=3 alpine true
+$ docker inspect -f '{{json .HostConfig.LogConfig}}' rotated
+{"Type":"json-file","Config":{"max-file":"3","max-size":"10m"}}
+`}</Terminal>
+
+Or set the same defaults for every container in the daemon's `daemon.json` with `"log-opts"`. Docker also offers a
+`local` driver that rotates and compresses by default, plus drivers that ship logs to journald, syslog or cloud
+services.
+
+## Getting inside: exec
+
+`docker exec` runs an extra process in a running container's namespaces. With `-it`, that process is an interactive
+shell:
+
+<Terminal>{`
+$ docker exec -it notes sh
+$ docker exec notes whoami
+node
+$ docker exec -u root notes whoami
+root
+`}</Terminal>
+
+`exec` runs as the image's `USER` unless you pass `-u`. It only works on running containers, and only if the image
+has the program you ask for: distroless images have no `sh` at all (<L id="02.07" />).
+
+To move files without a shell, use `docker cp`, which works on stopped containers too:
+
+<Code lang="bash" file="cp">{`
+docker cp notes:/app/package.json ./from-container.json
+docker cp ./debug.json notes:/tmp/debug.json
+`}</Code>
+
+<Quiz
+  question="Your app writes its logs to /var/log/app.log inside the container. What does docker logs show?"
+  options={[
+    { text: "The contents of /var/log/app.log", why: "Docker doesn't look at files inside the container. It only captures the main process's stdout and stderr." },
+    { text: "Only what the main process writes to stdout and stderr, possibly nothing", correct: true, why: "docker logs is the process's console output. Logging to a file inside the container hides it from Docker, and it's lost with the container." },
+    { text: "Both the file and the console output", why: "Docker has no idea the file exists." },
+    { text: "An error, because the log driver can't read files", why: "There's no error; you just get whatever went to the console." },
+  ]}
+/>
+
+The official nginx image handles this by symlinking its log files to `/dev/stdout` and `/dev/stderr`, a handy trick
+for software you can't reconfigure.
+
+<Checkpoint
+  title="Follow, filter, and look inside"
+  solution={<p><code>docker exec</code> says the container isn't running: start it first. "executable file not found": the image has no shell at that path; try <code>sh</code> instead of <code>bash</code>.</p>}
+>
+  <p>Run the notes API, then in a second terminal <code>docker logs -f notes</code>. Post a few notes and watch nothing appear (it only logs at startup and shutdown). Stop it and watch the <code>SIGTERM received</code> line arrive. Start it again with <code>--log-opt max-size=1m</code> and confirm the setting with <code>docker inspect</code>. Use <code>docker exec</code> to list <code>/app/dist</code>.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Logging to files inside the container.** Invisible to `docker logs`, gone when the container goes.</li>
+    <li>**No log rotation on servers.** `json-file` grows forever by default.</li>
+    <li>**Fixing things with `exec` and walking away.** The next deploy throws your fix away. Change the image.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Container logs = the main process's stdout and stderr.</li>
+    <li>`docker logs -f --tail 50 --since 10m -t` covers most needs.</li>
+    <li>Cap log size with `--log-opt max-size` and `max-file`, or daemon-wide.</li>
+    <li>`exec` adds a process to a running container; `cp` copies files in and out.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do logs work for Docker containers, and how would you handle them in production?", level: "Mid", frequency: 2, importance: "Must-know", kind: "Design" }}
+  followUps={["Why can unrotated logs take down a server?"]}
+>
+  <p>Docker captures the main process's stdout and stderr and passes them to a logging driver, `json-file` by default, which writes to a file on the host and doesn't rotate unless configured. Apps should log to the console, ideally structured JSON.</p>
+  <p>In production, set rotation (`max-size`, `max-file`) or use the `local` driver, and ship logs to a central system (via a driver, or an agent like Fluent Bit or Vector reading the files) so they survive the container and can be searched across hosts.</p>
+</InterviewCard>
