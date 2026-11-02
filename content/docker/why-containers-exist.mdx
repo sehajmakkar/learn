@@ -68,7 +68,7 @@ Docker, released in 2013, didn't invent the isolation. It made it usable:
 - one CLI that does all of it: `docker build`, `docker push`, `docker run`
 
 In 2015 the image and runtime formats were handed to the Open Container Initiative (OCI), which is why images built
-with Docker also run on Podman, containerd and Kubernetes. More on that in <L id="08.01" />.
+with Docker also run on Podman, containerd and Kubernetes.
 
 <Quiz
   question="A colleague says 'Docker invented container isolation in Linux.' What's the more accurate version?"
@@ -89,7 +89,7 @@ It's worth being clear-eyed about the limits early:
   Windows, Docker runs a small Linux VM to provide one.
 - **Bad configuration.** A container with a wrong environment variable is still wrong, just consistently.
 - **Running many machines.** Docker runs containers on one host. Scheduling them across many is what Kubernetes is
-  for (<L id="08.04" />).
+  for.
 
 <Mistakes>
   <ul>

@@ -1,7 +1,7 @@
 export const meta = {
   summary: "A container is a process with a private view of the system and a budget. Here are the two kernel features that make it one.",
   uses: ["01.02"],
-  usedIn: ["03.06", "05.01", "08.02"],
+  usedIn: ["03.06", "05.01", "07.01"],
 };
 
 <BeforeYouStart>
@@ -35,7 +35,7 @@ Each namespace type wraps one part of the system. A process inside sees only wha
 | `user` | user and group IDs | root inside can map to a normal user outside |
 
 Docker gives each container its own `pid`, `net`, `mnt`, `uts` and `ipc` namespaces by default. User namespaces are
-opt-in; you'll meet them in <L id="08.03" />.
+opt-in, and are how Docker's rootless mode runs containers without root on the host.
 
 The important bit: from the host, the container's processes are still right there, with normal PIDs. Namespaces hide
 the host from the container, not the container from the host.

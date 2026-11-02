@@ -114,17 +114,6 @@ export const modules: Module[] = [
       l("07.07", "Project: deploy to a VPS", 35, "BUILD", "project-deploy-to-a-vps"),
     ],
   },
-  {
-    n: "08",
-    title: "Beyond Docker",
-    blurb: "The standards and runtimes underneath, and where to go next.",
-    lessons: [
-      l("08.01", "OCI: the image and runtime specs", 10, "CONCEPT"),
-      l("08.02", "containerd and runc", 11, "CONCEPT"),
-      l("08.03", "Rootless containers and Podman", 9, "CODE"),
-      l("08.04", "From Compose to Kubernetes", 12, "CONCEPT"),
-    ],
-  },
 ];
 
 export const allLessons = modules.flatMap((m) => m.lessons.map((lesson) => ({ ...lesson, module: m })));

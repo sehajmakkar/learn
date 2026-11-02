@@ -1,7 +1,7 @@
 export const meta = {
   summary: "Take the notes stack to a real server: a hardened production compose file, secrets from files, one deploy script, and rollbacks by image tag.",
   uses: ["07.01", "07.02", "07.06", "06.06", "04.05"],
-  usedIn: ["08.04", "docker-step-07"],
+  usedIn: ["docker-step-07"],
 };
 
 <BeforeYouStart>
@@ -230,8 +230,8 @@ Avoid deploying `latest` for exactly this reason: you can't roll back to "the la
 ## What you built
 
 Over seven steps the notes API went from a TypeScript file to a scanned, multi-platform image built by CI, running as
-four hardened containers on a server, deployed and rolled back by tag. Module 08 looks underneath Docker at the
-standards and runtimes you've been using all along, and at where to go next.
+four hardened containers on a server, deployed and rolled back by tag. That's the whole course: everything you need to
+containerise, ship and run a real app with Docker.
 
 ## Interview questions
 

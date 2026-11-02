@@ -40,7 +40,7 @@ $ sudo usermod -aG docker $USER
 
 Know what that means: anyone who can talk to the daemon can start a container that mounts the host's `/` and do
 anything as root. **Being in the `docker` group is effectively root on that machine.** Fine on your laptop; think twice
-on shared servers. Rootless mode avoids this, covered in <L id="08.03" />.
+on shared servers. Docker's rootless mode, or Podman, avoids this by running containers without root on the host.
 
 ## Check both halves
 
