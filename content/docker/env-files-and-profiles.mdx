@@ -1,0 +1,152 @@
+export const meta = {
+  summary: "Keep settings out of compose.yaml with variables and .env files, and keep optional tools out of the way with profiles.",
+  uses: ["06.01", "03.03"],
+  usedIn: ["06.06", "07.02"],
+};
+
+<BeforeYouStart>
+  You know how containers take configuration (<L id="03.03" />) and the compose file's shape (<L id="06.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+Two different things in Compose both get called "env", and mixing them up causes most of the confusion:
+
+- **Variables in the compose file**, like `${POSTGRES_PASSWORD}`. Compose fills these in from your shell or a `.env`
+  file **before** it does anything else.
+- **Environment variables in a container**, set with `environment:` or `env_file:`. These are what the app sees.
+
+## Variables in the file
+
+<Code lang="yaml" file="compose.yaml">{`
+services:
+  proxy:
+    ports:
+      - "\${PROXY_PORT:-8080}:80"
+  api:
+    environment:
+      DATABASE_URL: postgres://\${POSTGRES_USER:-notes}:\${POSTGRES_PASSWORD:-notes}@db:5432/\${POSTGRES_DB:-notes}
+      MAX_NOTE_LENGTH: \${MAX_NOTE_LENGTH:-280}
+`}</Code>
+
+`${VAR:-default}` uses `default` when `VAR` is unset or empty. Others you'll meet: `${VAR}` (empty if unset) and
+`${VAR:?message}` (refuse to run if unset), handy for things that must never default, like production passwords.
+
+Values come from, highest priority first:
+
+1. your shell: `MAX_NOTE_LENGTH=99 docker compose up`
+2. a file named **`.env`** next to `compose.yaml`, read automatically
+3. the default in the file
+
+`docker compose config` prints the file with everything filled in, so you can check before you run:
+
+<Terminal>{`
+$ docker compose config | grep MAX_NOTE_LENGTH
+      MAX_NOTE_LENGTH: "280"
+$ echo "MAX_NOTE_LENGTH=50" > .env
+$ docker compose config | grep MAX_NOTE_LENGTH
+      MAX_NOTE_LENGTH: "50"
+$ MAX_NOTE_LENGTH=99 docker compose config | grep MAX_NOTE_LENGTH
+      MAX_NOTE_LENGTH: "99"
+`}</Terminal>
+
+The project commits a **`.env.example`** with safe defaults and ignores `.env`, so everyone copies the example and
+changes their own copy:
+
+<Code lang="bash" file=".env.example">{`
+# Copy to .env and change as needed. Compose reads .env from this folder automatically (see 06.04).
+POSTGRES_USER=notes
+POSTGRES_PASSWORD=notes
+POSTGRES_DB=notes
+MAX_NOTE_LENGTH=280
+PROXY_PORT=8080
+`}</Code>
+
+## Variables in the container
+
+`environment:` sets variables directly. `env_file:` loads them from a file into **that service's** container:
+
+<Code lang="yaml" file="compose.yaml">{`
+services:
+  api:
+    env_file: ./api/.env.local     # every KEY=value in it becomes a container variable
+    environment:
+      LOG_LEVEL: debug             # environment: wins over env_file for the same key
+`}</Code>
+
+The difference in one line: **`.env` configures Compose; `env_file:` configures a container.** A variable in `.env`
+only reaches the app if the compose file passes it on, like `MAX_NOTE_LENGTH` above.
+
+## Profiles: optional services
+
+Some services are only sometimes useful: a database UI, a load generator, a debugging toolbox. Give them a profile and
+they're skipped unless you ask for it:
+
+<Code lang="yaml" file="compose.yaml">{`
+  adminer:
+    image: adminer
+    profiles: [tools]
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    networks: [backend]
+`}</Code>
+
+<Terminal>{`
+$ docker compose up -d                       # proxy, api, db, cache: no adminer
+$ docker compose --profile tools up -d       # the same, plus adminer
+$ curl -s -o /dev/null -w "%{http_code}\\n" localhost:8081
+200
+`}</Terminal>
+
+Adminer is a web UI for Postgres at `localhost:8081`, published on `127.0.0.1` only so it isn't reachable from your
+network. You can also set `COMPOSE_PROFILES=tools` in `.env` to turn it on by default for yourself.
+
+<Quiz
+  question="Your .env contains DEBUG=true. compose.yaml never mentions DEBUG. Does the API container see DEBUG?"
+  options={[
+    { text: "Yes, .env is loaded into every container", why: ".env is read by Compose to fill in ${...} in the file, not injected into containers." },
+    { text: "No, unless the compose file passes it on, e.g. environment: DEBUG: ${DEBUG}", correct: true, why: ".env only provides values for variables in compose.yaml. To reach a container, a variable has to appear in environment: or come from an env_file:." },
+    { text: "Only if the service has a profile", why: "Profiles decide which services run, not their variables." },
+    { text: "Only the first service in the file sees it", why: "No service sees it unless the file passes it on." },
+  ]}
+/>
+
+<Checkpoint
+  title="Configure without editing YAML"
+  solution={<p>If <code>docker compose config</code> still shows the default, check that <code>.env</code> is in the same folder as <code>compose.yaml</code> and that there are no spaces around <code>=</code>.</p>}
+>
+  <p>Copy <code>.env.example</code> to <code>.env</code>, set <code>PROXY_PORT=9090</code> and <code>MAX_NOTE_LENGTH=50</code>, and confirm both with <code>docker compose config</code>. Run <code>up -d</code>, reach the API on 9090, and check that a 60-character note is rejected. Then start Adminer with the <code>tools</code> profile and log in with the values from your <code>.env</code>.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Committing `.env`.** Commit `.env.example`; ignore `.env`.</li>
+    <li>**Expecting `.env` values to reach containers automatically.** Pass them through `environment:`.</li>
+    <li>**Real secrets in `.env` for production.** Fine for local development; use secrets for anything real (<L id="07.02" />).</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`${VAR:-default}` in the file; values from shell, then `.env`, then the default.</li>
+    <li>`.env` configures Compose; `environment:` and `env_file:` configure containers.</li>
+    <li>`docker compose config` shows the final result.</li>
+    <li>`profiles:` keep optional services out until `--profile` asks for them.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between the .env file and env_file in Docker Compose?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+>
+  <p>The `.env` file next to `compose.yaml` is read by Compose itself to substitute `${VAR}` references in the compose file; its values don't reach containers unless the file passes them through. `env_file:` is a per-service setting that loads a file's `KEY=value` pairs as environment variables inside that service's container. Shell variables override `.env`, and `environment:` overrides `env_file:` for the same key.</p>
+</InterviewCard>

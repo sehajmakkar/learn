@@ -1,0 +1,156 @@
+export const meta = {
+  summary: "Replace nine docker commands with one: the whole notes stack, healthy in order, seeded with data, and reloading as you edit.",
+  uses: ["06.02", "06.03", "06.04", "06.05"],
+  usedIn: ["07.06", "07.07", "docker-step-05"],
+};
+
+<BeforeYouStart>
+  Project step 5. You've seen every piece in this module. The finished state is tagged `docker-step-05`, in
+  `project/docker`.
+</BeforeYouStart>
+
+## The brief
+
+A new contributor clones the repo and runs one command. Done means:
+
+<Recap>
+  <ul>
+    <li>`docker compose up --watch` starts Nginx, the API, Postgres and Redis on the two-network layout from step 4.</li>
+    <li>Services start in dependency order and only once their dependencies are healthy.</li>
+    <li>A fresh database comes pre-filled with sample notes.</li>
+    <li>Editing `api/src` reloads the API; changing `package.json` rebuilds it.</li>
+    <li>Settings come from `.env`, with safe defaults if there isn't one. An optional database UI sits behind a profile.</li>
+  </ul>
+</Recap>
+
+## Seeding with init scripts
+
+The official Postgres image runs any `.sql` or `.sh` file it finds in `/docker-entrypoint-initdb.d/`, **once**, when it
+creates a new database in an empty data directory. Mount a seed file there:
+
+<Code lang="sql" file="db/seed.sql">{`
+-- Runs once, when Postgres initialises an empty data volume (see 06.06).
+-- The API also creates this table at startup; IF NOT EXISTS keeps the two in agreement.
+CREATE TABLE IF NOT EXISTS notes (
+  id uuid PRIMARY KEY,
+  text text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO notes (id, text) VALUES
+  (gen_random_uuid(), 'Welcome to the notes API. This note came from db/seed.sql.'),
+  (gen_random_uuid(), 'Edit api/src/server.ts while docker compose watch runs, and the API restarts.'),
+  (gen_random_uuid(), 'docker compose down keeps these notes. docker compose down -v deletes them.');
+`}</Code>
+
+<Code lang="yaml" file="compose.yaml">{`
+  db:
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+`}</Code>
+
+## The whole file
+
+`project/docker/compose.yaml` puts together everything from this module: the four services, both networks, the
+volume, healthchecks with `service_healthy` ordering (<L id="06.03" />), variables with defaults
+(<L id="06.04" />), the `dev` build target with watch rules (<L id="06.05" />), and Adminer behind the `tools`
+profile. One change from step 4: the API is now the service `api`, so the Nginx config proxies to `http://api:3000`.
+
+## Run it
+
+<Terminal>{`
+$ cd project/docker
+$ docker compose up --watch
+ Network notes_backend Created
+ Network notes_frontend Created
+ Volume notes_pgdata Created
+ ...
+        ⦿ Watch enabled
+Attaching to api-1, cache-1, db-1, proxy-1
+ Container notes-cache-1 Started
+ Container notes-db-1 Started
+ Container notes-cache-1 Waiting
+ Container notes-db-1 Waiting
+cache-1  | 1:C 02 Nov 2026 20:53:47.202 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+...
+`}</Terminal>
+
+Output trimmed. Watch is enabled straight away, then every service's logs stream into this terminal, prefixed with
+its name, while Compose works through the health waits. Give it a few seconds, then in another terminal:
+
+<Terminal>{`
+$ curl -s localhost:8080/notes | jq -r '.[].text'
+Welcome to the notes API. This note came from db/seed.sql.
+Edit api/src/server.ts while docker compose watch runs, and the API restarts.
+docker compose down keeps these notes. docker compose down -v deletes them.
+`}</Terminal>
+
+(Without `jq`, plain `curl localhost:8080/notes` shows the same notes as JSON.)
+
+## What survives what
+
+<Terminal>{`
+$ curl -X POST localhost:8080/notes -H 'content-type: application/json' -d '{"text":"added after seeding"}'
+$ docker compose down
+$ docker compose up -d
+$ curl -s localhost:8080/notes | jq length
+4
+$ docker compose logs db | grep -i initialization
+db-1  | PostgreSQL Database directory appears to contain a database; Skipping initialization
+$ docker compose down -v
+ Volume notes_pgdata Removed
+$ docker compose up -d
+$ curl -s localhost:8080/notes | jq length
+3
+$ docker compose logs db | grep initdb
+db-1  | /usr/local/bin/docker-entrypoint.sh: running /docker-entrypoint-initdb.d/seed.sql
+`}</Terminal>
+
+`down` keeps the volume, so the fourth note survives and the seed doesn't run again. `down -v` deletes it; the next
+`up` initialises a fresh database and runs the seed, giving you back exactly three notes. That makes
+`docker compose down -v && docker compose up` a one-line "reset my dev data".
+
+<Quiz
+  question="You edit db/seed.sql to add a fourth sample note and run docker compose up -d. The note doesn't appear. Why?"
+  options={[
+    { text: "Seed files are cached in the image", why: "It's bind-mounted from your machine, so the container sees your edit." },
+    { text: "Init scripts only run when Postgres initialises an empty data directory, and the volume already has a database", correct: true, why: "The image skips /docker-entrypoint-initdb.d entirely if the volume contains a database. Reset with docker compose down -v, or insert the note with psql." },
+    { text: "Compose needs --build to pick up SQL changes", why: "Nothing is built for the db service; it uses the official image." },
+    { text: "The API deletes seeded notes at startup", why: "The API only creates the table if it's missing." },
+  ]}
+/>
+
+## Nine commands, now one
+
+Step 4 needed `docker build`, two `network create`, a `volume create`, four `docker run` and a `network connect`, typed
+in the right order with names repeated across them. Step 5 is `docker compose up --watch`, and the order, names and
+health waits live in a file that's reviewed and versioned with the code.
+
+<Checkpoint
+  title="Project step 5: one-command dev environment"
+  solution={<p>Compare with the reference: <code>git diff docker-step-05 -- project/docker</code>. Port 8080 in use: set <code>PROXY_PORT</code> in <code>.env</code>. API never becomes healthy: <code>docker compose logs api</code>, usually a <code>DATABASE_URL</code> typo.</p>}
+>
+  <ul>
+    <li>Write <code>compose.yaml</code>, <code>db/seed.sql</code>, <code>.env.example</code> and the <code>dev</code> Dockerfile stage (or check out <code>docker-step-05</code>).</li>
+    <li>From a fresh clone, <code>docker compose up --watch</code> should give you three seeded notes through <code>localhost:8080</code>.</li>
+    <li>Edit the API and see it reload; reset the data with <code>down -v</code>; open Adminer with <code>--profile tools</code>.</li>
+  </ul>
+</Checkpoint>
+
+<Tripped>
+  Your note goes here after you finish this step.
+</Tripped>
+
+## What's next
+
+This is a development setup: the dev target, no resource limits, passwords in `.env`. Module 07 makes the image
+production-ready, ships it from CI, and deploys it to a server.
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you make a project's local environment reproducible for every developer?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Design" }}
+>
+  <p>Commit a Compose file that defines every dependency the app needs (database, cache, proxy) with pinned image versions, healthchecks and startup ordering, plus a `.env.example` with safe defaults and seed data for a fresh database. Use a dev build target with watch or reload so code changes apply instantly. Then onboarding is clone, copy `.env.example`, and `docker compose up --watch`, and `down -v` gives anyone a clean reset.</p>
+</InterviewCard>

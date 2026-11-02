@@ -1,0 +1,156 @@
+export const meta = {
+  summary: "Edit code on your machine and see it running in the container a second later, without bind-mount pitfalls or rebuilding by hand.",
+  uses: ["04.03", "02.04", "06.02"],
+  usedIn: ["06.06"],
+};
+
+<BeforeYouStart>
+  You know multi-stage builds (<L id="02.04" />) and why bind-mounting a Node project is awkward
+  (<L id="04.03" />).
+</BeforeYouStart>
+
+## The core idea
+
+During development you want edits to show up immediately. **Compose watch** watches folders on your machine and, when
+something changes, either **copies the changed files into the running container** or **rebuilds the image** and
+replaces the container, depending on rules you write. Combined with a process that restarts on change inside the
+container, you get hot reload.
+
+## A dev stage
+
+The production image compiles TypeScript and ships only `dist`. For development, the notes API's Dockerfile now has a
+`dev` stage that keeps the source and dev dependencies and runs a watcher:
+
+<Code lang="dockerfile" file="api/Dockerfile">{`
+# Development (06.05): the build stage plus a watcher. Node 22 runs TypeScript directly by
+# stripping the types, so edits restart the server with no compile step. Build with --target dev.
+FROM build AS dev
+ENV NODE_ENV=development
+CMD ["node", "--watch", "src/server.ts"]
+`}</Code>
+
+Two Node features do the work: `node --watch` restarts the process when a file it loaded changes, and Node 22 (from
+22.18) runs `.ts` files directly by stripping type annotations. The final production stage is still last in the file,
+so a plain `docker build` produces the same image as before. Compose picks the dev stage with `target: dev`.
+
+## Watch rules
+
+<Code lang="yaml" file="compose.yaml">{`
+  api:
+    build:
+      context: ./api
+      target: dev
+    develop:
+      watch:
+        # Source edits are copied into the running container; node --watch restarts the server.
+        - action: sync
+          path: ./api/src
+          target: /app/src
+        # New dependencies need a new image.
+        - action: rebuild
+          path: ./api/package.json
+`}</Code>
+
+| Action | When a matching file changes |
+| --- | --- |
+| `sync` | copy it into the running container at `target` |
+| `rebuild` | rebuild the image and recreate the container |
+| `sync+restart` | copy it in, then restart the container (for apps that only read config at startup) |
+| `restart` | restart the container without copying |
+
+## See it work
+
+<Terminal>{`
+$ docker compose watch
+ ...
+ Container notes-api-1 Healthy
+Watch enabled
+$ curl localhost:8080/healthz          # in another terminal
+{"status":"ok"}
+`}</Terminal>
+
+Now edit `api/src/server.ts` so `/healthz` returns `{ status: "ok", edited: true }` and save. Watch prints:
+
+<Terminal>{`
+Syncing service "api" after 2 changes were detected
+`}</Terminal>
+
+and the API's logs show Node restarting itself:
+
+<Terminal>{`
+$ docker compose logs api --since 30s
+api-1  | Restarting 'src/server.ts'
+api-1  | SIGTERM received, closing
+api-1  | notes-api listening on :3000 (max note length 280)
+$ curl localhost:8080/healthz
+{"status":"ok","edited":true}
+`}</Terminal>
+
+A change to `package.json`, like adding a dependency, triggers the other rule:
+
+<Terminal>{`
+Rebuilding service(s) ["api"] after changes were detected...
+ Image notes-api Building
+ Container notes-api-1 Recreate
+ Container notes-api-1 Recreated
+`}</Terminal>
+
+`docker compose up --watch` does the same as `up` plus `watch`, with every service's logs in one terminal.
+
+## Why not a bind mount?
+
+You could bind-mount `./api` over `/app` (<L id="04.03" />). Watch avoids the traps that come with it:
+
+- **No hidden `node_modules`.** Only `src` is synced; the image's dependencies stay put.
+- **No host-built native modules** leaking into a Linux container.
+- **Faster on Mac and Windows**, because only changed files cross into the VM instead of every read going through
+  file sharing.
+- **Dependency changes rebuild properly**, instead of a stale `node_modules` you have to fix by hand.
+
+<Quiz
+  question="You add a new npm package with npm install on your machine while docker compose watch is running. What happens?"
+  options={[
+    { text: "The sync rule copies your node_modules into the container", why: "The sync rule only watches ./api/src. node_modules isn't synced at all." },
+    { text: "package.json and package-lock.json change, so the rebuild rule rebuilds the image and recreates the container", correct: true, why: "npm install updates package.json, which matches the rebuild rule. The new image runs npm ci inside the container, for the container's platform." },
+    { text: "Nothing until you restart watch", why: "Watch reacts to changes as they happen." },
+    { text: "The container crashes because the package is missing", why: "The rebuild installs it inside the image." },
+  ]}
+/>
+
+<Checkpoint
+  title="Hot reload the notes API"
+  solution={<p>Edits sync but nothing restarts: the container is running the production stage. Check <code>target: dev</code> and run <code>docker compose up --build</code> once. Nothing syncs at all: watch only sees paths inside the <code>path:</code> you gave, relative to the compose file.</p>}
+>
+  <p>Run <code>docker compose up --watch</code>. Change the startup log message in <code>server.ts</code> and watch it restart. Add a new route, <code>GET /version</code> returning the version from <code>package.json</code>, and call it through the proxy. Finally bump the version in <code>package.json</code> and watch the rebuild.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Syncing `node_modules`.** Let the image own dependencies; rebuild when `package.json` changes.</li>
+    <li>**Shipping the dev stage.** Production builds the default (last) stage, without `--target dev`.</li>
+    <li>**Expecting watch to restart the app by itself.** `sync` only copies files; the process inside must notice the change, which `node --watch` does here.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`develop.watch` rules: `sync`, `rebuild`, `sync+restart`, `restart`.</li>
+    <li>A `dev` build stage plus `node --watch` gives hot reload.</li>
+    <li>`docker compose watch` or `up --watch` to run it.</li>
+    <li>Fewer traps than bind-mounting the whole project.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you set up a fast local development loop for a containerised service?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Design" }}
+>
+  <p>Use a dev build target that includes dev dependencies and runs the app with a file watcher (nodemon, `node --watch`, uvicorn `--reload`, air for Go). Then either Compose watch, syncing source into the container and rebuilding when dependency manifests change, or a bind mount of the source with a volume over the dependency directory. Keep the production stage separate and last in the Dockerfile, and run the whole stack with one `docker compose up --watch`.</p>
+</InterviewCard>

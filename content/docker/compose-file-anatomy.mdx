@@ -1,0 +1,151 @@
+export const meta = {
+  summary: "A compose.yaml is your docker run commands written down once. Learn its shape, how each flag maps to a key, and the five commands you'll use daily.",
+  uses: ["05.05"],
+  usedIn: ["06.02", "06.03", "06.06"],
+};
+
+<BeforeYouStart>
+  You've started the notes stack by hand: two networks, a volume and four `docker run` commands in the right order
+  (<L id="05.05" />). Docker Compose ships with Docker Desktop; on Linux, install the `docker-compose-plugin` package.
+  `docker compose version` should print v2 or later (this course used v5).
+</BeforeYouStart>
+
+## The core idea
+
+**Docker Compose** reads a YAML file describing containers, networks and volumes, and makes reality match it. Instead of
+remembering a dozen commands and their order, you write down what you want once and run `docker compose up`. It's
+declarative: run it again and Compose only changes what's different.
+
+## From docker run to YAML
+
+Every flag you've used has a key. Here's the database from step 4, both ways:
+
+<Code lang="bash" file="before">{`
+docker volume create notes-pgdata
+docker run -d --name notes-db --network notes-backend \\
+  -e POSTGRES_USER=notes -e POSTGRES_PASSWORD=notes -e POSTGRES_DB=notes \\
+  -v notes-pgdata:/var/lib/postgresql postgres:18
+`}</Code>
+
+<Code lang="yaml" file="compose.yaml">{`
+name: notes
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: notes
+      POSTGRES_PASSWORD: notes
+      POSTGRES_DB: notes
+    volumes:
+      - pgdata:/var/lib/postgresql
+    networks: [backend]
+
+networks:
+  backend:
+
+volumes:
+  pgdata:
+`}</Code>
+
+| `docker run` | compose key |
+| --- | --- |
+| image name | `image:` |
+| `docker build -t ... ./api` | `build: ./api` (or `build: { context, target }`) |
+| `-p 8080:80` | `ports: ["8080:80"]` |
+| `-e KEY=value` | `environment:` |
+| `-v name:/path` | `volumes:`, plus the volume under top-level `volumes:` |
+| `--network name` | `networks:`, plus the network under top-level `networks:` |
+| `--restart unless-stopped` | `restart: unless-stopped` |
+| `--health-cmd ...` | `healthcheck:` |
+| command after the image | `command:` |
+
+## The four top-level keys
+
+- **`name`**: the project name. Compose prefixes everything it creates with it.
+- **`services`**: one entry per container. The key (`db`) is the service name, and also its **DNS name** on the
+  project's networks.
+- **`networks`** and **`volumes`**: declared once here, referenced from services. If you declare no networks at all,
+  Compose creates one called `<project>_default` and puts every service on it.
+
+## The commands
+
+<Terminal>{`
+$ docker compose up -d
+ Network notes_frontend Created
+ Volume notes_pgdata Created
+ Container notes-cache-1 Created
+ Container notes-db-1 Created
+ Container notes-api-1 Created
+ Container notes-proxy-1 Created
+ ...
+$ docker compose ps --format 'table {{.Service}}\\t{{.Name}}\\t{{.Status}}\\t{{.Ports}}'
+SERVICE   NAME            STATUS                    PORTS
+api       notes-api-1     Up 5 seconds (healthy)
+cache     notes-cache-1   Up 11 seconds (healthy)   6379/tcp
+db        notes-db-1      Up 11 seconds (healthy)   5432/tcp
+proxy     notes-proxy-1   Up Less than a second     0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
+$ docker compose down
+`}</Terminal>
+
+Output trimmed. Names follow the pattern `project-service-number` for containers and `project_name` for networks and
+volumes.
+
+| Command | Does |
+| --- | --- |
+| `docker compose up -d` | create or update everything, start it in the background |
+| `docker compose ps` | the project's containers |
+| `docker compose logs -f api` | follow one service's logs (all services if you leave the name off) |
+| `docker compose down` | stop and remove containers and networks; **keeps volumes** |
+| `docker compose down -v` | the same, plus the volumes, which means the data |
+
+Compose works from the folder containing `compose.yaml` (it also accepts the older name `docker-compose.yml`).
+
+<Quiz
+  question="You change only the proxy's port in compose.yaml from 8080:80 to 9090:80 and run docker compose up -d again. What happens?"
+  options={[
+    { text: "Everything is torn down and recreated", why: "Compose compares the file to what's running and only touches what changed." },
+    { text: "Only the proxy container is recreated; the others keep running", correct: true, why: "Ports are fixed when a container is created, so the proxy has to be replaced. Nothing else changed, so nothing else is touched." },
+    { text: "Nothing, until you run docker compose down first", why: "up is idempotent and applies changes directly." },
+    { text: "The port changes live without a restart", why: "Published ports can't be changed on a running container." },
+  ]}
+/>
+
+<Checkpoint
+  title="Translate the database"
+  solution={<p><code>docker compose config</code> prints the file as Compose understood it, after defaults and variables. If a key is missing there, it's indented wrong.</p>}
+>
+  <p>Write a <code>compose.yaml</code> with only the <code>db</code> service above. Run <code>docker compose up -d</code>, check the container, network and volume names with <code>docker compose ps</code>, <code>docker network ls</code> and <code>docker volume ls</code>, then <code>docker compose down</code> and confirm the volume survived.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Treating `down -v` as a normal stop.** It deletes your volumes.</li>
+    <li>**YAML indentation.** A key indented one level wrong silently means something else; check with `docker compose config`.</li>
+    <li>**Using the old `docker-compose` (with a hyphen).** That's Compose v1, retired since 2023. Use `docker compose`.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`compose.yaml` = your `docker run` commands, declared once.</li>
+    <li>Services, networks and volumes; the service name is the DNS name.</li>
+    <li>`up -d`, `ps`, `logs -f`, `down`; `down -v` also deletes data.</li>
+    <li>Re-running `up` only changes what differs.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is Docker Compose, and when would you use it instead of plain docker run?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Would you use Compose in production?"]}
+>
+  <p>Compose defines a multi-container application (services, networks, volumes, config) in one YAML file and manages it as a unit with `up`, `down`, `logs` and so on. Use it whenever more than one container works together, or a single container needs enough flags that you'd otherwise keep them in a script: local development, CI test environments, and simple single-host deployments. For multi-host scheduling and self-healing, you'd move to an orchestrator like Kubernetes.</p>
+</InterviewCard>

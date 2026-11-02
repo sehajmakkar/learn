@@ -1,0 +1,144 @@
+export const meta = {
+  summary: "Make Compose start the database before the API, and wait until it's actually ready, not just running.",
+  uses: ["06.02", "03.07"],
+  usedIn: ["06.06", "07.07"],
+};
+
+<BeforeYouStart>
+  You know Docker healthchecks (<L id="03.07" />) and the notes stack in Compose (<L id="06.02" />).
+</BeforeYouStart>
+
+## The core idea
+
+`depends_on` tells Compose to start one service before another. On its own, it only waits until the dependency's
+container has **started**, not until the program inside is ready. Add `condition: service_healthy` and a healthcheck,
+and Compose waits until the dependency reports **healthy**.
+
+## Started is not ready
+
+Postgres takes a few seconds after its container starts before it accepts connections. With plain `depends_on`, the
+API can start in that gap and fail its first connection:
+
+<Code lang="yaml" file="not enough">{`
+  api:
+    depends_on: [db, cache]    # waits for the containers to start, nothing more
+`}</Code>
+
+## Waiting for healthy
+
+Give each dependency a healthcheck, then depend on its health:
+
+<Code lang="yaml" file="compose.yaml">{`
+  api:
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+
+  db:
+    image: postgres:18
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $\${POSTGRES_USER} -d $\${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  cache:
+    image: redis:8-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+`}</Code>
+
+Both images ship a client that can check readiness: `pg_isready` and `redis-cli ping`. Now `up` waits:
+
+<Terminal>{`
+$ docker compose up -d
+ Container notes-db-1 Started
+ Container notes-cache-1 Started
+ Container notes-db-1 Waiting
+ Container notes-cache-1 Waiting
+ Container notes-cache-1 Healthy
+ Container notes-db-1 Healthy
+ Container notes-api-1 Starting
+ Container notes-api-1 Started
+ Container notes-api-1 Waiting
+ Container notes-api-1 Healthy
+ Container notes-proxy-1 Starting
+ Container notes-proxy-1 Started
+`}</Terminal>
+
+Output trimmed. The API starts only after both dependencies are healthy, and the proxy only after the API is, because
+the full file also gives `api` a healthcheck and makes `proxy` depend on it.
+
+## Two details in that healthcheck
+
+- **`CMD` vs `CMD-SHELL`.** `CMD` runs a program directly, like exec-form `CMD` in a Dockerfile. `CMD-SHELL` runs the
+  string through `/bin/sh`, which you need for `$VARIABLES`.
+- **`$$`.** Compose replaces `${VAR}` in the file with values from **your** environment before anything runs. `$$`
+  escapes that, so `$${POSTGRES_USER}` reaches the container as `${POSTGRES_USER}` and the shell **inside** the
+  container expands it from the container's environment.
+
+## The three conditions
+
+| Condition | Waits until the dependency… | Use for |
+| --- | --- | --- |
+| `service_started` (default) | container has started | ordering only |
+| `service_healthy` | reports healthy | databases, caches, anything with a startup delay |
+| `service_completed_successfully` | ran and exited with 0 | one-off jobs like migrations before the app starts |
+
+<Quiz
+  question="With condition: service_healthy on db, the API starts after Postgres is healthy. Later, Postgres restarts while the API is running. What protects the API now?"
+  options={[
+    { text: "depends_on: Compose pauses the API until db is healthy again", why: "depends_on only affects startup order. It does nothing once everything is running." },
+    { text: "Nothing in Compose; the API has to handle lost connections and retry itself", correct: true, why: "Startup ordering is a convenience, not resilience. The app still needs retries, as the notes API's waitForDatabase and pg's pool reconnection provide." },
+    { text: "The healthcheck restarts the API", why: "Healthchecks never restart anything in plain Docker or Compose." },
+    { text: "Compose restarts every dependent service automatically", why: "It doesn't watch dependencies after startup." },
+  ]}
+/>
+
+That's why the notes API keeps its own retry loop even though Compose now orders startup. Ordering makes the happy
+path clean; retries make the unhappy path survivable.
+
+<Checkpoint
+  title="Watch the order"
+  solution={<p>If the API starts before the database is healthy, check the <code>condition:</code> form is used. The list form <code>depends_on: [db]</code> only means <code>service_started</code>.</p>}
+>
+  <p>Run <code>docker compose down -v</code> then <code>docker compose up -d</code> and read the Waiting/Healthy sequence. Change the database's healthcheck to <code>["CMD", "false"]</code> and run <code>up</code> again: what does Compose report about the API? Restore it afterwards.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Plain `depends_on` and hoping.** It only orders container starts.</li>
+    <li>**Healthchecks that need tools the image lacks** (like `curl` in slim images).</li>
+    <li>**Dropping the app's own retries** because Compose orders startup.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`depends_on` alone = start order. Add `condition: service_healthy` to wait for ready.</li>
+    <li>Use the image's own readiness tool: `pg_isready`, `redis-cli ping`.</li>
+    <li>`$$` passes a literal `$` through to the container.</li>
+    <li>Apps still need retries; ordering only helps at startup.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Your app container starts before the database is ready and crashes. How do you fix it with Compose?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Scenario" }}
+  followUps={["Is that enough on its own?"]}
+>
+  <p>Add a healthcheck to the database that tests real readiness (`pg_isready` for Postgres), and make the app depend on it with `depends_on: { db: { condition: service_healthy } }`. Compose then waits for the database to report healthy before starting the app.</p>
+  <p>It's not enough on its own: depends_on only affects startup, so the app should still retry connections with backoff and survive the database restarting later. A restart policy covers crashes the app can't recover from.</p>
+</InterviewCard>

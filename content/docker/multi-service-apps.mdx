@@ -1,0 +1,139 @@
+export const meta = {
+  summary: "Describe the whole notes stack in one file: how services find each other, how networks keep them apart, and how to work with one service at a time.",
+  uses: ["06.01", "05.02"],
+  usedIn: ["06.03", "06.06"],
+};
+
+<BeforeYouStart>
+  You know the shape of a compose file (<L id="06.01" />) and the two-network layout from step 4 (<L id="05.02" />).
+</BeforeYouStart>
+
+## The core idea
+
+A multi-service app in Compose is the same set of containers you'd run by hand, but the relationships are written
+down: which services share a network, which volume holds the data, which service is built from source. Compose turns
+those relationships into the right `docker` calls, in the right order.
+
+## The notes stack as services
+
+<Code lang="yaml" file="compose.yaml (trimmed)">{`
+name: notes
+
+services:
+  proxy:
+    image: nginx:alpine
+    ports: ["8080:80"]
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [frontend]
+
+  api:
+    build:
+      context: ./api
+      target: dev
+    environment:
+      DATABASE_URL: postgres://notes:notes@db:5432/notes
+      REDIS_URL: redis://cache:6379
+    networks: [frontend, backend]
+
+  db:
+    image: postgres:18
+    volumes:
+      - pgdata:/var/lib/postgresql
+    networks: [backend]
+
+  cache:
+    image: redis:8-alpine
+    networks: [backend]
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  pgdata:
+`}</Code>
+
+The full file, with healthchecks and startup order, is in `project/docker/compose.yaml`; the next two lessons fill in
+the missing parts.
+
+Things worth noticing:
+
+- **Service names are hostnames.** `db`, `cache` and `api` resolve through Docker's DNS, exactly like container names
+  did in <L id="05.02" />. That's why `DATABASE_URL` says `@db:5432`, and why the Nginx config now proxies to
+  `http://api:3000`.
+- **Networks are the security boundary.** `api` is on both; `proxy` can't see `db` or `cache`.
+- **Only `proxy` has `ports:`.** Services talk to each other over their networks without publishing anything.
+- **Relative paths** like `./nginx/default.conf` and `./api` are relative to the compose file, so the project works
+  wherever it's cloned.
+- **`build:` instead of `image:`** for code you own. Compose builds it the first time, and again with
+  `docker compose up --build` or `docker compose build`.
+
+## Working with one service
+
+Most Compose commands take service names:
+
+<Terminal>{`
+$ docker compose logs api --tail 3
+api-1  | notes-api listening on :3000 (max note length 280)
+$ docker compose exec db psql -U notes -c 'SELECT count(*) FROM notes'
+ count
+-------
+     3
+(1 row)
+$ docker compose run --rm --no-deps cache redis-cli -h cache ping
+PONG
+`}</Terminal>
+
+- **`exec`** runs a command in the service's **running** container, like `docker exec`.
+- **`run`** starts a **new, one-off** container from the service's definition, with its networks and environment.
+  `--rm` removes it afterwards and `--no-deps` skips starting its dependencies. It's how you run migrations, scripts or
+  a one-time shell.
+- **`restart api`**, **`stop cache`**, **`up -d proxy`** all work per service too.
+
+<Quiz
+  question="The api service connects to postgres://notes:notes@localhost:5432/notes. Every other service is healthy, but the API can't reach the database. Why?"
+  options={[
+    { text: "Postgres needs ports: [\"5432:5432\"]", why: "Publishing is for the host. Services on the same network reach each other directly." },
+    { text: "localhost inside the api container is the api container; it should use the service name db", correct: true, why: "Each service is its own container with its own localhost. The database is reachable at db:5432 on the shared network." },
+    { text: "Compose services can't talk to each other by default", why: "They can, by service name, on any network they share." },
+    { text: "The database password is wrong", why: "That would be an authentication error, not a failure to connect." },
+  ]}
+/>
+
+<Checkpoint
+  title="Bring up the stack"
+  solution={<p><code>proxy</code> returns 502: the API is still starting, or isn't on <code>frontend</code>. <code>docker compose logs api</code> says which.</p>}
+>
+  <p>From <code>project/docker</code> (step 5, <code>docker-step-05</code>), run <code>docker compose up -d</code>. Use <code>exec</code> to count notes in Postgres, <code>run --rm</code> to ping Redis, and <code>logs -f api</code> while you <code>curl -X POST localhost:8080/notes</code>. Then <code>docker compose stop cache</code> and confirm the API still serves notes.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Using `localhost` between services.** Use the service name.</li>
+    <li>**Publishing every service's port "to be safe".** Only what you need to reach from your machine.</li>
+    <li>**Forgetting `--build` after changing the Dockerfile.** `up` reuses the existing image otherwise.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Service name = hostname on the project's networks.</li>
+    <li>Networks separate public and private services; only the entry point publishes ports.</li>
+    <li>`exec` into running services, `run --rm` for one-offs, `logs SERVICE` to focus.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do services in a Compose project communicate with each other?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+>
+  <p>Compose puts services on user-defined networks (a `<project>_default` network if none are declared), and Docker's embedded DNS resolves each service name to its container's IP. So the API connects to `db:5432` and `cache:6379`. Ports don't need publishing for this; `ports:` is only for access from the host. Services on networks they don't share can't reach each other, which you can use to separate public and private tiers.</p>
+</InterviewCard>

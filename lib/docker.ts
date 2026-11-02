@@ -92,12 +92,12 @@ export const modules: Module[] = [
     title: "Compose",
     blurb: "One file, one command, the whole stack.",
     lessons: [
-      l("06.01", "Anatomy of a compose file", 10, "CODE"),
-      l("06.02", "Multi-service apps", 12, "CODE"),
-      l("06.03", "Startup order and healthchecks", 9, "CODE"),
-      l("06.04", "Env files and profiles", 8, "CODE"),
-      l("06.05", "A dev loop with compose watch", 10, "CODE"),
-      l("06.06", "Project: one-command dev environment", 25, "BUILD"),
+      l("06.01", "Anatomy of a compose file", 11, "CODE", "compose-file-anatomy"),
+      l("06.02", "Multi-service apps", 11, "CODE", "multi-service-apps"),
+      l("06.03", "Startup order and healthchecks", 10, "CODE", "startup-order-and-healthchecks"),
+      l("06.04", "Env files and profiles", 11, "CODE", "env-files-and-profiles"),
+      l("06.05", "A dev loop with compose watch", 12, "CODE", "compose-watch"),
+      l("06.06", "Project: one-command dev environment", 25, "BUILD", "project-one-command-dev"),
     ],
   },
   {
@@ -142,7 +142,7 @@ export const projectSteps = [
   { tag: "docker-step-02", title: "Configure and health-check it", after: "03", detail: "Env-based config, a healthcheck and sensible limits." },
   { tag: "docker-step-03", title: "Persist Postgres", after: "04", detail: "Notes move to Postgres 18 on a named volume, with a tested dump and restore." },
   { tag: "docker-step-04", title: "Wire the services together", after: "05", detail: "Nginx in front, a Redis cache, and separate public and private networks." },
-  { tag: "docker-step-05", title: "One-command dev environment", after: "06", detail: "docker compose up with hot reload and seeded data." },
+  { tag: "docker-step-05", title: "One-command dev environment", after: "06", detail: "docker compose up --watch: healthy startup order, seeded data and hot reload." },
   { tag: "docker-step-06", title: "Ship from CI", after: "07", detail: "GitHub Actions builds, scans and pushes to GHCR." },
   { tag: "docker-step-07", title: "Deploy to a VPS", after: "07", detail: "Pull, migrate and roll forward with healthchecks." },
 ];
