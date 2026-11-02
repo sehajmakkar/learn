@@ -2,6 +2,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import pg from "pg";
+import { createClient } from "redis";
 
 // All configuration comes from the environment (see 03.03). Bad config fails fast at startup.
 function intFromEnv(name: string, fallback: number) {
@@ -25,6 +26,26 @@ if (!databaseUrl) {
 
 const pool = new pg.Pool({ connectionString: databaseUrl });
 
+// Redis is optional and only a cache (see 05.05): if it's missing or down, every request goes to Postgres.
+const redisUrl = process.env.REDIS_URL;
+const cache = redisUrl ? createClient({ url: redisUrl }) : null;
+cache?.on("error", (err: Error) => console.error("redis error:", err.message));
+const CACHE_KEY = "notes:all";
+
+async function cached<T>(load: () => Promise<T>): Promise<{ value: T; hit: boolean }> {
+  if (cache?.isReady) {
+    try {
+      const hit = await cache.get(CACHE_KEY);
+      if (hit) return { value: JSON.parse(hit) as T, hit: true };
+    } catch {
+      // fall through to the database
+    }
+  }
+  const value = await load();
+  if (cache?.isReady) await cache.set(CACHE_KEY, JSON.stringify(value), { EX: 30 }).catch(() => {});
+  return { value, hit: false };
+}
+
 // The database container may still be starting when we start (see 04.05), so retry for a while before giving up.
 async function waitForDatabase(attempts = 15) {
   for (let i = 1; ; i++) {
@@ -39,8 +60,8 @@ async function waitForDatabase(attempts = 15) {
   }
 }
 
-function send(res: ServerResponse, status: number, body: unknown) {
-  res.writeHead(status, { "content-type": "application/json" });
+function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
+  res.writeHead(status, { "content-type": "application/json", ...headers });
   res.end(JSON.stringify(body));
 }
 
@@ -55,8 +76,11 @@ const server = createServer(async (req, res) => {
     // Health stays cheap and doesn't touch the database (see 03.07).
     if (req.method === "GET" && req.url === "/healthz") return send(res, 200, { status: "ok" });
     if (req.method === "GET" && req.url === "/notes") {
-      const { rows } = await pool.query('SELECT id, text, created_at AS "createdAt" FROM notes ORDER BY created_at');
-      return send(res, 200, rows);
+      const { value, hit } = await cached(async () => {
+        const { rows } = await pool.query('SELECT id, text, created_at AS "createdAt" FROM notes ORDER BY created_at');
+        return rows;
+      });
+      return send(res, 200, value, { "x-cache": hit ? "hit" : "miss" });
     }
     if (req.method === "POST" && req.url === "/notes") {
       const { text } = (await readJson(req)) as { text?: unknown };
@@ -66,6 +90,7 @@ const server = createServer(async (req, res) => {
         'INSERT INTO notes (id, text) VALUES ($1, $2) RETURNING id, text, created_at AS "createdAt"',
         [randomUUID(), text],
       );
+      if (cache?.isReady) await cache.del(CACHE_KEY).catch(() => {});
       return send(res, 201, rows[0]);
     }
     send(res, 404, { error: "not found" });
@@ -75,6 +100,9 @@ const server = createServer(async (req, res) => {
     send(res, 500, { error: "internal error" });
   }
 });
+
+// Don't wait for Redis: the API works without it, and the client keeps reconnecting in the background.
+cache?.connect().catch((err: Error) => console.error("redis unavailable, serving without cache:", err.message));
 
 try {
   await waitForDatabase();
@@ -91,5 +119,9 @@ server.listen(port, () => console.log(`notes-api listening on :${port} (max note
 // docker stop sends SIGTERM. As PID 1 we must handle it ourselves (see 01.03).
 process.on("SIGTERM", () => {
   console.log("SIGTERM received, closing");
-  server.close(() => pool.end().then(() => process.exit(0)));
+  server.close(async () => {
+    await cache?.close().catch(() => {});
+    await pool.end();
+    process.exit(0);
+  });
 });
