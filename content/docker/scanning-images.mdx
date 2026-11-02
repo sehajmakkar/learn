@@ -36,7 +36,7 @@ Counts from this course's scans, all with the same Trivy version on the same day
 | notes API on `node:22-slim` | 1 | 42 | 110 | 84 | 239 |
 | `node:22-alpine` | 0 | 10 | 12 | 1 | 23 |
 
-The full Debian image has twenty times the findings of the slim one, because it has twenty times the packages. Base
+The full Debian image has nearly twenty times the findings of the slim one, because it ships far more packages: compilers, git, Python and their libraries. Base
 image choice (<L id="02.07" />) is your biggest lever. But 239 still sounds alarming, so filter to what you can act on.
 
 ## Only what's fixable
