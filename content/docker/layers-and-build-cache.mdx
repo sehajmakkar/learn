@@ -1,7 +1,7 @@
 export const meta = {
   summary: "Why a one-line change can rebuild your whole image, and how to order a Dockerfile so it doesn't.",
   uses: ["01.04", "02.01"],
-  usedIn: ["02.04", "07.05", "step-01"],
+  usedIn: ["02.04", "07.05", "docker-step-01"],
 };
 
 <BeforeYouStart>
@@ -37,16 +37,18 @@ You can list an image's layers with `docker history`:
 <Terminal>{`
 $ docker build -t my-api .
 $ docker history my-api
-IMAGE          CREATED          CREATED BY                          SIZE
-3f9a1c2b7d4e   10 seconds ago   CMD ["node" "src/index.js"]         0B
-<missing>      10 seconds ago   RUN /bin/sh -c npm ci # buildkit    48.2MB
-<missing>      12 seconds ago   COPY . . # buildkit                 1.31MB
-<missing>      12 seconds ago   WORKDIR /app                        0B
-<missing>      3 weeks ago      ...layers from node:22-slim...
+IMAGE          CREATED                  CREATED BY                                      SIZE
+a9ded8c2f9c7   Less than a second ago   CMD ["node" "src/index.js"]                     0B
+<missing>      Less than a second ago   RUN /bin/sh -c npm ci # buildkit                9.68MB
+<missing>      1 second ago             COPY . . # buildkit                             61.4kB
+<missing>      2 minutes ago            WORKDIR /app                                    8.19kB
+<missing>      5 days ago               CMD ["node"]                                    0B
+<missing>      5 days ago               ENTRYPOINT ["docker-entrypoint.sh"]             0B
+...
 `}</Terminal>
 
-Read it bottom to top: that's the order the layers stack. The `npm ci` layer is most of your image, which is why
-rebuilding it is what makes builds slow.
+Read it bottom to top: that's the order the layers stack. Lines from "5 days ago" come from `node:22-slim`. Of the
+layers you added, `npm ci` is by far the biggest (here, one dependency: Express), and it's the slow one to rebuild.
 
 Layers are also shared. If ten images on your machine start `FROM node:22-slim`, those base layers are stored once,
 and `docker pull` only downloads layers you don't already have.
@@ -134,7 +136,7 @@ $ docker build --progress=plain -t my-api .
 #8 CACHED
 
 #9 [5/5] COPY . .
-#9 DONE 0.1s
+#9 DONE 0.0s
 `}</Terminal>
 
   <p>Output is trimmed. You're looking for <code>CACHED</code> on <code>RUN npm ci</code> and real work only on the last <code>COPY</code>.</p>
