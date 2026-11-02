@@ -25,15 +25,15 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Build once for this runner's platform and load it, so it can be scanned before anything is published.
       - name: Build for scanning
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ env.CONTEXT }}
           load: true
@@ -50,7 +50,7 @@ jobs:
 
       - name: Image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -60,7 +60,7 @@ jobs:
       # Publishing is opt-in: set the repository variable PUBLISH_IMAGE to "true" to push to GHCR.
       - name: Log in to GHCR
         if: github.event_name != 'pull_request' && vars.PUBLISH_IMAGE == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -68,7 +68,7 @@ jobs:
 
       - name: Build and push (amd64 + arm64)
         if: github.event_name != 'pull_request' && vars.PUBLISH_IMAGE == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ env.CONTEXT }}
           platforms: linux/amd64,linux/arm64
