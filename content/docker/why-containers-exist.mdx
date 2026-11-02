@@ -1,0 +1,124 @@
+export const meta = {
+  summary: "The problem containers solve, what people did before them, and what Docker actually added.",
+  usedIn: ["01.02", "01.04"],
+};
+
+<BeforeYouStart>
+  Nothing yet. You only need to have deployed, or tried to run, someone else's code at least once.
+</BeforeYouStart>
+
+## The core idea
+
+Your code never runs alone. It runs on top of a language runtime, system libraries, config files and an operating
+system, and every one of those has a version. When any of them differ between your laptop and the server, the same
+code behaves differently.
+
+A **container** packages your app together with everything it needs above the kernel, and runs it as an isolated
+process. The package is called an **image**. The same image runs the same way on your laptop, in CI and in production.
+
+## "It works on my machine"
+
+Picture a small Python API. On your laptop it needs:
+
+- Python 3.12, because you used a newer syntax feature
+- `libpq`, the C library the Postgres driver links against
+- an environment variable pointing at the database
+- a particular version of OpenSSL, which the OS happens to ship
+
+The server has Python 3.9, a different OpenSSL, and another team's app that needs Python 3.9 to stay. Each mismatch
+is a bug that only shows up after you deploy, and fixing one app's environment can break the other's.
+
+That's the real problem: **an app's environment is part of the app, but it isn't shipped with the app.**
+
+## What people did before
+
+| Approach | How it works | Where it hurts |
+| --- | --- | --- |
+| Shared servers | Many apps installed side by side on one OS. | Dependency conflicts; one app's upgrade breaks another. |
+| Config management | Scripts (Chef, Puppet, Ansible) install the right versions on every server. | Slow, and servers still drift apart over time. |
+| One VM per app | Each app gets a whole virtual machine with its own OS. | Gigabytes per app, slow to boot, a full OS to patch for each one. |
+
+Virtual machines solved isolation, but at the cost of running a whole operating system for every app. You'll compare
+the two properly in <L id="01.02" />.
+
+## What a container gives you
+
+A container sits between those options. Each app gets its own filesystem, its own process tree and its own network,
+so apps can't see or break each other. But there's no second operating system: every container shares the host's
+kernel and starts about as fast as a normal process.
+
+What you get in practice:
+
+- **One artifact.** The image is the app plus its environment. You build it once and promote the same image from
+  test to production.
+- **Isolation without the weight.** Ten containers on one server don't need ten copies of an OS.
+- **Disposability.** A broken container is replaced, not repaired. Start a fresh one from the image.
+
+## What Docker actually added
+
+The pieces containers are made of existed long before Docker. `chroot` (changing a process's root directory) dates back
+to 1979, FreeBSD jails arrived in 2000, and the Linux features containers rely on, **namespaces** and **cgroups**,
+landed in the kernel through the 2000s. LXC combined them in 2008.
+
+Docker, released in 2013, didn't invent the isolation. It made it usable:
+
+- a simple text format for describing an image (the Dockerfile)
+- an image format built from shareable layers
+- a public registry to push and pull images from (Docker Hub)
+- one CLI that does all of it: `docker build`, `docker push`, `docker run`
+
+In 2015 the image and runtime formats were handed to the Open Container Initiative (OCI), which is why images built
+with Docker also run on Podman, containerd and Kubernetes. More on that in <L id="08.01" />.
+
+<Quiz
+  question="A colleague says 'Docker invented container isolation in Linux.' What's the more accurate version?"
+  options={[
+    { text: "Right: Docker added namespaces to the kernel in 2013", why: "Namespaces were added to Linux over the 2000s, years before Docker existed." },
+    { text: "Docker made existing kernel isolation easy to build, ship and run", correct: true, why: "The isolation came from namespaces and cgroups. Docker's contribution was the developer workflow: Dockerfiles, layered images, a registry and a single CLI." },
+    { text: "Docker is a lightweight hypervisor", why: "Docker doesn't virtualise hardware. Containers are processes on the host's kernel." },
+    { text: "Docker replaced the Linux kernel with its own", why: "Containers use the host's kernel directly. That's exactly why they start so fast." },
+  ]}
+/>
+
+## What containers don't solve
+
+It's worth being clear-eyed about the limits early:
+
+- **State.** A container's filesystem disappears when you delete it. Databases need volumes (<L id="04.02" />).
+- **Kernel differences.** Containers share the host kernel, so a Linux image needs a Linux kernel. On a Mac or
+  Windows, Docker runs a small Linux VM to provide one.
+- **Bad configuration.** A container with a wrong environment variable is still wrong, just consistently.
+- **Running many machines.** Docker runs containers on one host. Scheduling them across many is what Kubernetes is
+  for (<L id="08.04" />).
+
+<Mistakes>
+  <ul>
+    <li>**Thinking of containers as small VMs.** They're processes with a restricted view of the system. That difference explains most of how they behave.</li>
+    <li>**Treating a container like a server you log into and fix.** Change the image and start a new container instead; otherwise your fix disappears on the next deploy.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>An app's environment is part of the app. Containers ship them together.</li>
+    <li>An image is the package; a container is a running instance of it.</li>
+    <li>Containers share the host kernel, so they're light and fast to start.</li>
+    <li>Docker's contribution was the workflow, not the isolation.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Why would a team adopt containers? And what problems don't containers solve?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How would you run a database in containers safely?", "When would you still choose a VM?"]}
+>
+  <p>Containers ship an app together with its runtime, libraries and config, so the artifact you test is the artifact you deploy. That removes environment drift between laptops, CI and production, isolates apps from each other on shared hosts, and makes deploys and rollbacks a matter of swapping images.</p>
+  <p>They don't solve persistent state (you need volumes or a managed database), orchestration across many machines (that's Kubernetes or similar), or strong multi-tenant isolation, since every container shares the host kernel.</p>
+</InterviewCard>

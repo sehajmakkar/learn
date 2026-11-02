@@ -1,0 +1,185 @@
+export const meta = {
+  summary: "The Docker CLI is one pattern repeated: docker, a noun, a verb. Learn the pattern and the twenty commands you'll actually use.",
+  uses: ["01.04", "01.05"],
+  usedIn: ["02.01", "03.01", "03.04"],
+};
+
+<BeforeYouStart>
+  Docker is installed and `docker version` shows a server (<L id="01.05" />).
+</BeforeYouStart>
+
+## The core idea
+
+Nearly every Docker command has the same shape:
+
+<Anatomy
+  title="The shape of a command"
+  parts={[
+    { text: "docker" },
+    { text: " " },
+    { text: "container", label: "object" },
+    { text: " " },
+    { text: "ls", label: "verb" },
+    { text: " " },
+    { text: "--all", label: "flags" },
+  ]}
+  caption="Objects: container, image, volume, network, builder, system. Verbs: ls, inspect, rm, prune, and a few more."
+/>
+
+The most common commands also have older short forms. `docker ps` is `docker container ls`, `docker images` is
+`docker image ls`, `docker rmi` is `docker image rm`. Both work; you'll see both in the wild.
+
+## The commands you'll actually use
+
+| Task | Command |
+| --- | --- |
+| Run a container | `docker run [flags] image [command]` |
+| List running containers | `docker ps` (add `-a` for stopped ones too) |
+| Stop, start, restart | `docker stop web`, `docker start web`, `docker restart web` |
+| Remove a container | `docker rm web` (add `-f` to stop it first) |
+| See logs | `docker logs -f --tail 50 web` |
+| Run a command inside | `docker exec -it web sh` |
+| Live resource use | `docker stats` |
+| Everything about it | `docker inspect web` |
+| List images | `docker images` |
+| Download, upload | `docker pull nginx:alpine`, `docker push ghcr.io/you/api:1.0` |
+| Build an image | `docker build -t my-api .` |
+| Remove an image | `docker rmi my-api` |
+| Disk usage | `docker system df` |
+| Clean up | `docker system prune` |
+
+## docker run, flag by flag
+
+`docker run` has dozens of flags, but these cover most days:
+
+<Code lang="bash" file="run">{`
+docker run \\
+  -d \\
+  --name api \\
+  -p 8080:3000 \\
+  -e NODE_ENV=production \\
+  -v api-data:/data \\
+  --rm \\
+  my-api:1.0
+`}</Code>
+
+| Flag | Means |
+| --- | --- |
+| `-d` | detached: run in the background and print the container ID |
+| `--name api` | a name to use instead of the random one Docker picks |
+| `-p 8080:3000` | host port 8080 forwards to container port 3000 |
+| `-e KEY=value` | set an environment variable |
+| `-v api-data:/data` | mount the volume `api-data` at `/data` (<L id="04.02" />) |
+| `--rm` | delete the container when it exits |
+| `-it` | interactive with a terminal; use it for shells, not servers |
+
+Anything after the image name replaces the image's default command: `docker run --rm -it ubuntu bash`.
+
+## run, start and exec
+
+These three trip people up because they all sound like "make it go":
+
+- `docker run` creates a **new** container from an image and starts it.
+- `docker start` starts an **existing**, stopped container again, with the same writable layer.
+- `docker exec` runs an **extra** process inside a container that's already running.
+
+<Quiz
+  question="You run docker run -it ubuntu bash, create a file, then type exit. What state is that container in?"
+  options={[
+    { text: "Deleted, along with the file", why: "Only if you'd passed --rm. Without it, the container stays." },
+    { text: "Stopped, and the file is still in its writable layer", correct: true, why: "When the main process (bash) exits, the container stops but isn't removed. docker ps -a lists it, and docker start -ai brings the same container back with your file." },
+    { text: "Still running in the background", why: "A container runs as long as its main process. bash exited, so the container stopped." },
+    { text: "Paused, waiting for you to reattach", why: "Paused is a separate state you only get with docker pause." },
+  ]}
+/>
+
+## Finding things out
+
+Two habits save a lot of guessing. Read logs before anything else, and use `inspect` with `--format` to pull out one
+field instead of scrolling through JSON:
+
+<Terminal>{`
+$ docker logs --tail 20 web
+$ docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' web
+exited 137
+$ docker inspect --format '{{.NetworkSettings.IPAddress}}' web
+`}</Terminal>
+
+An exit code of `137` means the container was killed (<L id="01.03" />).
+
+## Cleaning up
+
+Docker never deletes anything on its own, so disk usage grows. See where it went, then prune:
+
+<Terminal>{`
+$ docker system df
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          14        3         4.2GB     3.1GB (73%)
+Containers      9         2         180MB     160MB (88%)
+Local Volumes   5         2         1.1GB     600MB (54%)
+Build Cache     61        0         2.3GB     2.3GB
+$ docker system prune
+`}</Terminal>
+
+Example output. `docker system prune` removes stopped containers, unused networks, dangling images and build cache.
+It **does not** remove volumes unless you add `--volumes`, and only removes images without a tag unless you add `-a`.
+Both of those flags can delete things you want, so read the prompt before saying yes.
+
+<Checkpoint
+  title="Run, start, exec and clean up"
+  solution={<p>If <code>docker start -ai box</code> says the container doesn't exist, you probably ran the first command with <code>--rm</code>. Leave it off for this exercise.</p>}
+>
+  <p>Do each of these and predict the result before you press enter:</p>
+
+<Terminal>{`
+$ docker run -it --name box ubuntu bash
+$ touch /keep-me && exit
+$ docker ps -a --filter name=box
+$ docker start -ai box
+$ ls /keep-me
+$ exit
+$ docker rm box
+$ docker system df
+`}</Terminal>
+
+  <p>The file survives the stop and start because it's the same container. It's gone only after <code>docker rm</code>.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Using `docker run` to "restart" a container.** It makes a new one each time, leaving stopped copies behind. Use `docker start`, or `--rm` for throwaway runs.</li>
+    <li>**Putting flags after the image name.** `docker run nginx -p 8080:80` passes `-p 8080:80` to nginx, not to Docker.</li>
+    <li>**Running `docker system prune -a --volumes` on autopilot.** It can delete volumes holding real data.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Commands are `docker <object> <verb>`; short forms like `docker ps` still work.</li>
+    <li>`run` makes a new container, `start` restarts an existing one, `exec` adds a process to a running one.</li>
+    <li>Flags go before the image name; anything after it is the container's command.</li>
+    <li>`docker system df` shows usage; prune carefully.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between docker run, docker start and docker exec?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+>
+  <p>`run` creates a new container from an image and starts its main process. `start` starts an existing stopped container again, keeping its writable layer and configuration. `exec` starts an additional process inside a container that's already running, for example a shell for debugging. It doesn't work on stopped containers.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "A CI server running Docker is out of disk. How do you find what's using space and reclaim it safely?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Debugging" }}
+  followUps={["How would you stop it happening again?"]}
+>
+  <p>Start with `docker system df` (and `-v` for detail) to see how much is in images, containers, volumes and build cache. On CI it's usually build cache and old images. Then prune by type: `docker builder prune` for build cache, `docker image prune -a` for unused images, `docker container prune` for stopped containers. Leave volumes alone unless you've confirmed they're disposable.</p>
+  <p>To prevent it, add a scheduled prune with a filter like `--filter until=72h`, and cap build cache with BuildKit's garbage-collection settings.</p>
+</InterviewCard>

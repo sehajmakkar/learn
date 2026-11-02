@@ -1,0 +1,166 @@
+export const meta = {
+  summary: "Get Docker running on your machine, then trace exactly what happens when you type docker run.",
+  uses: ["01.04"],
+  usedIn: ["01.06", "03.01"],
+};
+
+<BeforeYouStart>
+  You know what images and containers are (<L id="01.04" />). You'll need admin rights on your machine to install
+  software.
+</BeforeYouStart>
+
+## The core idea
+
+Docker has two halves. The **`docker` CLI** you type into is only a client. The work is done by the **Docker daemon**
+(`dockerd`), a background service that builds images, pulls them from registries and runs containers. The CLI sends it
+requests over a local socket and prints the replies.
+
+Installing Docker means getting both halves running. Most problems in this lesson come from the daemon not running,
+or the CLI not being allowed to talk to it.
+
+## Pick an install
+
+| You're on | Install | Notes |
+| --- | --- | --- |
+| macOS or Windows | Docker Desktop | Runs a small Linux VM for your containers. Free for personal use, education and small businesses; larger companies need a paid plan. |
+| Linux | Docker Engine | The daemon runs directly on your kernel. Open source and free. Docker Desktop for Linux also exists. |
+| macOS, alternatives | OrbStack, Colima | Also provide a Linux VM and the same `docker` CLI. |
+
+Follow the official instructions for your platform at docs.docker.com/get-docker. On Linux, prefer installing from
+Docker's apt or dnf repository over your distribution's own `docker.io` package, which is often older.
+
+### Linux: running without sudo
+
+On Linux the daemon's socket, `/var/run/docker.sock`, belongs to root and the `docker` group. To run `docker` without
+`sudo`, add yourself to that group, then log out and back in:
+
+<Terminal>{`
+$ sudo usermod -aG docker $USER
+`}</Terminal>
+
+Know what that means: anyone who can talk to the daemon can start a container that mounts the host's `/` and do
+anything as root. **Being in the `docker` group is effectively root on that machine.** Fine on your laptop; think twice
+on shared servers. Rootless mode avoids this, covered in <L id="08.03" />.
+
+## Check both halves
+
+<Terminal>{`
+$ docker version
+Client:
+ Version:           27.3.1
+ ...
+Server: Docker Desktop 4.36.0
+ Engine:
+  Version:          27.3.1
+  ...
+`}</Terminal>
+
+Output trimmed; your versions will differ. If you see a `Client` section but an error instead of `Server`, the CLI is
+installed and the daemon isn't reachable.
+
+## Your first container
+
+<Terminal>{`
+$ docker run hello-world
+Unable to find image 'hello-world:latest' locally
+latest: Pulling from library/hello-world
+...
+Hello from Docker!
+This message shows that your installation appears to be working correctly.
+...
+`}</Terminal>
+
+That one command did a lot:
+
+<Flow
+  title="What docker run hello-world does"
+  steps={[
+    { label: "CLI → daemon", detail: "The CLI sends a 'run hello-world' request over the Docker socket." },
+    { label: "Look locally", detail: "The daemon checks for hello-world:latest in its local image store. It isn't there." },
+    { label: "Pull", detail: "It downloads the image's layers from Docker Hub, docker.io/library/hello-world." },
+    { label: "Create and start", detail: "It adds a writable layer, sets up namespaces and cgroups, and starts the process." },
+    { label: "Stream output", detail: "The program prints its message and exits. Output streams back to your terminal." },
+  ]}
+/>
+
+Run it again and the "Unable to find image" and pull lines disappear: the image is cached locally now.
+
+## Something more useful
+
+hello-world exits immediately. A web server keeps running:
+
+<Terminal>{`
+$ docker run -d -p 8080:80 --name web nginx:alpine
+$ curl -s localhost:8080 | head -4
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+$ docker logs web
+...
+$ docker stop web
+$ docker rm web
+`}</Terminal>
+
+`-d` runs it in the background. `-p 8080:80` forwards port 8080 on your machine to port 80 in the container. You'll
+look at each flag properly in <L id="01.06" />.
+
+<Quiz
+  question="docker ps fails with: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running? What's the most likely cause?"
+  options={[
+    { text: "The image you want isn't downloaded", why: "docker ps doesn't need any image. The CLI can't reach the daemon at all." },
+    { text: "The daemon isn't running", correct: true, why: "The CLI found nothing listening on the socket. Start Docker Desktop, or on Linux: sudo systemctl start docker." },
+    { text: "You're not in the docker group", why: "That gives a different error: 'permission denied while trying to connect to the Docker daemon socket'." },
+    { text: "Docker Hub is down", why: "docker ps never talks to a registry. It only asks the local daemon." },
+  ]}
+/>
+
+## See it yourself
+
+<Checkpoint
+  title="Prove both halves work"
+  solution={<p>No <code>Server</code> section: start Docker Desktop, or run <code>sudo systemctl start docker</code> on Linux. Permission denied on Linux: add yourself to the <code>docker</code> group and log out and back in, or use <code>sudo</code> for now.</p>}
+>
+  <p>Run <code>docker version</code> and check you see both <code>Client</code> and <code>Server</code>. Then run <code>hello-world</code> twice and notice the second run doesn't pull. Finally, open <code>localhost:8080</code> in your browser while the nginx container from above is running.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Forgetting Docker Desktop has to be open.** On Mac and Windows, closing it stops the daemon.</li>
+    <li>**Using `sudo docker` for everything on Linux.** It works, but files created through bind mounts end up owned by root, and you'll fight permissions later.</li>
+    <li>**Adding users to the `docker` group on shared servers without thinking.** It grants root-equivalent access.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>The `docker` CLI is a client; the daemon does the work.</li>
+    <li>Docker Desktop runs containers in a Linux VM; on Linux, Docker Engine uses your kernel directly.</li>
+    <li>`docker run` pulls the image if needed, creates a container and starts it.</li>
+    <li>Access to the Docker socket is root-equivalent.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Walk me through what happens when you run docker run nginx.", level: "Junior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What does containerd do in this picture?", "What changes the second time you run it?"]}
+>
+  <p>The CLI sends the request to the Docker daemon over its socket. The daemon resolves `nginx` to `docker.io/library/nginx:latest`, checks its local image store, and pulls any missing layers from Docker Hub. It then creates a container: a writable layer on top of the image, plus namespaces, cgroups and networking. Finally it starts the image's default command, and output streams back to the CLI.</p>
+  <p>Under the hood the daemon hands the container to containerd, which uses runc to create the actual process.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "Why is being in the docker group considered a security risk?", level: "Mid", frequency: 2, importance: "Must-know", kind: "Concept" }}
+  followUps={["What are the alternatives?"]}
+>
+  <p>Members of the group can talk to the Docker daemon, which runs as root. They can start a container that bind-mounts the host's root filesystem, or runs privileged, and get full root access to the host. So group membership is equivalent to passwordless root.</p>
+  <p>Alternatives are rootless Docker or Podman, which run the daemon or containers as an unprivileged user, and restricting who can reach the socket.</p>
+</InterviewCard>

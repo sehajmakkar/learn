@@ -1,0 +1,143 @@
+export const meta = {
+  summary: "Both isolate apps. One virtualises hardware, the other shares a kernel. That single difference explains speed, size and security.",
+  uses: ["01.01"],
+  usedIn: ["01.03", "08.03"],
+};
+
+<BeforeYouStart>
+  You know why containers exist (<L id="01.01" />). It helps to know that the **kernel** is the core of the operating
+  system: the part that manages processes, memory, files and the network for every program.
+</BeforeYouStart>
+
+## The core idea
+
+A **virtual machine** pretends to be a whole computer. It gets virtual CPUs, memory and disks, and boots its own
+operating system with its own kernel.
+
+A **container** doesn't pretend to be a computer at all. It's a normal process running on the host's kernel, which has
+been told to show that process a private view of the system.
+
+Everything else in this lesson follows from that.
+
+<Stacks
+  title="Where the kernel lives"
+  columns={[
+    {
+      title: "Virtual machines",
+      note: "a kernel per VM",
+      layers: [
+        ["App A", "App B"],
+        ["Libraries", "Libraries"],
+        [{ text: "Guest OS + kernel", tone: "accent" }, { text: "Guest OS + kernel", tone: "accent" }],
+        ["Hypervisor"],
+        [{ text: "Host OS / hardware", tone: "muted" }],
+      ],
+    },
+    {
+      title: "Containers",
+      note: "one shared kernel",
+      layers: [
+        ["App A", "App B"],
+        ["Libraries", "Libraries"],
+        ["Container runtime (Docker)"],
+        [{ text: "Host OS + kernel", tone: "accent" }],
+        [{ text: "Hardware", tone: "muted" }],
+      ],
+    },
+  ]}
+  caption="A VM image carries a whole operating system. A container image carries only the files above the kernel."
+/>
+
+## What follows from sharing a kernel
+
+| | Virtual machine | Container |
+| --- | --- | --- |
+| Starts in | tens of seconds (it boots an OS) | about as long as the app takes to start |
+| Image size | gigabytes | often tens to hundreds of megabytes |
+| Runs a different OS | yes, Windows on a Linux host is fine | only one built for the host's kernel |
+| Isolation boundary | the hypervisor, a small, hardened layer | the shared kernel, a much larger surface |
+| Overhead per instance | a whole OS's memory | close to a normal process |
+
+The speed and size come for free: there's no second OS to boot or store. The trade-off is the isolation boundary.
+Every container talks to the same kernel, so a kernel vulnerability can let a process escape its container. A VM
+attacker has to break the hypervisor instead, which is far harder.
+
+That's why platforms that run strangers' code side by side often wrap containers in very light VMs. AWS Lambda and
+Fargate, for example, run on Firecracker microVMs, and tools like gVisor and Kata Containers exist for the same reason.
+
+## The Mac and Windows question
+
+If containers need the host's kernel, how does a Linux image run on a Mac?
+
+It doesn't, directly. Docker Desktop on macOS and Windows starts a small Linux VM in the background, and your
+containers run on that VM's kernel. It's mostly invisible, but it explains things you'll hit later: file sharing
+between your Mac and containers is slower than on Linux, and the memory you give Docker Desktop is the VM's memory.
+
+<Quiz
+  question="On an Ubuntu 24.04 server, you start a container from a Fedora image and run uname -r inside it. Whose kernel version is printed?"
+  options={[
+    { text: "Fedora's kernel, from the image", why: "Images don't contain a running kernel. They only hold the files above it." },
+    { text: "The Ubuntu host's kernel", correct: true, why: "The container is a process on the host, so it sees the host's kernel. The Fedora part is just the userland files: package manager, libraries, /etc." },
+    { text: "Docker's own kernel", why: "Docker doesn't ship a kernel on Linux. It asks the host kernel to isolate the process." },
+    { text: "It fails: Fedora images can't run on Ubuntu", why: "They run fine. Linux images need a Linux kernel, not the same distribution." },
+  ]}
+/>
+
+## See it yourself
+
+<Checkpoint
+  title="Same kernel, different userland"
+  solution={<p>On a Mac or Windows machine, the container shows Docker Desktop's VM kernel, which usually has <code>linuxkit</code> in its name. Your host's own <code>uname -r</code> will be different. That's the hidden VM from the section above.</p>}
+>
+  <p>Compare the kernel and the OS release, on your machine and inside a container.</p>
+
+<Terminal>{`
+$ uname -r
+6.8.0-45-generic
+$ docker run --rm alpine uname -r
+6.8.0-45-generic
+$ docker run --rm alpine cat /etc/os-release | head -2
+NAME="Alpine Linux"
+ID=alpine
+`}</Terminal>
+
+  <p>Output from an Ubuntu host. On Linux, both kernel versions match. The OS release says Alpine because that's the userland in the image.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Assuming containers are as isolated as VMs.** Fine for your own services; not enough on its own for running untrusted code from different customers.</li>
+    <li>**Expecting a Windows image to run on a Linux host.** Images are built for a kernel. Windows containers need a Windows host.</li>
+    <li>**Thinking "containers vs VMs" is either/or.** In the cloud, your containers almost always run inside VMs anyway.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A VM virtualises hardware and boots its own kernel. A container is a process on the host kernel.</li>
+    <li>Sharing the kernel makes containers small and fast, and makes the isolation weaker.</li>
+    <li>On Mac and Windows, Docker Desktop runs your containers inside a hidden Linux VM.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is the difference between a container and a virtual machine?", level: "Junior", frequency: 4, importance: "Must-know", kind: "Concept" }}
+  followUps={["Which would you choose to run untrusted customer code, and why?", "How does Docker run Linux containers on a Mac?"]}
+>
+  <p>A VM virtualises hardware: a hypervisor gives each VM virtual CPU, memory and disks, and each VM boots a full operating system with its own kernel. A container is an isolated process on the host's kernel; namespaces limit what it can see and cgroups limit what it can use.</p>
+  <p>So containers start in about the time the app takes to start and are much smaller, but they share one kernel, so isolation is weaker. VMs are heavier but have a smaller, harder attack surface and can run a different OS from the host.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "Can you run a Windows container on a Linux host? Why or why not?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+>
+  <p>Not directly. Containers use the host's kernel, and a Windows container expects the Windows kernel's interfaces. You'd need a Windows host, or a Windows VM on the Linux host. The reverse works on Windows only because Docker Desktop runs Linux containers inside a Linux VM.</p>
+</InterviewCard>

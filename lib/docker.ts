@@ -26,12 +26,12 @@ export const modules: Module[] = [
     title: "Foundations",
     blurb: "What a container actually is, and why it beat the alternatives.",
     lessons: [
-      l("01.01", "Why containers exist", 9, "CONCEPT"),
-      l("01.02", "Containers vs virtual machines", 11, "CONCEPT"),
-      l("01.03", "Under the hood: namespaces and cgroups", 16, "CODE"),
-      l("01.04", "Images, containers, registries", 10, "CONCEPT"),
-      l("01.05", "Install Docker and run your first container", 12, "CODE"),
-      l("01.06", "The Docker CLI, mapped", 10, "CODE"),
+      l("01.01", "Why containers exist", 9, "CONCEPT", "why-containers-exist"),
+      l("01.02", "Containers vs virtual machines", 11, "CONCEPT", "containers-vs-virtual-machines"),
+      l("01.03", "Under the hood: namespaces and cgroups", 16, "CODE", "namespaces-and-cgroups"),
+      l("01.04", "Images, containers, registries", 12, "CODE", "images-containers-registries"),
+      l("01.05", "Install Docker and run your first container", 12, "CODE", "install-and-first-container"),
+      l("01.06", "The Docker CLI, mapped", 12, "CODE", "docker-cli-mapped"),
     ],
   },
   {

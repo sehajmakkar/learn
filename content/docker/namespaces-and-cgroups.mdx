@@ -1,0 +1,159 @@
+export const meta = {
+  summary: "A container is a process with a private view of the system and a budget. Here are the two kernel features that make it one.",
+  uses: ["01.02"],
+  usedIn: ["03.06", "05.01", "08.02"],
+};
+
+<BeforeYouStart>
+  You know containers share the host kernel (<L id="01.02" />). You'll need Docker installed to run the commands
+  (<L id="01.05" />). If you haven't installed it yet, read this now and come back to the checkpoints.
+</BeforeYouStart>
+
+## The core idea
+
+There's no such thing as a "container" inside the Linux kernel. What Docker starts is an ordinary process, with three
+things set up around it:
+
+- **Namespaces** control what the process can **see**: its own process list, network, hostname and mount points.
+- **Cgroups** (control groups) control what it can **use**: how much memory and CPU, how many processes.
+- **A root filesystem**, the image, becomes its `/`.
+
+Docker also drops some privileges (Linux capabilities) and blocks risky system calls (seccomp), but namespaces and
+cgroups are the heart of it.
+
+## Namespaces: a private view
+
+Each namespace type wraps one part of the system. A process inside sees only what's in its namespace:
+
+| Namespace | Isolates | Inside the container you see… |
+| --- | --- | --- |
+| `pid` | process IDs | your app as PID 1, and only its own processes |
+| `net` | network interfaces, ports, routes | its own `eth0` and `localhost` |
+| `mnt` | mount points | the image's filesystem as `/` |
+| `uts` | hostname | a hostname of its own |
+| `ipc` | shared memory, message queues | only its own |
+| `user` | user and group IDs | root inside can map to a normal user outside |
+
+Docker gives each container its own `pid`, `net`, `mnt`, `uts` and `ipc` namespaces by default. User namespaces are
+opt-in; you'll meet them in <L id="08.03" />.
+
+The important bit: from the host, the container's processes are still right there, with normal PIDs. Namespaces hide
+the host from the container, not the container from the host.
+
+## See it yourself: one process, two views
+
+<Checkpoint
+  title="Find a container's process from both sides"
+  solution={<p><code>docker top</code> asks the host, so it shows host PIDs. <code>docker exec ... ps</code> runs inside the container's PID namespace, so it shows container PIDs, starting from 1.</p>}
+>
+  <p>Start nginx, then list its processes from inside and from the host.</p>
+
+<Terminal>{`
+$ docker run -d --name web nginx:alpine
+$ docker exec web ps
+PID   USER     TIME  COMMAND
+    1 root      0:00 nginx: master process nginx -g daemon off;
+   30 nginx     0:00 nginx: worker process
+   ...
+$ docker top web
+UID     PID     PPID    C   STIME   TTY   TIME       CMD
+root    41728   41705   0   10:02   ?     00:00:00   nginx: master process nginx -g daemon off;
+...
+`}</Terminal>
+
+  <p>Output trimmed; your PIDs will differ. Inside, nginx is PID 1. On the host, the same process has a normal PID like 41728.</p>
+</Checkpoint>
+
+You can even build a namespace by hand. Inside a privileged throwaway container (so this works on any OS), `unshare`
+starts a shell in a brand-new PID namespace:
+
+<Terminal>{`
+$ docker run --rm -it --privileged ubuntu bash
+$ unshare --pid --fork --mount-proc bash
+$ ps
+    PID TTY          TIME CMD
+      1 pts/0    00:00:00 bash
+      8 pts/0    00:00:00 ps
+`}</Terminal>
+
+The new shell thinks it's PID 1 and can't see anything else. That's the same kernel feature Docker uses, minus the
+convenience.
+
+## Cgroups: a budget
+
+Namespaces don't limit anything. A process that can only see itself can still eat all the host's memory. Cgroups fix
+that: the kernel accounts for every cgroup's memory, CPU and process count, and enforces the limits you set.
+
+<Code lang="bash" file="limits">{`
+docker run -d --name capped --memory 64m --cpus 0.5 nginx:alpine
+docker stats --no-stream capped
+docker exec capped cat /sys/fs/cgroup/memory.max
+`}</Code>
+
+`docker stats` shows a memory limit of 64 MiB, and the last command prints `67108864`, the same limit in bytes, read
+straight from the cgroup files the kernel uses. (That path is for cgroup v2, which current Linux distributions and
+Docker Desktop use.)
+
+When a container hits its memory limit and can't reclaim any, the kernel's **OOM killer** ends a process in it. If
+that's the main process, the container exits with code `137` (128 + signal 9, SIGKILL), and `docker inspect` reports
+`OOMKilled: true`. You'll tune limits properly in <L id="03.06" />.
+
+<Quiz
+  question="You start a container with --memory 64m. What actually enforces that limit?"
+  options={[
+    { text: "The Docker daemon, which checks usage and stops the container", why: "Docker only sets the limit up. It isn't watching usage in a loop." },
+    { text: "The Linux kernel, through the container's cgroup", correct: true, why: "Docker writes the limit into the cgroup. From then on the kernel accounts for every page and acts when the limit is reached." },
+    { text: "The app, which reads the limit and stays under it", why: "Most apps don't know about the limit at all, which is a common cause of OOM kills." },
+    { text: "The image, which reserves 64 MB when it's built", why: "Limits are set when you run a container, not when you build an image." },
+  ]}
+/>
+
+## PID 1 is special
+
+Because your app is PID 1 in its namespace, it inherits a job normally done by `init`: the kernel won't apply default
+signal behaviour to PID 1. If your app doesn't explicitly handle `SIGTERM`, `docker stop` sends it, nothing happens,
+and ten seconds later Docker gives up and sends `SIGKILL`.
+
+Two fixes: handle `SIGTERM` in your app (you should anyway, to shut down cleanly), or run with `docker run --init`,
+which puts a tiny init process in front of your app to forward signals.
+
+<Mistakes>
+  <ul>
+    <li>**Assuming namespaces limit resources.** They only hide things. Without cgroup limits, one container can starve the host.</li>
+    <li>**Ignoring exit code 137.** It almost always means the container was killed, usually by the OOM killer. Check `docker inspect` for `OOMKilled`.</li>
+    <li>**Apps that ignore SIGTERM.** Every `docker stop` then takes ten seconds and ends with a hard kill.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A container is a process plus namespaces, cgroups and a root filesystem.</li>
+    <li>Namespaces decide what it can see. Cgroups decide what it can use.</li>
+    <li>From the host, container processes are normal processes with normal PIDs.</li>
+    <li>Your app is PID 1, so it must handle SIGTERM, or run with `--init`.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is a container, at the operating-system level?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Which namespaces does Docker create by default?", "What happens when a container exceeds its memory limit?"]}
+>
+  <p>A regular Linux process (or process tree) that the kernel isolates and constrains. Namespaces give it a private view of process IDs, network, mounts, hostname and IPC. Cgroups limit and account for its CPU, memory and process count. Its root filesystem is the image, and Docker additionally drops capabilities and applies a seccomp profile.</p>
+  <p>There's no container object in the kernel; "container" is the name for that combination.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "docker stop takes ten seconds for one of your containers, every time. Why, and how do you fix it?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Debugging" }}
+  followUps={["How does the shell form of CMD make this worse?"]}
+>
+  <p>`docker stop` sends SIGTERM, waits ten seconds by default, then sends SIGKILL. The app runs as PID 1, and the kernel doesn't apply default signal handling to PID 1, so if the app doesn't install a SIGTERM handler, the signal is ignored and it only dies at the timeout.</p>
+  <p>Handle SIGTERM in the app and shut down cleanly, or run with `--init` so a small init process forwards signals. Also make sure the app really is PID 1: with the shell form of CMD, a shell is PID 1 and may not pass the signal on.</p>
+</InterviewCard>

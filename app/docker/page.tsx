@@ -36,10 +36,10 @@ export default function DockerPage() {
           </p>
           <div className="mt-8 flex flex-wrap items-center gap-3">
             <Link
-              href="/docker/layers-and-build-cache"
+              href="/docker/why-containers-exist"
               className="inline-flex h-10 items-center gap-2 bg-ink px-4 text-[0.92rem] text-paper transition-opacity hover:opacity-85"
             >
-              Read the sample lesson <span aria-hidden>→</span>
+              Start with 01.01 <span aria-hidden>→</span>
             </Link>
             <a
               href="#curriculum"
