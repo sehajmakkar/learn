@@ -1,0 +1,153 @@
+export const meta = {
+  summary: "Mount a folder from your machine into a container: live-edit code, inject config, and avoid the three traps (hidden files, missing paths, root-owned output).",
+  uses: ["04.01", "04.02"],
+  usedIn: ["06.05"],
+};
+
+<BeforeYouStart>
+  You know what volumes are (<L id="04.02" />).
+</BeforeYouStart>
+
+## The core idea
+
+A **bind mount** maps a specific folder (or file) on your machine to a path in the container. It isn't a copy: both
+sides see the same files, and a change on one side shows up on the other immediately. That makes it ideal for
+development and for handing a container config files. It's a poor fit for production data, which belongs in volumes.
+
+## Live editing
+
+<Terminal>{`
+$ mkdir site && echo '<h1>v1</h1>' > site/index.html
+$ docker run -d --name live -p 8086:80 -v "$PWD/site":/usr/share/nginx/html:ro nginx:alpine
+$ curl localhost:8086
+<h1>v1</h1>
+$ echo '<h1>v2, edited on the host</h1>' > site/index.html
+$ curl localhost:8086
+<h1>v2, edited on the host</h1>
+`}</Terminal>
+
+No rebuild, no restart. `:ro` stops the container from writing back:
+
+<Terminal>{`
+$ docker exec live sh -c 'echo x > /usr/share/nginx/html/new.html'
+sh: can't create /usr/share/nginx/html/new.html: Read-only file system
+`}</Terminal>
+
+The source must be an **absolute** path (`"$PWD/site"`, not `site`). A bare name like `site` would be read as a volume
+name instead.
+
+## Trap 1: the mount hides what was there
+
+A bind mount replaces the whole directory. Whatever the image had at that path becomes invisible:
+
+<Terminal>{`
+$ docker run --rm -v "$PWD/site":/usr/share/nginx/html nginx:alpine ls /usr/share/nginx/html
+index.html
+`}</Terminal>
+
+nginx's own `50x.html` is gone; only your folder's contents show. The classic case is mounting a Node project over
+`/app` for development: the image's `node_modules` disappears behind your folder, which has none (or has packages built
+for macOS):
+
+<Terminal>{`
+$ docker run --rm notes-dev ls /app
+dist node_modules package-lock.json package.json src tsconfig.json
+$ docker run --rm -v "$PWD":/app notes-dev ls /app
+package-lock.json package.json src tsconfig.json
+$ docker run --rm -v "$PWD":/app -v /app/node_modules notes-dev ls /app
+node_modules package-lock.json package.json src tsconfig.json
+`}</Terminal>
+
+(Output joined onto one line per command.) The fix in the last line adds an anonymous volume at `/app/node_modules`.
+The more specific mount wins, so the image's `node_modules` shows through again (it's an empty volume, so it gets
+pre-filled; see <L id="04.02" />). Docker also creates an empty `node_modules` folder in your project as the mount
+point.
+
+## Trap 2: missing paths
+
+The two syntaxes disagree about a host path that doesn't exist:
+
+<Terminal>{`
+$ docker run --rm -v "$PWD/does-not-exist":/data alpine true
+$ ls -d does-not-exist
+does-not-exist
+$ docker run --rm --mount type=bind,src="$PWD/does-not-exist",dst=/data alpine true
+docker: Error response from daemon: invalid mount config for type "bind": bind source path does not exist: ...
+`}</Terminal>
+
+`-v` quietly creates an empty directory, which is how a typo becomes "my config file is empty". `--mount` refuses.
+In scripts, prefer `--mount`.
+
+## Trap 3: who owns the files
+
+A container running as root that writes into a bind mount creates files owned by UID 0. On a **Linux** host, those
+files are then owned by root on your machine too, and you need `sudo` to delete them. Run the container as your own
+user to avoid it:
+
+<Code lang="bash" file="linux">{`
+docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/work -w /work node:22-slim npm run build
+`}</Code>
+
+Docker Desktop on macOS and Windows hides this: its file sharing maps ownership to your user, so the same file shows
+as yours on the Mac. Code that works on your laptop can still leave root-owned files on a Linux CI runner.
+
+<Aside title="Performance on Mac and Windows">
+  On Docker Desktop, bind mounts cross from your machine into the Linux VM. File sharing (VirtioFS on recent versions)
+  is much faster than it used to be, but folders with tens of thousands of small files, like `node_modules`, are still
+  slower than on Linux. That's another reason to keep `node_modules` in a volume during development.
+</Aside>
+
+<Quiz
+  question="You start a dev container with -v ./src:/app/src, but there's a typo and the folder is actually ./scr. The app starts and can't find any source files. Why?"
+  options={[
+    { text: "Docker copied the folder but not its contents", why: "Bind mounts never copy. They show the host folder as it is." },
+    { text: "-v created an empty ./src folder on the host and mounted it, hiding the image's /app/src", correct: true, why: "With -v, a missing host path is created as an empty directory. Mounting it over /app/src hides whatever the image had there. --mount would have failed loudly instead." },
+    { text: "Relative paths aren't allowed, so nothing was mounted", why: "Recent Docker versions accept ./ paths with -v. The problem is the missing folder." },
+    { text: "The container needs restarting to see the files", why: "Bind mounts are live. There were simply no files to see." },
+  ]}
+/>
+
+<Checkpoint
+  title="A live-reload dev setup"
+  solution={<p>Changes don't show up: some editors replace files instead of writing to them, and a bind-mounted single <strong>file</strong> keeps pointing at the old one. Mount the folder, not the file.</p>}
+>
+  <p>Serve a folder with nginx as above and edit it live. Then reproduce trap 1 with the notes API's build stage (<code>docker build --target build -t notes-dev .</code>) and fix it with the extra <code>-v /app/node_modules</code>. Finally try the <code>--mount</code> version with a typo and read the error.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Bind-mounting over a directory the app needs from the image.** Mount a subfolder, or add a volume for the part you need.</li>
+    <li>**`-v` in scripts.** A typo silently creates an empty folder; `--mount` fails loudly.</li>
+    <li>**Bind mounts for production data.** Tied to one host's paths and permissions; use volumes.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A bind mount shows a host folder inside the container, live, both ways.</li>
+    <li>It hides whatever the image had at that path.</li>
+    <li>`-v` creates missing host paths; `--mount` errors.</li>
+    <li>On Linux, files written as root are root-owned on the host. Use `-u`.</li>
+    <li>Great for development and config; use volumes for data.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "When would you use a bind mount instead of a volume?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+>
+  <p>Bind mounts map a specific host path, so they're right when the host owns the files: source code for live reloading in development, config files or certificates managed on the host, or build outputs you want back on your machine. Volumes are managed by Docker, portable between hosts, pre-populated from the image, and better for application data like databases. In production, prefer volumes for data and bind mounts only for host-provided config.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "Your dev container mounts the project into /app and now the app can't find its dependencies. What happened?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Debugging" }}
+>
+  <p>The bind mount replaced `/app` entirely, hiding the `node_modules` the image installed. The host folder has none, or has ones built for a different OS. Add an anonymous or named volume at `/app/node_modules` so the more specific mount shows the container's dependencies, or install dependencies outside the mounted path.</p>
+</InterviewCard>

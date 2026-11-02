@@ -68,11 +68,11 @@ export const modules: Module[] = [
     title: "Data",
     blurb: "Where data lives when containers come and go.",
     lessons: [
-      l("04.01", "The writable layer is temporary", 8, "CONCEPT"),
-      l("04.02", "Volumes", 11, "CODE"),
-      l("04.03", "Bind mounts", 9, "CODE"),
-      l("04.04", "tmpfs mounts", 6, "CODE"),
-      l("04.05", "Project: persist Postgres", 20, "BUILD"),
+      l("04.01", "The writable layer is temporary", 8, "CODE", "writable-layer"),
+      l("04.02", "Volumes", 12, "CODE", "volumes"),
+      l("04.03", "Bind mounts", 11, "CODE", "bind-mounts"),
+      l("04.04", "tmpfs mounts", 7, "CODE", "tmpfs-mounts"),
+      l("04.05", "Project: persist Postgres", 25, "BUILD", "project-persist-postgres"),
     ],
   },
   {
@@ -139,7 +139,7 @@ export const stats = {
 export const projectSteps = [
   { tag: "docker-step-01", title: "Containerise the API", after: "02", detail: "A multi-stage Dockerfile for the notes API, built and pushed to a registry." },
   { tag: "docker-step-02", title: "Configure and health-check it", after: "03", detail: "Env-based config, a healthcheck and sensible limits." },
-  { tag: "docker-step-03", title: "Persist Postgres", after: "04", detail: "A named volume that survives rebuilds, plus a backup command." },
+  { tag: "docker-step-03", title: "Persist Postgres", after: "04", detail: "Notes move to Postgres 18 on a named volume, with a tested dump and restore." },
   { tag: "docker-step-04", title: "Wire the services together", after: "05", detail: "API, Postgres, Redis and Nginx on one private network." },
   { tag: "docker-step-05", title: "One-command dev environment", after: "06", detail: "docker compose up with hot reload and seeded data." },
   { tag: "docker-step-06", title: "Ship from CI", after: "07", detail: "GitHub Actions builds, scans and pushes to GHCR." },

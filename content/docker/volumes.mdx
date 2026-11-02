@@ -1,0 +1,176 @@
+export const meta = {
+  summary: "Named storage that Docker manages and that outlives any container: create it, mount it, share it, back it up, and avoid the anonymous kind.",
+  uses: ["04.01"],
+  usedIn: ["04.05", "06.02"],
+};
+
+<BeforeYouStart>
+  You know why the writable layer isn't storage (<L id="04.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+A **volume** is a directory that Docker creates and manages, separate from any container. You mount it into a
+container at a path, and everything written there goes into the volume. Remove the container and the volume stays;
+mount it into a new container and the data is all there.
+
+## Create, write, read again
+
+<Terminal>{`
+$ docker volume create notes-data
+notes-data
+$ docker run --rm -v notes-data:/data alpine sh -c 'echo "written by container one" > /data/hello.txt'
+$ docker run --rm -v notes-data:/data alpine cat /data/hello.txt
+written by container one
+`}</Terminal>
+
+Two containers, both deleted with `--rm`. The file lives on in the volume.
+
+<Terminal>{`
+$ docker volume inspect notes-data
+[
+    {
+        "CreatedAt": "2026-11-02T20:30:51Z",
+        "Driver": "local",
+        "Mountpoint": "/var/lib/docker/volumes/notes-data/_data",
+        "Name": "notes-data",
+        "Scope": "local"
+        ...
+    }
+]
+`}</Terminal>
+
+The `Mountpoint` is a folder on the Docker host. On Linux you could look at it directly with `sudo`; on Docker Desktop it's
+inside the Linux VM. Either way, treat it as Docker's: go through containers, not the folder.
+
+## Two ways to write the same mount
+
+<Code lang="bash" file="mount syntax">{`
+# Short: source:destination[:options]
+docker run -v notes-data:/data alpine ...
+
+# Long: explicit key=value pairs, easier to read in scripts
+docker run --mount type=volume,src=notes-data,dst=/data alpine ...
+`}</Code>
+
+Add `:ro` (short) or `,readonly` (long) to mount read-only:
+
+<Terminal>{`
+$ docker run --rm --mount type=volume,src=notes-data,dst=/data,readonly alpine \\
+    sh -c 'cat /data/hello.txt; echo nope > /data/x'
+written by container one
+sh: can't create /data/x: Read-only file system
+`}</Terminal>
+
+## Named vs anonymous volumes
+
+If an image declares `VOLUME /some/path` and you don't mount anything there, Docker creates an **anonymous** volume
+with a random name. The official Postgres image does this:
+
+<Terminal>{`
+$ docker run -d --name pg -e POSTGRES_PASSWORD=x postgres:18
+$ docker inspect -f '{{range .Mounts}}{{.Type}} {{.Name}} -> {{.Destination}}{{end}}' pg
+volume 0eb4d36e933db0246a63ef9175338b25d3d8940343647a3981762d657c662acd -> /var/lib/postgresql
+`}</Terminal>
+
+Your data is safe-ish, but in a volume nobody will recognise. Recreate the container and you get a new anonymous
+volume and an empty database; the old one sits there orphaned. `docker rm -v` and `docker run --rm` delete anonymous
+volumes along with the container. **Always name volumes for data you care about.**
+
+## Pre-populated volumes
+
+Mount an **empty named volume** at a path that already has files in the image, and Docker copies those files into the
+volume first:
+
+<Terminal>{`
+$ docker run --rm -v site:/usr/share/nginx/html nginx:alpine ls /usr/share/nginx/html
+50x.html
+index.html
+$ docker run --rm -v site:/x alpine ls /x
+50x.html
+index.html
+`}</Terminal>
+
+The second container is plain Alpine, but the volume already contains nginx's files. This only happens for empty
+volumes, never for bind mounts (<L id="04.03" />).
+
+## Backing up a volume
+
+A volume is just files, so back it up with a throwaway container that mounts it next to a folder from your machine:
+
+<Terminal>{`
+$ docker run --rm -v notes-data:/data -v "$PWD":/backup alpine \\
+    tar czf /backup/notes-data.tgz -C /data .
+$ tar tzf notes-data.tgz
+./
+./hello.txt
+`}</Terminal>
+
+To restore, run the same thing with `tar xzf` into a new volume. For databases, prefer the database's own dump tool,
+because copying the files of a running database can capture a half-written state (<L id="04.05" />).
+
+## Housekeeping
+
+| Command | Does |
+| --- | --- |
+| `docker volume ls` | list volumes |
+| `docker volume ls -f dangling=true` | volumes no container uses |
+| `docker volume rm NAME` | delete one (fails if a container uses it) |
+| `docker volume prune` | delete unused **anonymous** volumes; add `-a` to include named ones |
+| `docker system df -v` | size of each volume |
+
+<Quiz
+  question="Three containers mount the same named volume at /data. One deletes /data/report.csv. What do the other two see?"
+  options={[
+    { text: "They still have their own copy", why: "There's only one copy: the volume. Each container mounts the same directory." },
+    { text: "The file is gone for all three", correct: true, why: "A volume is shared storage, not a per-container copy. Sharing is useful, and it also means containers must agree on who writes what." },
+    { text: "It's gone only after they restart", why: "Changes are visible immediately; it's one directory." },
+    { text: "Docker blocks the delete because the volume is shared", why: "Docker doesn't coordinate access. Use :ro for containers that should only read." },
+  ]}
+/>
+
+<Checkpoint
+  title="Make data outlive its containers"
+  solution={<p>Empty volume when you expected files: check the volume name is spelled the same in both commands. <code>-v notes-dat:/data</code> silently creates a new, empty volume called <code>notes-dat</code>.</p>}
+>
+  <p>Create a volume, write to it from one container, read it from another, then back it up to a <code>.tgz</code> on your machine. Delete the volume, restore it from the archive into a new volume, and read the file once more.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Typos in volume names.** Docker creates a new empty volume without warning.</li>
+    <li>**`docker volume prune -a` or `system prune --volumes` on autopilot.** That's how databases get deleted.</li>
+    <li>**Copying a live database's volume as a backup.** Use the database's dump or backup tool.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A volume is Docker-managed storage that outlives containers.</li>
+    <li>`-v name:/path` or `--mount type=volume,src=name,dst=/path`.</li>
+    <li>Name them: anonymous volumes get orphaned.</li>
+    <li>Empty named volumes are pre-filled from the image; bind mounts never are.</li>
+    <li>Back up with a throwaway container and `tar`, or the app's own dump tool.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between a named volume and an anonymous volume?", level: "Mid", frequency: 2, importance: "Must-know", kind: "Concept" }}
+>
+  <p>Both are Docker-managed storage. A named volume has a name you choose, so a new container can mount it again and it's easy to back up and inspect. An anonymous volume gets a random ID, typically created because the image declares `VOLUME` and nothing was mounted there; recreating the container creates a new one and orphans the old, and `docker rm -v` or `--rm` deletes it. Use named volumes for anything persistent.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "How would you back up and restore data stored in a Docker volume?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Scenario" }}
+  followUps={["Why is copying a database's files risky?"]}
+>
+  <p>For plain files, run a temporary container that mounts the volume and a host directory, and `tar` from one to the other; restore by extracting into a new volume. For databases, use the database's own tool (`pg_dump`, `mysqldump`, or physical backups like `pg_basebackup`), because copying files under a running database can produce an inconsistent snapshot. Then test restores regularly, because an untested backup isn't one.</p>
+</InterviewCard>

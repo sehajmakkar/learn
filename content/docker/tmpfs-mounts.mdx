@@ -1,0 +1,113 @@
+export const meta = {
+  summary: "Memory-backed scratch space that never touches disk, and how it lets you run containers with a read-only root filesystem.",
+  uses: ["04.01", "03.06"],
+  usedIn: ["07.01", "07.02"],
+};
+
+<BeforeYouStart>
+  You know the three kinds of mount (<L id="04.01" />) and how memory limits work (<L id="03.06" />).
+</BeforeYouStart>
+
+## The core idea
+
+A **tmpfs mount** is a directory that lives in memory. It's fast, it's never written to disk, and it disappears when
+the container stops. You won't use it often, but it solves two problems neatly: scratch space for files that must
+never be persisted, and making a **read-only** container work.
+
+## Read-only containers
+
+`--read-only` makes the container's whole filesystem read-only. An attacker who gets in can't drop files, modify
+binaries or plant a backdoor that survives. But many programs need to write *somewhere*, usually `/tmp`:
+
+<Terminal>{`
+$ docker run --rm --read-only alpine touch /tmp/x
+touch: /tmp/x: Read-only file system
+$ docker run --rm --read-only --tmpfs /tmp:size=16m alpine sh -c 'touch /tmp/x && df -h /tmp'
+Filesystem                Size      Used Available Use% Mounted on
+tmpfs                    16.0M         0     16.0M   0% /tmp
+`}</Terminal>
+
+Everything is read-only except a 16 MB in-memory `/tmp`. Add a tmpfs for each path the app really needs to write, and
+a volume for anything it needs to keep. You'll apply this to the notes API in <L id="07.01" />.
+
+## Syntax and limits
+
+<Code lang="bash" file="tmpfs">{`
+# Short form, options after the colon
+docker run --tmpfs /tmp:size=64m,mode=1777 ...
+
+# Long form
+docker run --mount type=tmpfs,dst=/cache,tmpfs-size=8m ...
+`}</Code>
+
+The size is a hard cap:
+
+<Terminal>{`
+$ docker run --rm --mount type=tmpfs,dst=/cache,tmpfs-size=8m alpine \\
+    sh -c 'dd if=/dev/zero of=/cache/f bs=1M count=20'
+dd: error writing '/cache/f': No space left on device
+`}</Terminal>
+
+Always set one. Without it, a tmpfs can grow to half of the host's (or Docker Desktop VM's) memory:
+
+<Terminal>{`
+$ docker run --rm --memory 64m --tmpfs /scratch alpine df -h /scratch
+tmpfs                     3.8G         0      3.8G   0% /scratch
+`}</Terminal>
+
+Even inside a container limited to 64 MB, the tmpfs *reports* 3.8 GB. Files written there count against the
+container's memory limit, so filling it can get the container OOM-killed (<L id="03.06" />).
+
+| | Volume | Bind mount | tmpfs |
+| --- | --- | --- | --- |
+| Stored on | disk, managed by Docker | disk, your path | memory |
+| Survives the container | yes | yes | no |
+| Shared between containers | yes | yes | no |
+| Typical use | databases, uploads | dev code, config | scratch, secrets, read-only roots |
+
+<Quiz
+  question="An app writes decrypted credentials to a temporary file while it starts. You want to be sure they never reach any disk. Where should that path be?"
+  options={[
+    { text: "A named volume", why: "Volumes are stored on disk and outlive the container, the opposite of what you want." },
+    { text: "The container's writable layer", why: "That's on disk too, and it survives until the container is removed." },
+    { text: "A tmpfs mount", correct: true, why: "tmpfs lives only in memory and disappears when the container stops." },
+    { text: "A bind mount to /tmp on the host", why: "That's the host's disk, and other processes on the host can read it." },
+  ]}
+/>
+
+<Checkpoint
+  title="Run read-only"
+  solution={<p>An app that fails under <code>--read-only</code> usually prints the path it tried to write. For <code>nginx:alpine</code>, it's <code>mkdir() "/var/cache/nginx/client_temp" failed (30: Read-only file system)</code>; with <code>--tmpfs /var/cache/nginx --tmpfs /run --tmpfs /tmp</code> it serves pages. (Its startup script also notes it can't edit <code>default.conf</code>, which is harmless.)</p>}
+>
+  <p>Run the notes API with <code>--read-only</code>. Does it start? (It only writes to Postgres and stdout.) Then run <code>nginx:alpine</code> with <code>--read-only</code> and read the errors: add <code>--tmpfs</code> mounts for the paths it complains about until it serves pages.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**No size on a tmpfs.** It can eat the container's memory budget and trigger an OOM kill.</li>
+    <li>**Expecting tmpfs data after a restart.** It's gone the moment the container stops.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>tmpfs = in-memory directory, gone when the container stops.</li>
+    <li>Pair `--read-only` with tmpfs mounts for the paths an app must write.</li>
+    <li>Always set a size; usage counts against the memory limit.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you run a container with a read-only filesystem when the app needs to write temporary files?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Scenario" }}
+  followUps={["What else would you combine with it to harden a container?"]}
+>
+  <p>Start it with `--read-only` and add size-limited tmpfs mounts for the specific paths the app writes to, like `/tmp` or a cache directory, plus a volume for anything that must persist. Find those paths by running it read-only and reading the errors. Combine it with a non-root user, dropped capabilities and no new privileges for a hardened container.</p>
+</InterviewCard>

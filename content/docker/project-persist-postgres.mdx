@@ -1,0 +1,195 @@
+export const meta = {
+  summary: "Move the notes API's data into Postgres on a named volume, prove it survives deleting every container, and practise a backup and restore.",
+  uses: ["04.02", "03.03", "02.08"],
+  usedIn: ["05.02", "06.02", "docker-step-03"],
+};
+
+<BeforeYouStart>
+  Project step 3. You have the notes API from step 2 (`docker-step-02`) and know volumes (<L id="04.02" />). The
+  finished state is tagged `docker-step-03`.
+</BeforeYouStart>
+
+## The brief
+
+Notes currently live in the API's memory, so every restart wipes them. Done means:
+
+<Recap>
+  <ul>
+    <li>Notes are stored in Postgres 18, running in its own container.</li>
+    <li>Postgres keeps its data in a **named** volume, `notes-pgdata`.</li>
+    <li>The API gets the database address from `DATABASE_URL` and waits for the database if it starts first.</li>
+    <li>Deleting both containers and starting new ones loses nothing.</li>
+    <li>You can dump the database to a file and restore it into a brand-new one.</li>
+  </ul>
+</Recap>
+
+## What changed in the API
+
+Check out the reference (`git checkout docker-step-03`) or make these changes yourself in `project/docker/api`:
+
+- `pg`, the Postgres client, is now a runtime dependency (`npm install pg`, and `npm install -D @types/pg`). For the
+  first time, the final stage's `npm ci --omit=dev` installs something.
+- `DATABASE_URL` is required; without it the API exits 1 with a message saying so (<L id="03.03" />).
+- At startup it retries `SELECT 1` every 2 seconds, up to 15 times, then creates the `notes` table if it doesn't exist.
+- `/healthz` still doesn't touch the database (<L id="03.07" />).
+
+<Code lang="ts" file="src/server.ts">{`
+const pool = new pg.Pool({ connectionString: databaseUrl });
+
+// The database container may still be starting when we start, so retry for a while before giving up.
+async function waitForDatabase(attempts = 15) {
+  for (let i = 1; ; i++) {
+    try {
+      await pool.query("SELECT 1");
+      return;
+    } catch (err) {
+      if (i === attempts) throw err;
+      console.log(\`database not ready (attempt \${i}/\${attempts}), retrying in 2s\`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+}
+`}</Code>
+
+## Step 1: a network and a volume
+
+The API reaches Postgres by container name, `notes-db`. That works on a **user-defined network**, which gives
+containers DNS names for each other. You'll learn how in <L id="05.02" />; for now, create one:
+
+<Terminal>{`
+$ docker network create notes-net
+$ docker volume create notes-pgdata
+notes-pgdata
+`}</Terminal>
+
+## Step 2: start both, API first
+
+Start the API before the database on purpose, to watch it wait:
+
+<Terminal>{`
+$ docker build -t notes-api .
+$ docker run -d --name notes --network notes-net -p 8080:3000 \\
+    -e DATABASE_URL=postgres://notes:notes@notes-db:5432/notes notes-api
+$ docker run -d --name notes-db --network notes-net \\
+    -e POSTGRES_USER=notes -e POSTGRES_PASSWORD=notes -e POSTGRES_DB=notes \\
+    -v notes-pgdata:/var/lib/postgresql postgres:18
+$ docker logs notes
+database not ready (attempt 1/15), retrying in 2s
+database not ready (attempt 2/15), retrying in 2s
+notes-api listening on :3000 (max note length 280)
+$ curl -X POST localhost:8080/notes -H 'content-type: application/json' -d '{"text":"this one should survive"}'
+{"id":"ca767c14-0820-4cd5-963d-9df6240ada88","text":"this one should survive","createdAt":"2026-11-02T20:32:26.604Z"}
+`}</Terminal>
+
+The `POSTGRES_*` variables only matter the first time, when the volume is empty and the image initialises a database.
+
+## The Postgres 18 mount path
+
+Look closely at `-v notes-pgdata:/var/lib/postgresql`. Most tutorials, and every Postgres image before 18, mount
+`/var/lib/postgresql/data`. Postgres 18 images moved the data into a version-specific folder
+(`/var/lib/postgresql/18/docker`) and declare the parent as the volume. Use the old path with 18, and it refuses to start:
+
+<Terminal>{`
+$ docker run -d --name oldpath -e POSTGRES_PASSWORD=x -v oldpath-data:/var/lib/postgresql/data postgres:18
+$ docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}}' oldpath
+status=exited exit=1
+$ docker logs oldpath
+Error: in 18+, these Docker images are configured to store database data in a
+       format which is compatible with "pg_ctlcluster" (specifically, using
+       major-version-specific directory names).
+...
+`}</Terminal>
+
+Output trimmed. That error is a gift: on older setups, a wrong path silently put your data in an anonymous volume
+instead (<L id="04.02" />). **Always check the image's docs for where it keeps data**, or run
+`docker image inspect -f '{{json .Config.Volumes}}' IMAGE`.
+
+## Step 3: delete everything, keep the data
+
+<Terminal>{`
+$ docker rm -f notes notes-db
+$ docker volume ls --filter name=notes-pgdata
+DRIVER    VOLUME NAME
+local     notes-pgdata
+$ docker run -d --name notes-db --network notes-net \\
+    -e POSTGRES_USER=notes -e POSTGRES_PASSWORD=notes -e POSTGRES_DB=notes \\
+    -v notes-pgdata:/var/lib/postgresql postgres:18
+$ docker run -d --name notes --network notes-net -p 8080:3000 \\
+    -e DATABASE_URL=postgres://notes:notes@notes-db:5432/notes notes-api
+$ curl localhost:8080/notes
+[{"id":"ca767c14-0820-4cd5-963d-9df6240ada88","text":"this one should survive","createdAt":"2026-11-02T20:32:26.604Z"}]
+$ docker logs notes-db 2>&1 | grep -i initialization
+PostgreSQL Database directory appears to contain a database; Skipping initialization
+`}</Terminal>
+
+Both containers are brand new. The note survived because it never lived in a container.
+
+<Quiz
+  question="You recreate notes-db with -e POSTGRES_PASSWORD=different but the same notes-pgdata volume. The API still uses the old password. What happens?"
+  options={[
+    { text: "Postgres changes the password to the new value on startup", why: "The POSTGRES_* variables are only used to initialise an empty data directory. This one already has a database." },
+    { text: "The API keeps working: the password in the volume is still the old one", correct: true, why: "The image skips initialisation when the volume already contains a database, so the new value is ignored. To change it, run ALTER USER inside Postgres." },
+    { text: "Postgres wipes the volume and starts fresh", why: "The image never deletes existing data." },
+    { text: "The container fails to start", why: "It starts fine; it just ignores the variable." },
+  ]}
+/>
+
+## Step 4: back up and restore
+
+Copying the volume's files while Postgres is running can capture a half-written state. Use `pg_dump`, which runs
+inside the database container and writes a consistent SQL snapshot to your machine:
+
+<Terminal>{`
+$ docker exec notes-db pg_dump -U notes notes > backup.sql
+$ grep -A2 "^COPY public.notes" backup.sql
+COPY public.notes (id, text, created_at) FROM stdin;
+ca767c14-0820-4cd5-963d-9df6240ada88	this one should survive	2026-11-02 20:32:26.604687+00
+\\.
+`}</Terminal>
+
+A backup you haven't restored is a hope, not a backup. Restore it into a completely separate database:
+
+<Terminal>{`
+$ docker run -d --name restore-db -e POSTGRES_USER=notes -e POSTGRES_PASSWORD=notes -e POSTGRES_DB=notes \\
+    -v notes-pgdata-restored:/var/lib/postgresql postgres:18
+$ docker exec -i restore-db psql -q -U notes notes < backup.sql
+$ docker exec restore-db psql -U notes notes -c 'SELECT text FROM notes'
+          text
+-------------------------
+ this one should survive
+(1 row)
+`}</Terminal>
+
+Note the `-i` on the restore: it keeps stdin open so `psql` can read the file from your machine.
+
+<Checkpoint
+  title="Project step 3: persist Postgres"
+  solution={<p>The API exits with <code>could not reach the database</code>: both containers must be on <code>notes-net</code>, and the host in <code>DATABASE_URL</code> must be the container name, <code>notes-db</code>. Empty notes after recreating: check both <code>docker run</code> commands use exactly <code>notes-pgdata:/var/lib/postgresql</code>. Compare with <code>git diff docker-step-03 -- project/docker/api</code>.</p>}
+>
+  <ul>
+    <li>Switch the notes API to Postgres, or check out <code>docker-step-03</code>.</li>
+    <li>Run both containers as above, create three notes, then <code>docker rm -f</code> both and recreate them. All three notes should still be there.</li>
+    <li>Dump the database, restore it into a fresh container and volume, and count the rows.</li>
+    <li>Clean up with <code>docker rm -f notes notes-db restore-db</code> and <code>docker volume rm notes-pgdata-restored</code>. Keep <code>notes-pgdata</code>; the next steps use it.</li>
+  </ul>
+</Checkpoint>
+
+<Tripped>
+  Your note goes here after you finish this step.
+</Tripped>
+
+## What's next
+
+Three long `docker run` commands with a network, a volume and a password typed twice is a lot to get right by hand.
+Module 05 explains the network you just used (<L id="05.02" />), and Module 06 replaces all of this with one Compose
+file (<L id="06.06" />).
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you run a database in Docker safely?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["Would you run your production database in a container?", "How do you upgrade Postgres major versions?"]}
+>
+  <p>Keep the data in a named volume mounted at the path the image documents, pin the image's major version, and never rely on the container's writable layer. Pass credentials via secrets rather than plain env vars where possible, don't publish the port beyond what's needed, and set memory limits with headroom. Back up with the database's own tools on a schedule and test restores.</p>
+  <p>Many teams still prefer a managed database in production for backups, failover and upgrades; containers are excellent for development and CI. Major upgrades need `pg_upgrade` or dump-and-restore, not just a new image tag.</p>
+</InterviewCard>

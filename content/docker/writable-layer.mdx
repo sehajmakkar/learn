@@ -1,0 +1,125 @@
+export const meta = {
+  summary: "Why anything a container writes disappears with it, what survives a restart and what doesn't, and the three places data can live instead.",
+  uses: ["01.04", "03.01"],
+  usedIn: ["04.02", "04.03", "04.04"],
+};
+
+<BeforeYouStart>
+  You know every container gets its own writable layer on top of the image (<L id="01.04" />), and the difference
+  between stopping and removing a container (<L id="03.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+Everything a container writes, unless you say otherwise, goes into its **writable layer**. That layer belongs to the
+container: it survives `stop` and `start`, and it's deleted with `docker rm`. Containers are meant to be thrown away
+and replaced, so anything you want to keep has to live **outside** the container.
+
+## Watch data disappear
+
+<Terminal>{`
+$ docker run -d --name scratch alpine sleep 1000
+$ docker exec scratch sh -c 'echo "important" > /data.txt; dd if=/dev/zero of=/big bs=1M count=50'
+$ docker ps -s --filter name=scratch --format 'table {{.Names}}\\t{{.Size}}'
+NAMES     SIZE
+scratch   52.4MB (virtual 61.8MB)
+$ docker diff scratch
+A /big
+A /data.txt
+$ docker stop scratch && docker start scratch
+$ docker exec scratch cat /data.txt
+important
+$ docker rm -f scratch
+$ docker run --rm alpine cat /data.txt
+cat: can't open '/data.txt': No such file or directory
+`}</Terminal>
+
+`docker ps -s` shows the writable layer's size (52.4 MB) and, in brackets, that plus the image underneath. A stop and
+start keeps the file. Removing the container deletes it, and a new container from the same image starts clean.
+
+That's fine for a cache. It's a disaster for a database, which is exactly what happens if you run Postgres and later
+recreate the container to upgrade it.
+
+## Why not just keep the container forever?
+
+Because you can't, in practice:
+
+- **Deploying means replacing.** A new image version means a new container.
+- **Writable layers are slow for heavy writes.** Changing a file from the image first copies it into the writable layer
+  (copy-on-write), and the storage driver adds overhead that databases feel.
+- **Writable layers are hard to back up**, move to another server or share between containers.
+
+## Three places data can live
+
+<Stacks
+  title="Where a container's files can come from"
+  columns={[
+    {
+      title: "Inside the container",
+      note: "dies with it",
+      layers: [[{ text: "writable layer", tone: "danger" }], [{ text: "image layers (read-only)", tone: "muted" }]],
+    },
+    {
+      title: "Mounted from outside",
+      note: "outlives it",
+      layers: [[{ text: "volume", tone: "accent" }, { text: "bind mount", tone: "accent" }, { text: "tmpfs", tone: "accent" }]],
+    },
+  ]}
+  caption="A mount replaces one path inside the container with storage that Docker manages separately from the container."
+/>
+
+| Mount | Lives in | Use it for | Lesson |
+| --- | --- | --- | --- |
+| **Volume** | storage Docker manages (`/var/lib/docker/volumes/…`) | databases, uploads: data the app owns | <L id="04.02" /> |
+| **Bind mount** | a folder you choose on the host | source code in development, config files | <L id="04.03" /> |
+| **tmpfs** | memory, never disk | scratch space, secrets that must never touch disk | <L id="04.04" /> |
+
+<Quiz
+  question="You run Postgres in a container with no mounts, add data, then docker stop and docker start it. Then you upgrade by docker rm and docker run with the newer image. What happens to the data?"
+  options={[
+    { text: "Lost at the stop", why: "Stop and start keep the writable layer, so the data survives that." },
+    { text: "Survives the stop and start, lost at the rm", why: "Close, but the official Postgres image declares a VOLUME, so Docker quietly created an anonymous volume. The data is in that volume, and the new container just doesn't use it." },
+    { text: "Survives everything, since Postgres is smart about it", why: "Postgres doesn't know about containers. Where the data ends up is Docker's decision." },
+    { text: "Survives in an anonymous volume, but the new container starts with an empty database", correct: true, why: "The image's VOLUME instruction made Docker create an unnamed volume. docker rm (without -v) leaves it behind, orphaned; the new container gets a fresh one. You'd have to find the old volume by ID to recover." },
+  ]}
+/>
+
+That quiz is the next lesson's motivation: name your volumes.
+
+<Checkpoint
+  title="Lose some data on purpose"
+  solution={<p>If the file is still there after <code>docker rm</code>, check you started a <strong>new</strong> container with <code>docker run</code> rather than <code>docker start</code> on the old one.</p>}
+>
+  <p>Run the commands above. Then check <code>docker ps -s</code> on a running notes API: its writable layer should be tiny, because it doesn't write files. That's the goal for most app containers.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Treating the writable layer as storage.** It's gone at the next deploy.</li>
+    <li>**Running databases without a named volume.** Upgrades silently start empty.</li>
+    <li>**Writing logs to files in the container.** They grow the layer and vanish with it; log to stdout (<L id="03.04" />).</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Writes go to the container's writable layer by default.</li>
+    <li>It survives stop/start, not `docker rm`.</li>
+    <li>Data you care about goes in a volume, a bind mount, or (if temporary) tmpfs.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Where does data written inside a container go, and what happens to it when the container is removed?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why are writable layers slow for databases?"]}
+>
+  <p>Into the container's writable layer, a copy-on-write layer the storage driver puts on top of the image's read-only layers. It persists across stop and start but is deleted with the container. For data that must outlive the container, or that's write-heavy, use a volume or bind mount, which bypass the storage driver and live independently of any one container.</p>
+</InterviewCard>
