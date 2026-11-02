@@ -1,0 +1,148 @@
+export const meta = {
+  summary: "CI runners start empty, so the layer cache from 02.02 is gone every build. Export it, import it, and use cache mounts for the rest.",
+  uses: ["02.02", "07.04"],
+  usedIn: ["07.06"],
+};
+
+<BeforeYouStart>
+  You know how the layer cache works on one machine (<L id="02.02" />).
+</BeforeYouStart>
+
+## The core idea
+
+On your laptop, the build cache lives in Docker and persists between builds. A CI runner is usually a fresh virtual
+machine every time: **no cache at all**, so every build installs every dependency from scratch. The fix is to **export**
+the cache somewhere that outlives the runner at the end of a build, and **import** it at the start of the next.
+
+## Simulate a fresh CI runner
+
+A buildx builder that runs in its own container (`--driver docker-container`) has its own cache. Deleting and
+recreating it is a good stand-in for a fresh runner:
+
+<Terminal>{`
+$ docker buildx create --name cibuilder --driver docker-container
+$ docker buildx build --builder cibuilder --cache-to type=local,dest=./bcache,mode=max -t notes-api:ci .
+$ du -sh bcache
+ 91M
+$ docker buildx rm cibuilder && docker buildx create --name cibuilder --driver docker-container
+$ docker buildx build --builder cibuilder --progress=plain --cache-from type=local,src=./bcache -t notes-api:ci .
+#10 [build 2/7] WORKDIR /app
+#10 CACHED
+#11 [build 4/7] RUN npm ci
+#11 CACHED
+#13 [build 6/7] COPY src ./src
+#13 CACHED
+#16 [build 7/7] RUN npm run build
+#16 CACHED
+`}</Terminal>
+
+Output trimmed. A brand-new builder, and every step is `CACHED`, because the cache came from the exported folder. Timed
+on this machine:
+
+| Fresh builder | Time |
+| --- | --- |
+| no cache | 40 s |
+| with the imported cache | 27 s |
+
+Both include about 15 seconds of starting the builder and fetching the base image. For a real app, with hundreds of
+dependencies or a compile step that takes minutes, the cached build is minutes faster.
+
+## Where to keep the cache
+
+| `--cache-to` / `--cache-from` | Stored | Good for |
+| --- | --- | --- |
+| `type=gha` | GitHub Actions' cache service | GitHub Actions; the simplest option |
+| `type=registry,ref=…:buildcache` | a separate tag in your registry | any CI; shared between pipelines |
+| `type=local,dest=…` | a folder | CI systems that persist folders between jobs |
+| `type=inline` | inside the image itself | very simple setups; final stage only |
+
+**`mode=max`** exports the layers of **every** stage, including the build stage where `npm ci` happens. The default,
+`mode=min`, only exports the final image's layers, which for a multi-stage build misses the expensive part.
+
+## In GitHub Actions
+
+The project's workflow (<L id="07.06" />) uses the GitHub Actions cache:
+
+<Code lang="yaml" file=".github/workflows/notes-api.yml">{`
+      - name: Build for scanning
+        uses: docker/build-push-action@v7
+        with:
+          context: \${{ env.CONTEXT }}
+          load: true
+          tags: notes-api:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+`}</Code>
+
+Its first two real runs on this repo:
+
+<Terminal>{`
+run 1 (empty cache)       Build for scanning: 30s
+run 2 (source changed)    Build for scanning: 19s
+  #10 importing cache manifest from gha:1130349528686026853
+  #13 [build 4/7] RUN npm ci
+  #13 CACHED
+`}</Terminal>
+
+Run 2 changed `server.ts`, so the source copy and compile ran again, but `npm ci` came straight from the cache.
+
+## Cache mounts: the other cache
+
+The layer cache is all-or-nothing: change one dependency and the whole `npm ci` layer reruns, downloading every
+package again. A **cache mount** keeps a directory between builds without putting it in the image:
+
+<Code lang="dockerfile" file="Dockerfile">{`
+# syntax=docker/dockerfile:1
+RUN --mount=type=cache,target=/root/.npm npm ci
+`}</Code>
+
+npm's download cache in `/root/.npm` survives between builds, so after a lockfile change only the new packages are
+downloaded. It works for any package manager: `/root/.cache/pip`, `/go/pkg/mod`, `/var/cache/apt`. Cache mounts live in
+the builder, so on CI they share the same "fresh runner" problem; layer-cache export is the bigger win there.
+
+<Quiz
+  question="Your CI uses --cache-to type=gha (default mode) with a multi-stage Dockerfile. npm ci in the build stage still runs on every build. Why?"
+  options={[
+    { text: "GHA cache doesn't work with multi-stage builds", why: "It does, if you export all stages." },
+    { text: "The default mode=min only exports the final stage's layers; the build stage, where npm ci runs, isn't saved", correct: true, why: "Add mode=max to export every stage's layers." },
+    { text: "npm ci can never be cached", why: "It's cached like any RUN step, as long as the step before it hits and its layer was exported." },
+    { text: "You also need a cache mount", why: "Cache mounts help after a lockfile change. Here the layer itself isn't being exported." },
+  ]}
+/>
+
+<Checkpoint
+  title="Make a cold build warm"
+  solution={<p>"cache export feature is currently not supported for docker driver": the default builder can't export most cache types. Create one with <code>docker buildx create --driver docker-container</code> and pass <code>--builder</code>.</p>}
+>
+  <p>Repeat the experiment above: build with <code>--cache-to type=local</code>, recreate the builder, build with <code>--cache-from</code>, and compare times. Then add a cache mount to the build stage's <code>npm ci</code> and see what happens when you add a dependency.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**`mode=min` with multi-stage builds.** The expensive stage isn't cached.</li>
+    <li>**Expecting the local cache on CI.** Runners are fresh; export and import it.</li>
+    <li>**Caching secrets.** Never put credentials in a cache mount or a layer; use secret mounts (<L id="07.02" />).</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>CI runners start with an empty cache.</li>
+    <li>`--cache-to` / `--cache-from` with `type=gha`, `registry` or `local`; use `mode=max`.</li>
+    <li>Cache mounts keep package-manager downloads between builds.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Docker builds in your CI take 12 minutes, but locally they take 30 seconds. Why, and what would you do?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Scenario" }}
+>
+  <p>Locally, Docker reuses its layer cache; a CI runner usually starts empty, so every step runs from scratch. Export and import the cache: `docker buildx build --cache-to type=gha,mode=max --cache-from type=gha` on GitHub Actions, or a registry cache elsewhere, with `mode=max` so intermediate stages are included. Make sure the Dockerfile is ordered for caching (dependency manifests before source), add cache mounts for package managers, keep the build context small with `.dockerignore`, and avoid emulated multi-platform builds for heavy compile steps.</p>
+</InterviewCard>

@@ -105,13 +105,13 @@ export const modules: Module[] = [
     title: "Production",
     blurb: "Secure, reproducible images and a pipeline that ships them.",
     lessons: [
-      l("07.01", "Run as non-root", 9, "CODE"),
-      l("07.02", "Secrets without leaks", 11, "CODE"),
-      l("07.03", "Scanning images", 8, "CODE"),
-      l("07.04", "Multi-platform builds", 10, "CODE"),
-      l("07.05", "Build cache in CI", 9, "CODE"),
-      l("07.06", "Project: ship with GitHub Actions", 30, "BUILD"),
-      l("07.07", "Project: deploy to a VPS", 30, "BUILD"),
+      l("07.01", "Run as non-root", 12, "CODE", "run-as-non-root"),
+      l("07.02", "Secrets without leaks", 13, "CODE", "secrets-without-leaks"),
+      l("07.03", "Scanning images", 12, "CODE", "scanning-images"),
+      l("07.04", "Multi-platform builds", 10, "CODE", "multi-platform-builds"),
+      l("07.05", "Build cache in CI", 11, "CODE", "build-cache-in-ci"),
+      l("07.06", "Project: ship with GitHub Actions", 30, "BUILD", "project-ship-with-github-actions"),
+      l("07.07", "Project: deploy to a VPS", 35, "BUILD", "project-deploy-to-a-vps"),
     ],
   },
   {
@@ -143,8 +143,8 @@ export const projectSteps = [
   { tag: "docker-step-03", title: "Persist Postgres", after: "04", detail: "Notes move to Postgres 18 on a named volume, with a tested dump and restore." },
   { tag: "docker-step-04", title: "Wire the services together", after: "05", detail: "Nginx in front, a Redis cache, and separate public and private networks." },
   { tag: "docker-step-05", title: "One-command dev environment", after: "06", detail: "docker compose up --watch: healthy startup order, seeded data and hot reload." },
-  { tag: "docker-step-06", title: "Ship from CI", after: "07", detail: "GitHub Actions builds, scans and pushes to GHCR." },
-  { tag: "docker-step-07", title: "Deploy to a VPS", after: "07", detail: "Pull, migrate and roll forward with healthchecks." },
+  { tag: "docker-step-06", title: "Ship from CI", after: "07", detail: "GitHub Actions builds, scans with Trivy and publishes amd64 + arm64 images to GHCR." },
+  { tag: "docker-step-07", title: "Deploy to a VPS", after: "07", detail: "A hardened production compose file, secrets from files, deploys and rollbacks by tag." },
 ];
 
 export type InterviewQ = {

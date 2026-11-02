@@ -1,0 +1,155 @@
+export const meta = {
+  summary: "Containers run as root unless you say otherwise. Drop to a normal user, then strip capabilities, privilege escalation and write access until there's almost nothing left to abuse.",
+  uses: ["01.03", "04.04", "02.04"],
+  usedIn: ["07.07"],
+};
+
+<BeforeYouStart>
+  You know containers share the host kernel (<L id="01.03" />) and how `--read-only` and tmpfs work
+  (<L id="04.04" />).
+</BeforeYouStart>
+
+## The core idea
+
+Unless an image sets `USER`, its process runs as **root (UID 0)**. Namespaces limit what that root can see, but it's
+still UID 0 talking to the same kernel as the host. If there's ever a container escape bug, root inside is much closer
+to root outside. Running as a normal user is the cheapest, biggest security win available, and Docker gives you four
+more layers to stack on top.
+
+## Who are you in there?
+
+<Terminal>{`
+$ docker run --rm alpine id
+uid=0(root) gid=0(root) groups=0(root),0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),...
+$ docker run --rm --entrypoint id notes-api
+uid=1000(node) gid=1000(node) groups=1000(node)
+`}</Terminal>
+
+The notes API has run as `node` since its multi-stage build (<L id="02.04" />), thanks to `USER node` in the final
+stage. The official Node images create that user for exactly this. Root can rewrite system files in its container;
+`node` can't:
+
+<Terminal>{`
+$ docker run --rm alpine sh -c 'echo x > /etc/passwd-test && echo root-can-write-etc'
+root-can-write-etc
+$ docker run --rm --entrypoint sh notes-api -c 'echo x > /etc/passwd-test'
+sh: 1: cannot create /etc/passwd-test: Permission denied
+`}</Terminal>
+
+If your base image has no suitable user, create one:
+
+<Code lang="dockerfile" file="Dockerfile">{`
+RUN groupadd --system app && useradd --system --gid app --no-create-home app
+USER app
+`}</Code>
+
+Prefer a numeric ID (`USER 1000`) when you can: Kubernetes can only verify "not root" from a number, not a name.
+
+## Layer 2: drop capabilities
+
+Linux splits root's powers into about 40 **capabilities**: changing file ownership, binding low ports, tracing
+processes and so on. Docker gives containers a reduced default set; `--cap-drop ALL` removes the rest:
+
+<Terminal>{`
+$ docker run --rm alpine grep CapEff /proc/self/status
+CapEff:	00000000a80425fb
+$ docker run --rm --cap-drop ALL alpine grep CapEff /proc/self/status
+CapEff:	0000000000000000
+$ docker run --rm alpine chown nobody /etc/hostname && echo chown-ok
+chown-ok
+$ docker run --rm --cap-drop ALL alpine chown nobody /etc/hostname
+chown: /etc/hostname: Operation not permitted
+`}</Terminal>
+
+That hex value is a bitmap of capabilities; all zeros means none. Even root inside can't `chown` without
+`CAP_CHOWN`. Most apps need none at all; add back only what fails, with `--cap-add`.
+
+## Layer 3: no new privileges
+
+`--security-opt no-new-privileges` stops a process from **gaining** privileges after it starts, for example through a
+setuid binary like `su` or `sudo`. It closes the classic "get a shell as a normal user, then escalate" path.
+
+## Layer 4: read-only filesystem
+
+From <L id="04.04" />: `--read-only` plus tmpfs for the paths an app must write. The notes API writes nothing to disk,
+so it needs no tmpfs at all.
+
+## All together
+
+<Terminal>{`
+$ docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \\
+    -e DATABASE_URL=postgres://x:y@nowhere:5432/z notes-api
+database not ready (attempt 1/15), retrying in 2s
+`}</Terminal>
+
+It starts normally (and waits for a database that doesn't exist here). Inside the production stack in
+<L id="07.07" />, the API's process shows exactly this:
+
+<Terminal>{`
+$ docker compose -f compose.prod.yaml exec api grep -E "CapEff|NoNewPrivs" /proc/1/status
+CapEff:	0000000000000000
+NoNewPrivs:	1
+`}</Terminal>
+
+## Images that start as root on purpose
+
+Postgres and Redis images start as root, prepare their data directories, then switch to their own user before running
+the server. `docker exec` would show you `root` (that's the default user for `exec`), but the main process isn't:
+
+<Terminal>{`
+$ docker top notes-prod-db-1 -o pid,user,args
+PID     USER    ARGS
+...     999     postgres
+`}</Terminal>
+
+For Nginx, use `nginxinc/nginx-unprivileged`, which runs as the `nginx` user throughout. It's what the production
+stack uses.
+
+<Quiz
+  question="An attacker gets code execution inside the notes API container (USER node, --cap-drop ALL, --read-only, no-new-privileges). Which of these can they still do?"
+  options={[
+    { text: "Install tools with apt-get", why: "That needs root and a writable filesystem. They have neither." },
+    { text: "Use sudo or a setuid binary to become root", why: "no-new-privileges blocks gaining privileges that way." },
+    { text: "Make network requests the API itself could make, like to the database", correct: true, why: "Hardening limits what the process can do to the system, not what the app is allowed to reach. Network segmentation (05.02) and least-privilege database users cover that part." },
+    { text: "Overwrite the app's code in /app", why: "The filesystem is read-only, and node doesn't own those files anyway." },
+  ]}
+/>
+
+<Checkpoint
+  title="Harden and prove it"
+  solution={<p>An app that fails with <code>--cap-drop ALL</code> usually logs <code>Operation not permitted</code> next to the action it tried. Add back that one capability, e.g. <code>--cap-add NET_BIND_SERVICE</code> to bind a port below 1024 on older Docker versions.</p>}
+>
+  <p>Run the notes API with all four layers and check <code>/proc/1/status</code> for <code>CapEff</code> and <code>NoNewPrivs</code>. Try <code>touch /app/x</code> through <code>docker exec</code>. Then run plain <code>nginx:alpine</code> with <code>--cap-drop ALL</code> and read why it fails; compare with <code>nginxinc/nginx-unprivileged:alpine</code>.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**No `USER` in the final stage.** Root by default, every time.</li>
+    <li>**`--privileged` to fix a permission error.** It disables nearly every protection at once. Find the one capability or mount you need.</li>
+    <li>**Mounting the Docker socket into a container.** Anyone in that container controls Docker, which is root on the host (<L id="01.05" />).</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Set `USER` (numeric if you can) in the final stage.</li>
+    <li>`--cap-drop ALL`, add back only what fails.</li>
+    <li>`--security-opt no-new-privileges` blocks setuid escalation.</li>
+    <li>`--read-only` plus tmpfs where needed.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Why shouldn't containers run as root, and how do you harden one?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What does --privileged actually do?"]}
+>
+  <p>Root in a container is UID 0 on a shared kernel; namespaces reduce what it sees, but a container escape or a dangerous mount turns it into root on the host. Run as an unprivileged user with `USER` in the Dockerfile, ideally numeric. Then drop all capabilities and add back only what's needed, set `no-new-privileges` to block setuid escalation, use a read-only root filesystem with tmpfs for scratch, keep the default seccomp profile, and never mount the Docker socket or use `--privileged`, which grants all capabilities and device access.</p>
+</InterviewCard>

@@ -1,0 +1,110 @@
+export const meta = {
+  summary: "Build one image tag that runs on both Intel/AMD servers and ARM machines, and understand the emulation that makes it possible.",
+  uses: ["02.06"],
+  usedIn: ["07.06"],
+};
+
+<BeforeYouStart>
+  You know a tag can point at an index with one image per platform (<L id="02.06" />).
+</BeforeYouStart>
+
+## The core idea
+
+Images contain compiled code for one CPU architecture. Apple Silicon Macs and many cloud servers (AWS Graviton, for
+example) are `linux/arm64`; most other servers are `linux/amd64`. **docker buildx** can build for a platform other than
+your own, or for several at once, publishing them under one tag as an index so each machine pulls the right one.
+
+## Build for another platform
+
+On an arm64 Mac:
+
+<Terminal>{`
+$ docker buildx build --platform linux/amd64 -t notes-api:amd64 --load .
+$ docker image inspect -f '{{.Os}}/{{.Architecture}}' notes-api:amd64 notes-api
+linux/amd64
+linux/arm64
+$ docker run --rm --platform linux/amd64 --entrypoint node notes-api:amd64 -p 'process.arch'
+x64
+`}</Terminal>
+
+The amd64 build took 22 seconds here instead of a few, and the container still ran. Both are thanks to **QEMU
+emulation**: Docker Desktop translates amd64 instructions to arm64 on the fly. It works, but it's slow, so heavy builds
+(compiling native modules, big `npm ci`s) under emulation can take many times longer. On Linux, install emulation with
+the `tonistiigi/binfmt` image or `docker/setup-qemu-action` in CI.
+
+## Build for both at once
+
+<Terminal>{`
+$ docker buildx build --platform linux/amd64,linux/arm64 -t localhost:5050/notes-api:multi --push .
+#26 pushing manifest for localhost:5050/notes-api:multi@sha256:7804d1e8406c...
+$ docker buildx imagetools inspect localhost:5050/notes-api:multi
+Name:      localhost:5050/notes-api:multi
+MediaType: application/vnd.oci.image.index.v1+json
+  Name:        localhost:5050/notes-api:multi@sha256:917b5acd462e...
+  Platform:    linux/amd64
+  Name:        localhost:5050/notes-api:multi@sha256:a0e6a0ef445c...
+  Platform:    linux/arm64
+  Name:        localhost:5050/notes-api:multi@sha256:d06733d4f30e...
+  ...
+`}</Terminal>
+
+Output trimmed (the local registry is from <L id="02.06" />). One tag, an index, two images. The third entry is an
+**attestation**: provenance metadata BuildKit attaches describing how the image was built. Its platform shows as
+`unknown/unknown`, and Docker ignores it when choosing what to run.
+
+Multi-platform images usually go straight to a registry with `--push`. Loading them into your local image store with
+`--load` needs the containerd image store, which recent Docker Desktop versions use by default.
+
+## Faster than emulation
+
+- **Build natively per platform** in CI (amd64 and arm64 runners) and merge the results; fastest for heavy builds.
+- **Cross-compile** in the build stage for languages that support it (Go, Rust): run the build stage on the native
+  platform with `FROM --platform=$BUILDPLATFORM` and compile for `$TARGETPLATFORM`. No emulation at all.
+- For the notes API, emulation is fine: the only slow part is `npm ci`, and the cache (<L id="07.05" />) skips it most
+  of the time.
+
+<Quiz
+  question="You push an image built on an M-series Mac with plain docker build to a registry. An amd64 server pulls it and the container exits immediately with 'exec format error'. What's the fix?"
+  options={[
+    { text: "Restart Docker on the server", why: "The image contains arm64 binaries; nothing on the server can change that." },
+    { text: "Rebuild with docker buildx build --platform linux/amd64,linux/arm64 --push", correct: true, why: "That publishes an index with both architectures, so the server pulls the amd64 image and your Mac pulls arm64." },
+    { text: "Add --platform linux/arm64 to docker run on the server", why: "That would need the server to emulate arm64: slow, and only if emulation is installed." },
+    { text: "Use an alpine base image", why: "Alpine images are per-architecture too. The problem is which architecture you built." },
+  ]}
+/>
+
+<Checkpoint
+  title="Build for the server you'll deploy to"
+  solution={<p>"multiple platforms feature is currently not supported for docker driver": switch to the containerd image store in Docker Desktop's settings, or create a builder with <code>docker buildx create --use --driver docker-container</code>.</p>}
+>
+  <p>Build the notes API for <code>linux/amd64</code> and check the architecture with <code>docker image inspect</code>. Then build for both platforms, push to the local registry from <L id="02.06" />, and inspect the index with <code>docker buildx imagetools inspect</code>.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Shipping Mac-built images to amd64 servers.** `exec format error` on deploy.</li>
+    <li>**Compiling heavy code under emulation.** Cross-compile or use native runners.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`docker buildx build --platform linux/amd64,linux/arm64 --push` publishes one tag for both.</li>
+    <li>Non-native platforms run under QEMU emulation: works, but slow.</li>
+    <li>Cross-compile or build natively when builds are heavy.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do multi-architecture Docker images work?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+>
+  <p>A multi-arch tag points to an OCI image index (manifest list) that references one image manifest per platform, such as linux/amd64 and linux/arm64. When a client pulls the tag, the runtime picks the manifest matching its own platform. You build them with `docker buildx build --platform ... --push`, using QEMU emulation, native builders per architecture, or cross-compilation with `$BUILDPLATFORM` and `$TARGETPLATFORM`.</p>
+</InterviewCard>

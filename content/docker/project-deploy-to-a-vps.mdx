@@ -1,0 +1,244 @@
+export const meta = {
+  summary: "Take the notes stack to a real server: a hardened production compose file, secrets from files, one deploy script, and rollbacks by image tag.",
+  uses: ["07.01", "07.02", "07.06", "06.06", "04.05"],
+  usedIn: ["08.04", "docker-step-07"],
+};
+
+<BeforeYouStart>
+  Project step 7, the last one. You need an image in a registry (<L id="07.06" />) and a Linux server you can SSH
+  into: any small VPS with 1 GB of RAM will do. The finished files are tagged `docker-step-07`, in `project/docker`.
+</BeforeYouStart>
+
+<Aside title="What was verified, and what wasn't">
+  Everything in this lesson that runs Docker (the production compose file, the deploy script, the hardening checks,
+  rollbacks) was run for real against Docker 29, on a local machine standing in for the server. The server-specific
+  parts (SSH, the firewall, DNS and TLS) are standard steps but weren't run while writing this. Follow your provider's
+  docs where they differ.
+</Aside>
+
+## The brief
+
+<Recap>
+  <ul>
+    <li>The server runs the image CI published, not one built on the server.</li>
+    <li>Every container runs as non-root; the API is read-only with no capabilities.</li>
+    <li>The database password comes from a secret file and never appears in an environment variable.</li>
+    <li>The database and cache have no internet access and no published ports.</li>
+    <li>Deploying a new version, or rolling back to an old one, is one command.</li>
+  </ul>
+</Recap>
+
+## The production compose file
+
+`project/docker/compose.prod.yaml` is the dev file's grown-up sibling. The differences, service by service:
+
+<Code lang="yaml" file="compose.prod.yaml (api)">{`
+  api:
+    image: \${NOTES_API_IMAGE:-ghcr.io/sehajmakkar/notes-api:latest}
+    environment:
+      DATABASE_URL: postgres://notes@db:5432/notes
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      REDIS_URL: redis://cache:6379
+    secrets: [db_password]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+`}</Code>
+
+- **`image:` instead of `build:`**, with the tag set by `NOTES_API_IMAGE` so a deploy picks an exact version.
+- **Hardening** from <L id="07.01" />, **the secret file** from <L id="07.02" />, **limits** from
+  <L id="03.06" />, **restarts** from <L id="03.05" />.
+- **The proxy** is `nginxinc/nginx-unprivileged`, read-only with a tmpfs for `/tmp`, using the same `nginx/default.conf`.
+- **The cache** runs Redis as a pure cache: no snapshots, a 64 MB memory cap, least-recently-used eviction.
+- **Every service** shares one logging block with rotation, defined once as a YAML anchor:
+
+<Code lang="yaml" file="compose.prod.yaml">{`
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  api:
+    logging: *logging
+`}</Code>
+
+- **The backend network is `internal: true`**, so the database and cache can't reach the internet at all:
+
+<Terminal>{`
+$ docker compose -f compose.prod.yaml exec cache wget -qO- -T 3 http://example.com
+wget: bad address 'example.com'
+$ docker compose -f compose.prod.yaml exec api node -e 'fetch("http://example.com").then(r=>console.log(r.status))'
+200
+`}</Terminal>
+
+The API still can, through `frontend`.
+
+## Every process, non-root
+
+<Terminal>{`
+$ for c in notes-prod-proxy-1 notes-prod-api-1 notes-prod-db-1 notes-prod-cache-1; do docker top $c -o pid,user,args | sed -n 2p; done
+...  statd   nginx: master process nginx -g daemon off;
+...  1000    node dist/server.js
+...  999     postgres
+...  999     redis-server *:6379
+`}</Terminal>
+
+(`statd` is just how this host names UID 101, nginx's user: the same effect you saw in <L id="01.03" />.)
+
+## Prepare the server
+
+On a fresh Ubuntu or Debian VPS, as a user with `sudo`:
+
+<Code lang="bash" file="server, once">{`
+# Docker Engine and the Compose plugin, from Docker's apt repository (see docs.docker.com/engine/install)
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+# ...add Docker's repository as the install docs describe, then:
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Firewall: SSH and HTTP(S) only
+sudo ufw allow OpenSSH && sudo ufw allow 80/tcp && sudo ufw allow 443/tcp && sudo ufw enable
+
+# A deploy user that can run Docker (root-equivalent, see 01.05: keep SSH key-only)
+sudo adduser --disabled-password deploy && sudo usermod -aG docker deploy
+`}</Code>
+
+Remember <L id="03.02" />: Docker's published ports bypass `ufw`. That's why only the proxy publishes anything
+here.
+
+## Get the files there
+
+The server needs only four things from the repo, plus a password:
+
+<Code lang="bash" file="your machine">{`
+ssh deploy@YOUR_SERVER 'mkdir -p notes/nginx notes/secrets'
+scp project/docker/compose.prod.yaml project/docker/deploy.sh deploy@YOUR_SERVER:notes/
+scp project/docker/nginx/default.conf deploy@YOUR_SERVER:notes/nginx/
+ssh deploy@YOUR_SERVER 'openssl rand -base64 24 > notes/secrets/db_password.txt && chmod 600 notes/secrets/db_password.txt'
+`}</Code>
+
+The password is generated **on** the server and never leaves it. If your GHCR package is private, run
+`docker login ghcr.io` on the server once with a token that has `read:packages`.
+
+## Deploy
+
+`deploy.sh` pulls the images, starts or updates the stack, waits for every healthcheck, and cleans up old images:
+
+<Code lang="bash" file="deploy.sh">{`
+#!/usr/bin/env bash
+# Deploy or update the notes stack on the machine Docker points at (see 07.07).
+# Usage: ./deploy.sh [image]   e.g. ./deploy.sh ghcr.io/sehajmakkar/notes-api:sha-1a2b3c4
+set -euo pipefail
+cd "$(dirname "$0")"
+
+export NOTES_API_IMAGE="\${1:-ghcr.io/sehajmakkar/notes-api:latest}"
+
+if [ ! -s secrets/db_password.txt ]; then
+  echo "secrets/db_password.txt is missing. Create it with: openssl rand -base64 24 > secrets/db_password.txt" >&2
+  exit 1
+fi
+
+echo "Deploying $NOTES_API_IMAGE"
+docker compose -f compose.prod.yaml pull --ignore-buildable
+docker compose -f compose.prod.yaml up -d --wait
+docker compose -f compose.prod.yaml ps
+docker image prune -f
+`}</Code>
+
+`up --wait` is the important part: the command only succeeds once every service with a healthcheck reports healthy, so
+a broken release fails the deploy instead of silently serving errors. On the server:
+
+<Terminal>{`
+$ ssh deploy@YOUR_SERVER
+$ cd notes && ./deploy.sh ghcr.io/sehajmakkar/notes-api:sha-f22dfda
+Deploying ghcr.io/sehajmakkar/notes-api:sha-f22dfda
+ ...
+ Container notes-prod-api-1 Healthy
+ Container notes-prod-cache-1 Healthy
+ Container notes-prod-db-1 Healthy
+ Container notes-prod-proxy-1 Healthy
+NAME                 IMAGE                                       SERVICE   STATUS
+notes-prod-api-1     ghcr.io/sehajmakkar/notes-api:sha-f22dfda   api       Up 6 seconds (healthy)
+...
+$ curl -s localhost/notes
+[{"id":"74d4627d-...","text":"from production",...}]
+`}</Terminal>
+
+Output trimmed. (This run used a local registry in place of GHCR; the commands are identical.) Only the API container
+was recreated; the database kept running, with its data.
+
+You can also run the deploy from your own machine without logging in to the server, using a Docker context over SSH:
+
+<Code lang="bash" file="your machine">{`
+docker context create notes-vps --docker "host=ssh://deploy@YOUR_SERVER"
+docker --context notes-vps ps
+`}</Code>
+
+## Roll back
+
+Every image CI publishes is tagged with its commit (<L id="07.06" />). Rolling back is deploying the previous tag:
+
+<Code lang="bash" file="server">{`
+./deploy.sh ghcr.io/sehajmakkar/notes-api:sha-1f76f82
+`}</Code>
+
+Avoid deploying `latest` for exactly this reason: you can't roll back to "the latest before this one".
+
+## Keep it running
+
+- **Backups:** schedule the `pg_dump` from <L id="04.05" /> with cron, write it off the server (object storage),
+  and test restores.
+- **HTTPS:** point a domain at the server and terminate TLS in front of Nginx. Caddy does certificates automatically;
+  certbot works with Nginx. Then publish 443 instead of only 80.
+- **Updates:** rebuild in CI regularly so images pick up base-image patches (<L id="07.03" />), and run
+  `sudo apt-get upgrade` on the server.
+- **Logs:** rotation is on; `docker compose -f compose.prod.yaml logs -f api` is your first stop.
+
+<Quiz
+  question="You deploy a release whose API crashes on startup. With deploy.sh, what happens?"
+  options={[
+    { text: "The old API keeps serving; Compose waits for the new one before stopping the old", why: "Compose recreates the container in place: the old one is stopped first. There's a short outage." },
+    { text: "up --wait fails because the API never becomes healthy, so the script exits with an error and you roll back to the previous tag", correct: true, why: "The deploy fails loudly instead of 'succeeding' into a broken state. Rolling back is ./deploy.sh with the last good sha- tag. Zero-downtime swaps need two replicas behind the proxy, or an orchestrator." },
+    { text: "Docker automatically rolls back to the previous image", why: "Compose has no automatic rollback; that's why every image is tagged with its commit." },
+    { text: "Nothing: Compose ignores healthchecks", why: "--wait exists precisely to wait for them." },
+  ]}
+/>
+
+<Checkpoint
+  title="Project step 7: deploy to a VPS"
+  solution={<p>No server yet? Run the whole thing locally: <code>PROXY_PORT=8088 ./deploy.sh</code> with an image from a local registry (<L id="02.06" />), as this lesson's output was produced. <code>dependency failed to start ... is unhealthy</code>: <code>docker compose -f compose.prod.yaml logs api</code>. Compare files with <code>git diff docker-step-07 -- project/docker</code>.</p>}
+>
+  <ul>
+    <li>Prepare a server, copy the four files, generate the password on it.</li>
+    <li>Deploy a <code>sha-</code> tag from GHCR and reach the API through the proxy.</li>
+    <li>Check the hardening: non-root processes, <code>CapEff</code> of zero, no password in <code>docker inspect</code>, no internet from <code>cache</code>.</li>
+    <li>Deploy a second tag, then roll back to the first.</li>
+  </ul>
+</Checkpoint>
+
+<Tripped>
+  Your note goes here after you deploy.
+</Tripped>
+
+## What you built
+
+Over seven steps the notes API went from a TypeScript file to a scanned, multi-platform image built by CI, running as
+four hardened containers on a server, deployed and rolled back by tag. Module 08 looks underneath Docker at the
+standards and runtimes you've been using all along, and at where to go next.
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Walk me through how you'd deploy a containerised app to a single server.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How would you get zero-downtime deploys?", "When would you move to Kubernetes?"]}
+>
+  <p>CI builds, scans and pushes an image tagged with the commit SHA. The server has Docker Engine, a firewall allowing only SSH and HTTP(S), and a production Compose file that references that image tag, with hardened containers, resource limits, log rotation, restart policies, secrets mounted as files, and the database on an internal network with a named volume. A deploy is pull plus `up -d --wait`, which fails if healthchecks don't pass; rollback is redeploying the previous SHA. Add scheduled database backups off the server, TLS at the proxy, and monitoring.</p>
+  <p>For zero downtime, run two API replicas behind the proxy and replace them one at a time, or use an orchestrator. Move to Kubernetes or a managed platform when you need multiple hosts, autoscaling or self-healing across machines.</p>
+</InterviewCard>

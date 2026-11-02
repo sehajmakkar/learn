@@ -34,6 +34,18 @@ curl localhost:8080/notes
 
 The same stack started with plain `docker` commands is in lesson 05.05 (`git checkout docker-step-04`).
 
+## Production
+
+CI (`.github/workflows/notes-api.yml`) builds, scans and publishes `ghcr.io/sehajmakkar/notes-api` (lesson 07.06).
+On a server with `compose.prod.yaml`, `deploy.sh` and `nginx/default.conf` from `project/docker` (lesson 07.07):
+
+```bash
+openssl rand -base64 24 > secrets/db_password.txt
+./deploy.sh ghcr.io/sehajmakkar/notes-api:sha-<commit>
+```
+
+The production API reads its database password from `DATABASE_PASSWORD_FILE` instead of the URL.
+
 ## Run without Docker
 
 You still need a Postgres to point at.

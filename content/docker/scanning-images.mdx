@@ -1,0 +1,153 @@
+export const meta = {
+  summary: "Scan images for known vulnerabilities with Trivy, read the numbers without panicking, and gate CI on the findings you can actually fix.",
+  uses: ["02.07", "02.05"],
+  usedIn: ["07.06"],
+};
+
+<BeforeYouStart>
+  You've compared base images (<L id="02.07" />) and know how layers add up (<L id="02.05" />).
+</BeforeYouStart>
+
+## The core idea
+
+An image contains hundreds of packages you didn't write: the OS, the language runtime, your dependencies. Some of them
+have known vulnerabilities (CVEs). A **scanner** lists every package in the image and matches it against vulnerability
+databases. The skill isn't running the scanner; it's reading the result: which findings matter, and which you can fix.
+
+## Run a scan
+
+[Trivy](https://trivy.dev) is a free, open-source scanner that runs as a container, so there's nothing to install:
+
+<Code lang="bash" file="scan">{`
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \\
+  -v trivy-cache:/root/.cache aquasec/trivy:0.76.1 image notes-api
+`}</Code>
+
+The socket mount lets Trivy read your local images; the cache volume keeps its vulnerability database between runs.
+(Docker Desktop also includes **Docker Scout**, `docker scout cves`, which does the same job with a Docker account.)
+
+## The numbers
+
+Counts from this course's scans, all with the same Trivy version on the same day:
+
+| Image | Critical | High | Medium | Low | Total |
+| --- | --- | --- | --- | --- | --- |
+| `node:22` | 20 | 455 | 2042 | 1789 | 4397 |
+| notes API on `node:22-slim` | 1 | 42 | 110 | 84 | 239 |
+| `node:22-alpine` | 0 | 10 | 12 | 1 | 23 |
+
+The full Debian image has twenty times the findings of the slim one, because it has twenty times the packages. Base
+image choice (<L id="02.07" />) is your biggest lever. But 239 still sounds alarming, so filter to what you can act on.
+
+## Only what's fixable
+
+Many findings have no fix released yet; you can't do anything about those except choose a different base. Trivy's
+`--ignore-unfixed` hides them:
+
+<Terminal>{`
+$ trivy image --scanners vuln --ignore-unfixed notes-api
+...
+notes-api fixable: CRITICAL=0 HIGH=10 MEDIUM=12 LOW=1 total 24
+`}</Terminal>
+
+(Summary of Trivy's report.) 239 became 24. Then ask where those 24 live:
+
+<Terminal>{`
+$ trivy image --scanners vuln --ignore-unfixed --severity HIGH --format json notes-api | ...
+Node.js {'brace-expansion': 5, 'ip-address': 1, 'pacote': 2, 'picomatch': 1, 'sigstore': 1}
+`}</Terminal>
+
+Every fixable HIGH was inside **npm's own bundled packages**, part of the Node.js installation. The notes API never runs
+npm in production. So the final stage now deletes it in the same step that uses it:
+
+<Code lang="dockerfile" file="api/Dockerfile">{`
+# Install production dependencies, then delete npm itself: the app never runs it, and its bundled
+# packages were the only fixable HIGH findings in a scan (see 07.03). Same RUN, so they never reach a layer.
+RUN npm ci --omit=dev \\
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+`}</Code>
+
+<Terminal>{`
+$ trivy image --scanners vuln --ignore-unfixed notes-api
+...
+notes-api fixable: CRITICAL=0 HIGH=0 MEDIUM=0 LOW=0
+`}</Terminal>
+
+Zero fixable findings. The image isn't smaller, because npm also lives in a lower layer from the base image
+(<L id="02.05" />), but scanners and attackers both see the final filesystem, where it's gone.
+
+## Smaller isn't automatically safer
+
+You might expect distroless (<L id="02.07" />) to win. Built the same day, it didn't:
+
+<Terminal>{`
+notes-api:distroless --ignore-unfixed: CRITICAL=1 HIGH=6 MEDIUM=12 LOW=14
+notes-api:distroless (debian 12.13) libssl3 CRITICAL 3.0.18-1~deb12u2 -> fixed in 3.0.19-1~deb12u2
+`}</Terminal>
+
+Its OpenSSL was a patch release behind the slim image's. Fewer packages is good, but only if they're up to date.
+**Measure; don't assume.** And rebuild regularly with `docker build --pull` so you pick up base-image patches.
+
+## Gating CI
+
+A scan nobody reads does nothing, so make the build fail on what matters. `--exit-code 1` makes Trivy fail when it
+finds anything at the chosen severities:
+
+<Terminal>{`
+$ trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 notes-api
+$ echo $?
+0
+`}</Terminal>
+
+Before the npm change, the same command exited with 1. "Fixable HIGH or CRITICAL" is a gate teams can live with: it
+fails on things you can fix today, not on noise. The workflow in <L id="07.06" /> runs exactly this.
+
+<Quiz
+  question="A scan shows 200 vulnerabilities in your image, 180 with no fix available. What's the most useful next step?"
+  options={[
+    { text: "Block the release until all 200 are resolved", why: "180 can't be resolved by you right now. A gate on unfixable findings just blocks every release." },
+    { text: "Ignore the scan: most findings never matter", why: "Some do, and the fixable ones are usually cheap to fix." },
+    { text: "Filter to fixable HIGH/CRITICAL, find which packages they're in, and fix or remove those", correct: true, why: "That turns a scary number into a short, actionable list. Often a base-image update or removing an unused package clears most of it." },
+    { text: "Switch to an image with no OS packages and stop scanning", why: "Runtimes and app dependencies still have vulnerabilities, and minimal images can lag on patches." },
+  ]}
+/>
+
+<Checkpoint
+  title="Scan, reduce, gate"
+  solution={<p>Different numbers from the table are expected: the vulnerability database changes daily and base images are re-published. Compare images against each other on the same day, not against these numbers.</p>}
+>
+  <p>Scan <code>node:22</code>, <code>node:22-slim</code> and your notes API. Re-run with <code>--ignore-unfixed --severity HIGH,CRITICAL</code> and find which packages the findings come from. Run the gate command and check its exit code.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Gating on every finding.** Nothing ever ships; people learn to bypass the gate.</li>
+    <li>**Scanning once.** New CVEs are published daily. Scan in CI and on a schedule.</li>
+    <li>**Never rebuilding.** Your image keeps its old packages until you rebuild with `--pull`.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Scanners match an image's packages against CVE databases.</li>
+    <li>Base image choice dominates the count.</li>
+    <li>`--ignore-unfixed` and severity filters give an actionable list.</li>
+    <li>Remove what you don't need, rebuild with `--pull`, and gate CI on fixable HIGH/CRITICAL.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you introduce image vulnerability scanning into a team's pipeline?", level: "Senior", frequency: 2, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle a CVE with no fix?"]}
+>
+  <p>Scan every image in CI with a tool like Trivy, Grype or Docker Scout, and gate on fixable HIGH and CRITICAL findings so the gate is actionable rather than noisy. Also scan on a schedule, because new CVEs appear for images you haven't changed. Reduce findings at the source: minimal and current base images, multi-stage builds, removing unused packages, and regular rebuilds with `--pull` (automated with Renovate or Dependabot).</p>
+  <p>For unfixable or irrelevant findings, record time-limited exceptions with a reason (for example, the vulnerable code path isn't reachable), and revisit them when fixes ship.</p>
+</InterviewCard>

@@ -1,0 +1,175 @@
+export const meta = {
+  summary: "A GitHub Actions workflow that builds the notes API, refuses to ship fixable HIGH vulnerabilities, and publishes multi-platform images to GHCR tagged by commit.",
+  uses: ["07.03", "07.04", "07.05", "02.06"],
+  usedIn: ["07.07", "docker-step-06"],
+};
+
+<BeforeYouStart>
+  Project step 6. You know scanning (<L id="07.03" />), multi-platform builds (<L id="07.04" />) and CI caching
+  (<L id="07.05" />). The workflow is `.github/workflows/notes-api.yml` in the course repo, tagged
+  `docker-step-06`.
+</BeforeYouStart>
+
+## The brief
+
+<Recap>
+  <ul>
+    <li>Every pull request and push that touches the API builds the image and scans it.</li>
+    <li>The build fails if there are fixable HIGH or CRITICAL vulnerabilities.</li>
+    <li>Pushes to `main` publish `linux/amd64` and `linux/arm64` images to GitHub Container Registry.</li>
+    <li>Every published image has a `sha-` tag for its commit; `main` also moves `latest`.</li>
+    <li>Builds reuse the cache from previous runs.</li>
+  </ul>
+</Recap>
+
+## The workflow, part by part
+
+**When it runs.** Only when the API or the workflow itself changes, plus a manual button:
+
+<Code lang="yaml" file=".github/workflows/notes-api.yml">{`
+on:
+  push:
+    branches: [main]
+    paths:
+      - "project/docker/api/**"
+      - ".github/workflows/notes-api.yml"
+  pull_request:
+    paths:
+      - "project/docker/api/**"
+      - ".github/workflows/notes-api.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+`}</Code>
+
+`permissions` gives the job's automatic `GITHUB_TOKEN` exactly what it needs: read the code, write packages. No
+personal token is stored anywhere.
+
+**Build and scan before publishing.** The image is built once for the runner's platform and loaded locally, so the scan
+runs before anything leaves the runner:
+
+<Code lang="yaml" file=".github/workflows/notes-api.yml">{`
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build for scanning
+        uses: docker/build-push-action@v7
+        with:
+          context: \${{ env.CONTEXT }}
+          load: true
+          tags: notes-api:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan with Trivy
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \\
+            aquasec/trivy:0.76.1 image --scanners vuln --severity HIGH,CRITICAL \\
+            --ignore-unfixed --exit-code 1 notes-api:scan
+`}</Code>
+
+The scan is the same gate as in <L id="07.03" />, with a pinned Trivy version so results don't change underneath you.
+
+**Tags.** `docker/metadata-action` turns the commit into tags:
+
+<Code lang="yaml" file=".github/workflows/notes-api.yml">{`
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: \${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+`}</Code>
+
+**Publish.** Log in to GHCR with the built-in token, then build both platforms and push. The amd64 layers come
+straight from the cache the scan build just wrote:
+
+<Code lang="yaml" file=".github/workflows/notes-api.yml">{`
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request' && vars.PUBLISH_IMAGE == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: \${{ github.actor }}
+          password: \${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        if: github.event_name != 'pull_request' && vars.PUBLISH_IMAGE == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: \${{ env.CONTEXT }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: \${{ steps.meta.outputs.tags }}
+          labels: \${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+`}</Code>
+
+Two guards on publishing: pull requests never publish (code from a fork shouldn't push images), and a **repository
+variable**, `PUBLISH_IMAGE`, must be `true`. That makes publishing a deliberate switch. Set it under the repo's
+Settings → Secrets and variables → Actions → Variables, or with `gh variable set PUBLISH_IMAGE --body true`.
+
+## What the real runs looked like
+
+<Terminal>{`
+$ gh run view 41526039809
+✓ image in 1m29s
+  ✓ Run actions/checkout@v5
+  ✓ Run docker/setup-qemu-action@v3
+  ✓ Run docker/setup-buildx-action@v3
+  ✓ Build for scanning
+  ✓ Scan with Trivy
+  ✓ Image tags
+  - Log in to GHCR
+  - Build and push (amd64 + arm64)
+
+ANNOTATIONS
+! Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24:
+  docker/build-push-action@v6, docker/metadata-action@v5, docker/setup-buildx-action@v3, docker/setup-qemu-action@v3.
+`}</Terminal>
+
+Output trimmed. The first run passed the scan and skipped publishing (the variable wasn't set yet). It also flagged that
+the action versions were a major behind, so the workflow moved to `checkout@v7`, `setup-qemu-action@v4`,
+`setup-buildx-action@v4`, `build-push-action@v7`, `metadata-action@v6` and `login-action@v4`. The second run had no
+warnings and reused the cache (<L id="07.05" />). Read your CI warnings; they're cheap to fix early.
+
+<Quiz
+  question="A pull request from someone's fork changes the API. What does this workflow do?"
+  options={[
+    { text: "Builds, scans and publishes a sha- image for the PR", why: "Publishing is skipped for pull_request events." },
+    { text: "Builds and scans, so the PR gets a pass or fail, but publishes nothing", correct: true, why: "Both publish steps check github.event_name != 'pull_request'. Reviewers see whether the change builds and passes the scan." },
+    { text: "Nothing: paths filters don't apply to PRs", why: "The pull_request trigger has the same paths filter, and this PR touches the API." },
+    { text: "Fails, because forks can't use the GHA cache", why: "Fork PRs can read the cache; the build works." },
+  ]}
+/>
+
+<Checkpoint
+  title="Project step 6: ship from CI"
+  solution={<p>Push fails with <code>denied: permission_denied</code>: check <code>permissions: packages: write</code> in the workflow, and that the repository is allowed to write to the package (the package's Settings → Manage Actions access). The scan fails: read the table Trivy printed; it lists each package with its fixed version.</p>}
+>
+  <ul>
+    <li>Add the workflow to your fork, push, and watch it run in the Actions tab or with <code>gh run watch</code>.</li>
+    <li>Open a PR that changes <code>server.ts</code> and confirm it builds and scans without publishing.</li>
+    <li>Set <code>PUBLISH_IMAGE</code> to <code>true</code>, push to <code>main</code>, and find your image under your GitHub profile's Packages. Pull it on a machine with the other architecture.</li>
+    <li>Check the package's visibility in its settings. If it's private, the server needs <code>docker login ghcr.io</code> before it can pull (<L id="07.07" />); make it public if you'd rather not.</li>
+  </ul>
+</Checkpoint>
+
+<Tripped>
+  Your note goes here after you finish this step.
+</Tripped>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Describe a CI pipeline for building and publishing Docker images.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you tag images?", "How do you stop PRs from publishing?"]}
+>
+  <p>On every PR and push: check out, set up Buildx (and QEMU for multi-arch), build with an exported cache (`type=gha` or a registry cache, `mode=max`), load the image and scan it, failing on fixable HIGH and CRITICAL findings. On the main branch only: log in to the registry with a short-lived token (`GITHUB_TOKEN` with `packages: write`), build for all target platforms, and push with immutable commit tags (`sha-…`) plus moving tags like `latest` or semver. Deployments then reference the SHA tag, so every running container traces to a commit and rollbacks are redeploys.</p>
+</InterviewCard>
