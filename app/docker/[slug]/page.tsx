@@ -22,6 +22,9 @@ type LessonModule = { default: ComponentType; meta: LessonMeta };
 
 const tagLabel = { CODE: "with code", CONCEPT: "concept", BUILD: "build" } as const;
 
+// Every live lesson is prerendered below, so there's nothing to stream; let unknown slugs block and 404.
+export const instant = false;
+
 export function generateStaticParams() {
   return allLessons.filter((l) => l.live).map((l) => ({ slug: l.slug! }));
 }

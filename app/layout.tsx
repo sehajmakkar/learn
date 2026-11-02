@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import {
   IBM_Plex_Mono,
   Instrument_Sans,
   Instrument_Serif,
   Nanum_Pen_Script,
 } from "next/font/google";
-import { ThemeProvider } from "next-themes";
 import { SiteHeader } from "@/components/site-header";
 import { SiteFooter } from "@/components/site-footer";
 import "./globals.css";
@@ -34,6 +34,8 @@ const pen = Nanum_Pen_Script({
   variable: "--f-pen",
 });
 
+const themeScript = `try{var t=localStorage.getItem("theme");var d=t?t==="dark":matchMedia("(prefers-color-scheme: dark)").matches;document.documentElement.classList.toggle("dark",d)}catch(e){}`;
+
 export const metadata: Metadata = {
   metadataBase: new URL("https://learn.sehaj.tech"),
   title: {
@@ -52,11 +54,13 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${serif.variable} ${sans.variable} ${mono.variable} ${pen.variable} antialiased`}
     >
       <body className="flex min-h-screen flex-col font-sans">
-        <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
-          <SiteHeader />
-          <main className="flex-1">{children}</main>
-          <SiteFooter />
-        </ThemeProvider>
+        {/* Set the theme before hydration: saved choice, else the system setting. */}
+        <Script id="theme" strategy="beforeInteractive">
+          {themeScript}
+        </Script>
+        <SiteHeader />
+        <main className="flex-1">{children}</main>
+        <SiteFooter />
       </body>
     </html>
   );

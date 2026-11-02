@@ -1,14 +1,15 @@
 "use client";
 
-import { useTheme } from "next-themes";
-
 export function ThemeToggle() {
-  const { resolvedTheme, setTheme } = useTheme();
-
   return (
     <button
       type="button"
-      onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
+      onClick={() => {
+        const dark = document.documentElement.classList.toggle("dark");
+        try {
+          localStorage.setItem("theme", dark ? "dark" : "light");
+        } catch {}
+      }}
       className="grid size-8 place-items-center rounded-md text-muted transition-colors hover:text-ink"
       aria-label="Toggle colour theme"
     >
