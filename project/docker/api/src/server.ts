@@ -4,7 +4,20 @@ import { randomUUID } from "node:crypto";
 
 type Note = { id: string; text: string; createdAt: string };
 
-const port = Number(process.env.PORT ?? 3000);
+// All configuration comes from the environment (see 03.03). Bad config fails fast at startup.
+function intFromEnv(name: string, fallback: number) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    console.error(`config error: ${name} must be a positive integer, got "${raw}"`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const port = intFromEnv("PORT", 3000);
+const maxNoteLength = intFromEnv("MAX_NOTE_LENGTH", 280);
 const notes: Note[] = [];
 
 function send(res: ServerResponse, status: number, body: unknown) {
@@ -25,6 +38,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/notes") {
       const { text } = (await readJson(req)) as { text?: unknown };
       if (typeof text !== "string" || !text.trim()) return send(res, 400, { error: "text is required" });
+      if (text.length > maxNoteLength) return send(res, 400, { error: `text is longer than ${maxNoteLength} characters` });
       const note = { id: randomUUID(), text, createdAt: new Date().toISOString() };
       notes.push(note);
       return send(res, 201, note);
@@ -35,7 +49,7 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(port, () => console.log(`notes-api listening on :${port}`));
+server.listen(port, () => console.log(`notes-api listening on :${port} (max note length ${maxNoteLength})`));
 
 // docker stop sends SIGTERM. As PID 1 we must handle it ourselves (see 01.03).
 process.on("SIGTERM", () => {
