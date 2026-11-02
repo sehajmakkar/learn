@@ -1,0 +1,215 @@
+export const meta = {
+  summary: "Put Nginx in front, add a Redis cache, and split everything across a public and a private network so only one container is reachable from outside.",
+  uses: ["05.02", "05.04", "04.05", "04.03"],
+  usedIn: ["06.06", "07.07", "docker-step-04"],
+};
+
+<BeforeYouStart>
+  Project step 4. You have the Postgres-backed API from step 3 (`docker-step-03`), and know user-defined networks
+  (<L id="05.02" />) and bind mounts (<L id="04.03" />). The finished state is tagged `docker-step-04`.
+</BeforeYouStart>
+
+## The brief
+
+<Recap>
+  <ul>
+    <li>Nginx is the only container with a published port. It forwards requests to the API.</li>
+    <li>The API caches `GET /notes` in Redis for 30 seconds and clears the cache on every new note.</li>
+    <li>If Redis is down, the API keeps working, just without the cache.</li>
+    <li>Two networks: `notes-frontend` (Nginx, API) and `notes-backend` (API, Postgres, Redis). Nginx can't reach the database.</li>
+    <li>Nginx starts even if the API isn't up yet.</li>
+  </ul>
+</Recap>
+
+<Stacks
+  title="Step 4 layout"
+  columns={[
+    { title: "notes-frontend", note: "public side", layers: [[{ text: "notes-proxy · nginx · :8080", tone: "accent" }], ["notes · API"]] },
+    { title: "notes-backend", note: "private side", layers: [["notes · API"], [{ text: "notes-db", tone: "muted" }, { text: "notes-cache", tone: "muted" }]] },
+  ]}
+/>
+
+## What changed in the API
+
+The API gets an optional `REDIS_URL` (`npm install redis`). The rule that matters: **a cache must never be able to take
+the app down.** So the API doesn't wait for Redis at startup, checks `isReady` before using it, and falls back to
+Postgres on any error. Responses carry an `x-cache: hit` or `miss` header so you can see it working.
+
+<Code lang="ts" file="src/server.ts">{`
+async function cached<T>(load: () => Promise<T>): Promise<{ value: T; hit: boolean }> {
+  if (cache?.isReady) {
+    try {
+      const hit = await cache.get(CACHE_KEY);
+      if (hit) return { value: JSON.parse(hit) as T, hit: true };
+    } catch {
+      // fall through to the database
+    }
+  }
+  const value = await load();
+  if (cache?.isReady) await cache.set(CACHE_KEY, JSON.stringify(value), { EX: 30 }).catch(() => {});
+  return { value, hit: false };
+}
+`}</Code>
+
+## The Nginx config
+
+`project/docker/nginx/default.conf`, bind-mounted read-only into the official image:
+
+<Code lang="nginx" file="nginx/default.conf">{`
+server {
+    listen 80;
+
+    # Docker's embedded DNS. Resolving per request means nginx starts even if the API isn't up yet,
+    # and follows the API to its new IP when the container is replaced.
+    resolver 127.0.0.11 valid=10s;
+    set $api http://notes:3000;
+
+    location / {
+        proxy_pass $api;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+`}</Code>
+
+The `resolver` and variable look odd, so here's why. With a plain `proxy_pass http://notes:3000;`, Nginx looks the name
+up once, at startup. If the API isn't running yet, Nginx refuses to start:
+
+<Terminal>{`
+$ docker run -d --name naive-proxy --network notes-frontend -v "$PWD/naive.conf":/etc/nginx/conf.d/default.conf:ro nginx:alpine
+$ docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' naive-proxy
+exited exit=1
+$ docker logs naive-proxy
+[emerg] 1#1: host not found in upstream "notes" in /etc/nginx/conf.d/default.conf:4
+`}</Terminal>
+
+Output trimmed. And even when it starts, it keeps the old IP after the API container is replaced. Using a variable
+makes Nginx ask Docker's DNS at request time instead.
+
+## Run it
+
+From `project/docker`:
+
+<Terminal>{`
+$ docker build -t notes-api api
+$ docker network create notes-backend
+$ docker network create notes-frontend
+$ docker volume create notes-pgdata
+$ docker run -d --name notes-db --network notes-backend \\
+    -e POSTGRES_USER=notes -e POSTGRES_PASSWORD=notes -e POSTGRES_DB=notes \\
+    -v notes-pgdata:/var/lib/postgresql postgres:18
+$ docker run -d --name notes-cache --network notes-backend redis:8-alpine
+$ docker run -d --name notes --network notes-backend \\
+    -e DATABASE_URL=postgres://notes:notes@notes-db:5432/notes \\
+    -e REDIS_URL=redis://notes-cache:6379 notes-api
+$ docker network connect notes-frontend notes
+$ docker run -d --name notes-proxy --network notes-frontend -p 8080:80 \\
+    -v "$PWD/nginx/default.conf":/etc/nginx/conf.d/default.conf:ro nginx:alpine
+$ docker ps --filter name=notes --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
+NAMES         STATUS                   PORTS
+notes-proxy   Up 8 seconds             0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
+notes         Up 8 seconds (healthy)   3000/tcp
+notes-cache   Up 8 seconds             6379/tcp
+notes-db      Up 17 seconds            5432/tcp
+`}</Terminal>
+
+Only `notes-proxy` has a host port. If you still have `notes-pgdata` from step 3, your old notes are already there.
+
+## Prove it works
+
+<Terminal>{`
+$ curl -X POST localhost:8080/notes -H 'content-type: application/json' -d '{"text":"through nginx"}'
+{"id":"52e5e286-3754-462b-866b-032a57f914af","text":"through nginx","createdAt":"2026-11-02T20:40:44.100Z"}
+$ curl -s -D - -o /dev/null localhost:8080/notes | grep -iE '^(server|x-cache):'
+Server: nginx/1.31.8
+x-cache: miss
+$ curl -s -D - -o /dev/null localhost:8080/notes | grep -iE '^(server|x-cache):'
+Server: nginx/1.31.8
+x-cache: hit
+`}</Terminal>
+
+`Server: nginx` shows the request went through the proxy. The second read came from Redis.
+
+**Nginx can't see the database:**
+
+<Terminal>{`
+$ docker exec notes-proxy wget -qO- -T 3 http://notes-db:5432
+wget: bad address 'notes-db:5432'
+$ docker exec notes-proxy wget -qO- -T 3 http://notes:3000/healthz
+{"status":"ok"}
+`}</Terminal>
+
+**The cache can fail safely:**
+
+<Terminal>{`
+$ docker stop notes-cache
+$ curl -s -D - -o /dev/null localhost:8080/notes | grep -i '^x-cache'
+x-cache: miss
+$ docker logs notes 2>&1 | grep -i redis | tail -1
+redis error: getaddrinfo ENOTFOUND notes-cache
+$ docker start notes-cache
+`}</Terminal>
+
+With Redis stopped, every request is a miss served from Postgres, and the API logs the problem instead of failing.
+Start Redis again and the client reconnects by itself.
+
+**Nginx survives the API restarting:**
+
+<Terminal>{`
+$ docker stop notes
+$ curl -s -o /dev/null -w "%{http_code}\\n" localhost:8080/notes
+502
+$ docker start notes
+$ curl -s -o /dev/null -w "%{http_code}\\n" localhost:8080/notes
+200
+`}</Terminal>
+
+A 502 while the API is down, then a 200 a few seconds after it starts (it waits for Postgres first), without touching
+Nginx.
+
+<Quiz
+  question="You replace the notes container with a new version, and it gets a new IP. What does Nginx do with this config?"
+  options={[
+    { text: "Keeps sending traffic to the old IP until Nginx restarts", why: "That's what a plain proxy_pass with a hostname does. The resolver and variable avoid it." },
+    { text: "Finds the new IP within about 10 seconds, because it resolves the name per request with valid=10s", correct: true, why: "The variable forces a DNS lookup at request time, and Nginx caches answers for 10 seconds." },
+    { text: "Fails, because Nginx can't use DNS inside Docker", why: "Docker's embedded DNS at 127.0.0.11 works for Nginx like for any other process." },
+    { text: "Load-balances between the old and new IP", why: "The old container is gone; its IP no longer answers." },
+  ]}
+/>
+
+<Checkpoint
+  title="Project step 4: wire the services together"
+  solution={<p>Nginx returns 502 constantly: the API isn't on <code>notes-frontend</code> (check <code>docker network inspect notes-frontend</code>). Always <code>x-cache: miss</code>: check <code>REDIS_URL</code> and that the cache is on <code>notes-backend</code>. Compare with <code>git diff docker-step-04 -- project/docker</code>.</p>}
+>
+  <ul>
+    <li>Add the Redis cache to the API (or check out <code>docker-step-04</code>) and write the Nginx config.</li>
+    <li>Start all four containers on the two networks; only Nginx publishes a port.</li>
+    <li>Show a cache miss then a hit, that Nginx can't resolve <code>notes-db</code>, that the API survives Redis stopping, and that Nginx survives the API restarting.</li>
+    <li>Count the <code>docker</code> commands you ran. Keep that number in mind for Module 06.</li>
+  </ul>
+</Checkpoint>
+
+<Tripped>
+  Your note goes here after you finish this step.
+</Tripped>
+
+## What's next
+
+That was nine commands, in the right order, with names repeated across them, to start one app. Module 06 turns all
+of it into a single `compose.yaml` and one `docker compose up` (<L id="06.06" />).
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Why put a reverse proxy like Nginx in front of an application container?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How does Nginx find the app container?"]}
+>
+  <p>It gives one public entry point while the app and its dependencies stay on a private network with no published ports. The proxy can terminate TLS, serve static files, add headers, apply rate limits and buffer slow clients, and it lets you route to several services or swap app containers behind a stable address. Inside Docker it reaches the app by container name through the embedded DNS; resolving at request time (a `resolver` plus a variable) avoids startup failures and stale IPs when containers are replaced.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "How should an application behave when its cache (Redis) is unavailable?", level: "Senior", frequency: 2, importance: "Must-know", kind: "Design" }}
+>
+  <p>Degrade, not fail: treat the cache as optional, check connection state before using it, catch errors and fall back to the source of truth, and keep cache operations off the critical path with short timeouts. Log and alert on the failure. Be aware the database now takes the full load, so it needs headroom, or you need rate limiting, to survive a cache outage.</p>
+</InterviewCard>

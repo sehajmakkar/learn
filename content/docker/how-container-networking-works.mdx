@@ -1,0 +1,130 @@
+export const meta = {
+  summary: "What actually connects a container to the world: a private network namespace, a virtual cable, a bridge, and some address translation.",
+  uses: ["01.03", "03.02"],
+  usedIn: ["05.02", "05.03", "05.04"],
+};
+
+<BeforeYouStart>
+  You know each container gets its own network namespace (<L id="01.03" />) and how `-p` publishes a port
+  (<L id="03.02" />).
+</BeforeYouStart>
+
+## The core idea
+
+Every container has its own network stack: its own interfaces, IP address, routing table and ports. Docker connects
+that private stack to the outside world with three pieces of ordinary Linux networking:
+
+<Flow
+  title="How a container reaches the network"
+  steps={[
+    { label: "veth pair", detail: "A virtual cable. One end is the container's eth0, the other end sits on the host." },
+    { label: "Bridge", detail: "A virtual switch on the host. Every container's cable plugs into it, so they can talk." },
+    { label: "NAT out", detail: "Traffic leaving for the internet is rewritten to come from the host's IP." },
+    { label: "NAT in (-p)", detail: "Published ports rewrite incoming traffic to the container's IP and port." },
+  ]}
+  caption="On Docker Desktop all of this happens inside the Linux VM; the idea is the same."
+/>
+
+## The networks Docker gives you
+
+<Terminal>{`
+$ docker network ls
+NETWORK ID     NAME      DRIVER    SCOPE
+ed8a6de1e4b5   bridge    bridge    local
+...            host      host      local
+...            none      null      local
+$ docker network inspect bridge -f '{{range .IPAM.Config}}subnet={{.Subnet}} gateway={{.Gateway}}{{end}}'
+subnet=172.17.0.0/16 gateway=172.17.0.1
+`}</Terminal>
+
+Output trimmed. Containers you start without `--network` join `bridge`, the **default bridge**, and get an address
+from `172.17.0.0/16`. `host` and `none` are special modes, covered in <L id="05.03" />.
+
+## The view from inside
+
+<Terminal>{`
+$ docker run --rm alpine sh -c 'ip -4 addr show eth0 | grep inet; ip route; cat /etc/resolv.conf'
+    inet 172.17.0.2/16 brd 172.17.255.255 scope global eth0
+default via 172.17.0.1 dev eth0
+172.17.0.0/16 dev eth0 scope link  src 172.17.0.2
+nameserver 192.168.65.7
+`}</Terminal>
+
+- **`eth0`** is the container's end of the virtual cable, with its own IP.
+- **`default via 172.17.0.1`**: anything not on the local subnet goes to the bridge's gateway, the host.
+- **`resolv.conf`** on the default bridge is copied from the host (here, Docker Desktop's resolver). Remember this;
+  it changes on user-defined networks.
+
+## Talking to each other, and out
+
+Containers on the same bridge can reach each other by IP. Outbound traffic is NAT'ed through the host, so the internet
+just works:
+
+<Terminal>{`
+$ docker run -d --name web1 nginx:alpine
+$ docker inspect -f '{{.NetworkSettings.Networks.bridge.IPAddress}}' web1
+172.17.0.2
+$ docker run --rm alpine wget -qO- http://172.17.0.2 | grep -o '<title>.*</title>'
+<title>Welcome to nginx!</title>
+$ docker run --rm alpine wget -qO- http://web1
+wget: bad address 'web1'
+$ docker run --rm alpine wget -qO- http://example.com | grep -o '<title>.*</title>'
+<title>Example Domain</title>
+`}</Terminal>
+
+By IP it works; **by name it doesn't**. The default bridge has no DNS for container names. And IPs are handed out
+fresh every time a container starts, so hard-coding them breaks on the next restart. That's why real setups use
+user-defined networks (<L id="05.02" />).
+
+## Where -p fits in
+
+Publishing `-p 8080:80` adds a rule on the host: "traffic arriving on port 8080 → rewrite to this container's IP,
+port 80". That's the NAT-in step. It's also why containers on the same network never need `-p` to reach each other:
+they talk directly over the bridge.
+
+<Quiz
+  question="Two containers on the default bridge need to talk. The API connects to the database at 172.17.0.3, which works. What goes wrong next week?"
+  options={[
+    { text: "Nothing: container IPs are permanent", why: "IPs are assigned from a pool each time a container starts." },
+    { text: "After a restart or recreate, the database may get a different IP and the API can't find it", correct: true, why: "Docker hands out addresses as containers start. Use a user-defined network and connect by name instead." },
+    { text: "The default bridge blocks traffic between containers after a while", why: "There's no such timeout; inter-container traffic is allowed on the default bridge." },
+    { text: "The database needs -p to accept connections", why: "Containers on the same network reach each other directly; -p is only for the host and outside." },
+  ]}
+/>
+
+<Checkpoint
+  title="Map your container's network"
+  solution={<p>No <code>ip</code> command: that's an image without iproute2 or busybox. Use <code>alpine</code> or <code>nicolaka/netshoot</code> for exploring.</p>}
+>
+  <p>Start two <code>alpine sleep 300</code> containers. For each, find its IP with <code>docker inspect</code> and from inside with <code>ip addr</code>. Ping one from the other by IP, then try by name. Stop and start one and check whether its IP changed.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Hard-coding container IPs.** They change. Use names on a user-defined network.</li>
+    <li>**Publishing ports so containers can talk.** They don't need `-p` for that, only a shared network.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Each container: own namespace, own `eth0`, own IP.</li>
+    <li>A veth pair connects it to a bridge; NAT handles traffic out and published ports in.</li>
+    <li>The default bridge has no name resolution, and IPs aren't stable.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Explain how Docker's default bridge networking works.", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["How does a published port reach the container?"]}
+>
+  <p>Each container gets its own network namespace. Docker creates a veth pair: one end becomes the container's `eth0`, the other attaches to a Linux bridge on the host (`docker0` for the default network). Containers get IPs from the bridge's subnet and use the bridge as their gateway. Outbound traffic is masqueraded (source-NAT) to the host's address. Published ports are destination-NAT rules that forward a host port to the container's IP and port.</p>
+</InterviewCard>

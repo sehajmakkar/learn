@@ -1,0 +1,126 @@
+export const meta = {
+  summary: "The two network modes that skip the bridge: host shares the machine's network, none has no network at all. Plus how to borrow another container's network for debugging.",
+  uses: ["05.01"],
+  usedIn: ["05.04"],
+};
+
+<BeforeYouStart>
+  You know how bridge networking works (<L id="05.01" />).
+</BeforeYouStart>
+
+## The core idea
+
+Bridge networks give each container its own isolated network stack. Two modes skip that:
+
+- **`--network host`**: no network namespace. The container uses the host's network directly.
+- **`--network none`**: a network namespace with nothing in it but loopback.
+
+And one mode borrows: **`--network container:NAME`** joins another container's network namespace.
+
+## none: nothing in, nothing out
+
+<Terminal>{`
+$ docker run --rm --network none alpine sh -c 'ip -4 addr | grep inet; wget -qO- -T 3 http://example.com'
+    inet 127.0.0.1/8 scope host lo
+wget: bad address 'example.com'
+`}</Terminal>
+
+Only `lo`. Useful for jobs that should never touch the network: processing untrusted files, offline batch work, or
+proving that a build doesn't secretly download anything.
+
+## host: the machine's network
+
+With `--network host`, a server listening on port 80 in the container listens on port 80 of the host. No NAT, no
+`-p`; Docker even warns if you pass one:
+
+<Terminal>{`
+$ docker run --rm -p 9999:80 --network host alpine true
+WARNING: Published ports are discarded when using host network mode
+`}</Terminal>
+
+On a **Linux** server, this is the real host network: slightly less overhead, and handy for software that needs many
+ports or sees the host's interfaces. The cost is isolation: port clashes with the host and other containers, and the
+container can reach every service listening on the host.
+
+On **Docker Desktop**, "the host" is the Linux VM, not your Mac:
+
+<Terminal>{`
+$ docker run --rm --network host alpine sh -c 'ip -4 addr | grep inet | head -2; hostname'
+    inet 127.0.0.1/8 scope host lo
+    inet 192.168.65.3/24 brd 192.168.65.255 scope global eth0
+docker-desktop
+$ docker run -d --name hostweb --network host nginx:alpine
+$ curl -m 3 localhost:80
+curl: (7) Failed to connect to localhost port 80 after 0 ms: Couldn't connect to server
+`}</Terminal>
+
+nginx is listening, but on the VM's port 80, which your Mac can't see. Recent Docker Desktop versions have an opt-in
+host networking setting; without it, use `-p` on Mac and Windows. This is a classic "works on my Linux box, not on my
+Mac" difference.
+
+## container: borrow a network
+
+`--network container:NAME` puts a new container into an existing container's network namespace. They share
+interfaces, IP and `localhost`:
+
+<Terminal>{`
+$ docker run --rm --network container:web1 alpine wget -qO- http://127.0.0.1 | grep -o '<title>.*</title>'
+<title>Welcome to nginx!</title>
+`}</Terminal>
+
+`127.0.0.1` reached nginx, because "localhost" is now the nginx container's. This is how you debug a container that
+has no tools of its own, like a distroless image: attach a toolbox container to its network (<L id="05.04" />).
+It's also how Kubernetes pods work: all containers in a pod share one network namespace.
+
+| Mode | Own network stack | Reachable via `-p` | Typical use |
+| --- | --- | --- | --- |
+| user-defined bridge | yes | yes | almost everything |
+| `host` | no, uses the host's | n/a, already on the host | Linux-only performance or port-heavy tools |
+| `none` | yes, loopback only | no | jobs that must stay offline |
+| `container:NAME` | shares another's | via the other container | debugging, sidecars |
+
+<Quiz
+  question="On a Mac, you run a web server with --network host and can't reach it at localhost from your browser. Why?"
+  options={[
+    { text: "host mode needs -p as well", why: "Docker discards -p in host mode." },
+    { text: "On Docker Desktop, 'host' is the Linux VM's network, not the Mac's", correct: true, why: "Containers run inside a VM on Mac and Windows. Host mode shares the VM's network, which your browser can't see unless you enable Docker Desktop's host networking option." },
+    { text: "The server must listen on 0.0.0.0", why: "That matters for bridge networks, but here the issue is which machine 'host' means." },
+    { text: "Host mode is blocked on macOS", why: "It runs; it just attaches to a different host than you expect." },
+  ]}
+/>
+
+<Checkpoint
+  title="Try every mode"
+  solution={<p>On Linux, the host-mode nginx is reachable at <code>localhost:80</code> unless something else already uses port 80, in which case it exits with "address already in use".</p>}
+>
+  <p>Run <code>alpine ip addr</code> with <code>--network none</code>, the default, a user-defined network and <code>--network host</code>, and compare the interfaces. Then start nginx and use <code>--network container:</code> to fetch its page via <code>127.0.0.1</code>.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Using host mode to "fix" a networking problem.** It hides the real issue and drops isolation.</li>
+    <li>**Expecting host mode to behave the same on Mac and Linux.** It doesn't, by default.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`none`: loopback only. `host`: the host's network, no isolation, no `-p`.</li>
+    <li>On Docker Desktop, host means the VM unless you enable host networking.</li>
+    <li>`container:NAME` shares another container's network; great for debugging.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What are the trade-offs of --network host?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+>
+  <p>The container uses the host's network stack directly: no NAT or bridge overhead, no need to publish ports, and it sees all host interfaces, which helps for high-throughput or port-heavy software. In exchange you lose isolation: ports clash with the host and other containers, the container can reach everything listening on the host, and behaviour differs on Docker Desktop, where the "host" is a VM. Use it deliberately, mostly on Linux.</p>
+</InterviewCard>

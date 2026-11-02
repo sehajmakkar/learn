@@ -1,0 +1,150 @@
+export const meta = {
+  summary: "Create your own networks so containers find each other by name, and use more than one to keep things that shouldn't talk apart.",
+  uses: ["05.01"],
+  usedIn: ["05.04", "05.05", "06.02"],
+};
+
+<BeforeYouStart>
+  You know why the default bridge isn't enough: no names, unstable IPs (<L id="05.01" />). You already used a
+  user-defined network in project step 3 (<L id="04.05" />); this is how it works.
+</BeforeYouStart>
+
+## The core idea
+
+A **user-defined bridge** is a bridge network you create with `docker network create`. It works like the default one,
+plus two things that matter: containers on it can find each other **by name**, through DNS built into Docker, and
+it's **isolated** from containers on other networks.
+
+## Names, not IPs
+
+<Terminal>{`
+$ docker network create appnet
+$ docker run -d --name web1 --network appnet nginx:alpine
+$ docker run --rm --network appnet alpine sh -c 'cat /etc/resolv.conf; nslookup web1; wget -qO- http://web1'
+nameserver 127.0.0.11
+options ndots:0
+Name:	web1
+Address: 172.20.0.2
+<title>Welcome to nginx!</title>
+`}</Terminal>
+
+Output trimmed. Compare `resolv.conf` with the default bridge's (<L id="05.01" />): on a user-defined network, every
+container asks **127.0.0.11**, Docker's embedded DNS server. It answers with the current IP of any container on the
+same network, by name, and forwards everything else to the normal resolver.
+
+Recreate `web1` and it may get a new IP, but `http://web1` keeps working.
+
+## Aliases
+
+A container can answer to extra names with `--network-alias`. Give several containers the same alias and DNS returns
+all of them:
+
+<Terminal>{`
+$ docker run -d --name api1 --network appnet --network-alias api alpine sleep 300
+$ docker run -d --name api2 --network appnet --network-alias api alpine sleep 300
+$ docker run --rm --network appnet alpine nslookup api
+Address: 172.20.0.4
+Address: 172.20.0.3
+`}</Terminal>
+
+Clients pick one of the addresses, which gives you crude load-spreading. It's a DNS trick, not a load balancer: there are
+no health checks, and clients often cache the answer.
+
+## Isolation between networks
+
+Containers on different user-defined networks can't reach each other, not even by IP:
+
+<Terminal>{`
+$ docker network create frontend
+$ docker network create backend
+$ docker run -d --name dbx --network backend nginx:alpine
+$ docker run --rm --network frontend alpine wget -qO- -T 3 http://dbx
+wget: bad address 'dbx'
+$ docker run --rm --network frontend alpine wget -qO- -T 3 http://172.22.0.2
+wget: download timed out
+`}</Terminal>
+
+The name doesn't resolve, and the IP isn't routable from the other network. That's the basis of a simple, useful
+security layout: a public-facing proxy on one network, the database on another, and only the app on both.
+
+## One container, several networks
+
+`docker network connect` attaches a running container to another network. It gets a second interface:
+
+<Terminal>{`
+$ docker run -d --name bridgebox --network frontend alpine sleep 300
+$ docker network connect backend bridgebox
+$ docker exec bridgebox ip -4 addr | grep inet
+    inet 127.0.0.1/8 scope host lo
+    inet 172.21.0.2/16 brd 172.21.255.255 scope global eth0
+    inet 172.22.0.3/16 brd 172.22.255.255 scope global eth1
+$ docker exec bridgebox wget -qO- http://dbx | grep -o '<title>.*</title>'
+<title>Welcome to nginx!</title>
+`}</Terminal>
+
+`eth0` is on `frontend`, `eth1` on `backend`, and the container can reach both sides. `docker network disconnect`
+removes it again.
+
+<Stacks
+  title="The layout project step 4 uses"
+  columns={[
+    { title: "notes-frontend", note: "public side", layers: [[{ text: "nginx (publishes :8080)", tone: "accent" }], ["notes API"]] },
+    { title: "notes-backend", note: "private side", layers: [["notes API"], [{ text: "postgres", tone: "muted" }, { text: "redis", tone: "muted" }]] },
+  ]}
+  caption="Only the API is on both. Nginx can't reach the database or Redis even if it's compromised."
+/>
+
+<Quiz
+  question="Your API is on network backend. You add nginx on network frontend and point it at http://api:3000. Nginx logs 'host not found'. What's the smallest fix?"
+  options={[
+    { text: "Publish the API's port with -p 3000:3000", why: "That exposes the API on the host, but nginx still can't resolve the name api." },
+    { text: "docker network connect frontend api", correct: true, why: "Names only resolve between containers that share a network. Putting the API on frontend too lets nginx find it, and the database stays private on backend." },
+    { text: "Move the database onto frontend too", why: "That works, but it exposes the database to everything on the public side." },
+    { text: "Use the default bridge instead", why: "The default bridge doesn't resolve names at all." },
+  ]}
+/>
+
+<Checkpoint
+  title="Build a two-network layout"
+  solution={<p>Names don't resolve: check both containers are on the same network with <code>docker network inspect NAME</code>, which lists every attached container. Remember the default <code>bridge</code> never resolves names.</p>}
+>
+  <p>Create <code>frontend</code> and <code>backend</code>. Put an nginx on <code>backend</code> named <code>secret</code>. From a container on <code>frontend</code>, show you can't reach it. Then attach that container to <code>backend</code> as well and show you can. Clean up with <code>docker network rm</code> (it fails while containers are attached).</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Using the default bridge and wondering why names don't work.** Always create a network.</li>
+    <li>**One flat network for everything.** Split public and private sides.</li>
+    <li>**Treating aliases as a load balancer.** No health checks, and clients cache DNS.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`docker network create` gives you DNS by container name via 127.0.0.11.</li>
+    <li>Different networks are isolated, even by IP.</li>
+    <li>`docker network connect` puts a container on several networks.</li>
+    <li>`--network-alias` adds names; shared aliases return several IPs.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do containers discover each other in Docker?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why doesn't this work on the default bridge?"]}
+>
+  <p>On user-defined networks, Docker runs an embedded DNS server at 127.0.0.11 inside each container. It resolves container names and network aliases to their current IPs on that network and forwards other queries upstream. So services connect by name, like `postgres://db:5432`, and survive IP changes. The default bridge network predates this and doesn't provide name resolution, which is why you should always create your own network.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "How would you stop a public-facing container from reaching your database?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Design" }}
+>
+  <p>Use separate user-defined networks: put the reverse proxy on a frontend network, the database and cache on a backend network, and attach only the application to both. Containers on different networks can't resolve or route to each other. Don't publish the database's port at all, and mark the backend network `--internal` if it never needs outbound internet access.</p>
+</InterviewCard>

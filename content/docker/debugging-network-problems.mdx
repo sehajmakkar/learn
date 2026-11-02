@@ -1,0 +1,175 @@
+export const meta = {
+  summary: "A repeatable checklist for 'container A can't reach B', the five mistakes behind almost every case, and a toolbox container that works even on distroless images.",
+  uses: ["05.02", "05.03", "03.02"],
+  usedIn: ["05.05", "07.07"],
+};
+
+<BeforeYouStart>
+  You know user-defined networks (<L id="05.02" />), the `container:` network mode (<L id="05.03" />) and
+  publishing ports (<L id="03.02" />). The examples run against the project step 4 stack (<L id="05.05" />), but the
+  checklist works anywhere.
+</BeforeYouStart>
+
+## The core idea
+
+"It can't connect" has a small number of causes, and you can rule them out in order: **does the name resolve, is
+anything listening, can packets get there, and is the app using the right address?** Work from the outside in and
+stop guessing.
+
+## The toolbox
+
+Most images don't ship `dig`, `curl`, `nc` or `ss`, and distroless ones don't even have a shell. Bring your own:
+**nicolaka/netshoot** is an image packed with network tools. Run it on the same network as the thing you're
+debugging, or inside its network namespace:
+
+<Code lang="bash" file="toolbox">{`
+# On a network, as a neighbour
+docker run --rm -it --network notes-backend nicolaka/netshoot
+
+# Inside another container's network: same IP, same localhost, same ports
+docker run --rm -it --network container:notes nicolaka/netshoot
+`}</Code>
+
+## The checklist
+
+**1. Are they on the same network?**
+
+<Terminal>{`
+$ docker network inspect notes-frontend -f '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\\n"}}{{end}}'
+notes 172.21.0.3/16
+notes-proxy 172.21.0.2/16
+`}</Terminal>
+
+If the caller isn't listed next to the target, nothing else matters. A container started without `--network` is on
+the default bridge and can't resolve anyone:
+
+<Terminal>{`
+$ docker run --rm alpine wget -qO- -T 3 http://notes:3000/healthz
+wget: bad address 'notes:3000'
+`}</Terminal>
+
+**2. Does the name resolve, from the caller's side?**
+
+<Terminal>{`
+$ docker run --rm --network notes-frontend nicolaka/netshoot dig +short notes notes-db
+172.21.0.3
+`}</Terminal>
+
+`notes` resolves; `notes-db` returns nothing because it's only on `notes-backend`. That's by design here, but it's
+the answer you'd be looking for.
+
+**3. Is anything listening, on the right address?**
+
+<Terminal>{`
+$ docker run --rm --network container:notes nicolaka/netshoot ss -tlnp
+State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess
+LISTEN 0      4096      127.0.0.11:46567      0.0.0.0:*
+LISTEN 0      511                *:3000             *:*
+`}</Terminal>
+
+`*:3000` means the API listens on all interfaces. If you saw `127.0.0.1:3000` instead, other containers could never
+reach it: the bind-address bug from <L id="03.02" />. (`127.0.0.11` is Docker's DNS server.)
+
+**4. Does the port answer?**
+
+<Terminal>{`
+$ docker run --rm --network notes-backend nicolaka/netshoot sh -c 'nc -zv -w 2 notes-db 5432; nc -zv -w 2 notes-db 5433'
+Connection to notes-db (172.20.0.2) 5432 port [tcp/postgresql] succeeded!
+nc: connect to notes-db (172.20.0.2) port 5433 (tcp) failed: Connection refused
+`}</Terminal>
+
+"Connection refused" means the host is reachable but nothing listens on that port. A **timeout** means packets aren't
+getting there at all: a different network, or a firewall.
+
+**5. Is the app actually using that address?** Read its config and logs. The most common culprit is in the next
+section.
+
+## The five usual suspects
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `bad address` / `ENOTFOUND` | not on the same user-defined network, or a typo | `docker network connect`, check the name |
+| refused on `localhost` | the app points at `localhost` for another container | use the container's name |
+| refused on the right host | wrong port, often the **published** port instead of the container port | containers use the container port |
+| works inside, not from outside | app bound to `127.0.0.1` | listen on `0.0.0.0` |
+| timeout | networks not connected, or a firewall | check `docker network inspect` |
+
+The `localhost` one deserves its own example. Inside a container, `localhost` is **that container**:
+
+<Terminal>{`
+$ docker run --rm --network notes-backend postgres:18 psql postgres://notes:notes@localhost:5432/notes -c 'select 1'
+psql: error: connection to server at "localhost" (::1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+`}</Terminal>
+
+The database is running fine, just in a different container. `postgres://notes:notes@notes-db:5432/notes` works.
+
+<Quiz
+  question="The database container was started with -p 5433:5432. The API, on the same network, connects to notes-db:5433 and gets 'connection refused'. Why?"
+  options={[
+    { text: "The database isn't running", why: "Refused means the host answered. If the container were down, the name wouldn't even resolve." },
+    { text: "Containers on a shared network use the container port, 5432; 5433 only exists on the host", correct: true, why: "Publishing maps host port 5433 to container port 5432. Container-to-container traffic goes straight to the container, where only 5432 is listening." },
+    { text: "Port 5433 is blocked by Docker's firewall", why: "Nothing blocks it; nothing is listening there inside the container." },
+    { text: "The API needs -p too", why: "Publishing only affects traffic from outside Docker." },
+  ]}
+/>
+
+## Seeing the request itself
+
+When the connection works but the response is wrong, look at the HTTP exchange from the caller's side:
+
+<Terminal>{`
+$ docker exec notes-proxy wget -S -qO- -T 3 http://notes:3000/healthz
+  HTTP/1.1 200 OK
+  content-type: application/json
+...
+{"status":"ok"}
+`}</Terminal>
+
+Output trimmed. From netshoot, `curl -v` gives the same view with more detail. For anything deeper, netshoot also has
+`tcpdump`: `docker run --rm --network container:notes nicolaka/netshoot tcpdump -i eth0 port 5432` shows every packet
+the API sends to Postgres.
+
+<Checkpoint
+  title="Break it, then find it"
+  solution={<p>If you're stuck, walk the checklist in order and write down the answer to each step. The first "no" is your bug.</p>}
+>
+  <p>With the step 4 stack running, break it three ways, one at a time, and diagnose each with the checklist before fixing it:</p>
+  <ul>
+    <li>Disconnect the API from <code>notes-frontend</code> (<code>docker network disconnect</code>). What does nginx return, and why?</li>
+    <li>Recreate the API with <code>DATABASE_URL</code> pointing at <code>localhost</code>. What do its logs say?</li>
+    <li>Recreate the API pointing at port 5433. What does <code>nc</code> tell you?</li>
+  </ul>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Installing debug tools into production images.** Attach netshoot instead.</li>
+    <li>**Testing from your laptop instead of the caller's network.** The host's view isn't the container's.</li>
+    <li>**Restarting things until it works.** Find the failing step; restarts hide the cause.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Same network → name resolves → something listens on 0.0.0.0 → port answers → app uses that address.</li>
+    <li>`localhost` in a container is that container.</li>
+    <li>Containers use container ports, not published ones.</li>
+    <li>netshoot, on the network or in `container:` mode, gives you dig, nc, ss, curl and tcpdump anywhere.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Two services on the same Docker network can't reach each other by name. Walk me through debugging it.", level: "Senior", frequency: 2, importance: "Must-know", kind: "Debugging" }}
+  followUps={["What's the difference between a refused connection and a timeout?"]}
+>
+  <p>Confirm both are on the same user-defined network with `docker network inspect`; the default bridge doesn't resolve names. From the caller's network namespace (a netshoot container with `--network container:caller`), check the name resolves with `dig`, then whether the port answers with `nc -zv`. Refused means the host is reachable but nothing listens on that port, so check the target with `ss -tlnp`: it should listen on 0.0.0.0 and the container port, not 127.0.0.1 or the published port. A timeout points at network separation or a firewall. Finally, check the caller's actual config for `localhost` or a stale address.</p>
+</InterviewCard>
