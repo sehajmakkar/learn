@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Course project code is built inside Docker, not by the site.
+    "project/**",
   ]),
 ]);
 
