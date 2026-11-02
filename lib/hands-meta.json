@@ -1,0 +1,15 @@
+{
+  "cols": 424,
+  "rows": 140,
+  "cell": 3,
+  "gapStart": 182,
+  "gapEnd": 237,
+  "leftTip": {
+    "x": 181,
+    "y": 65
+  },
+  "rightTip": {
+    "x": 238,
+    "y": 63
+  }
+}
