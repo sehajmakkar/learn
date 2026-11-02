@@ -50,7 +50,8 @@ export function Recap({ children }: { children: ReactNode }) {
   return (
     <aside className="not-prose my-8 bg-ink px-6 py-5 text-paper">
       <p className="font-mono text-[0.68rem] tracking-[0.12em] uppercase opacity-60">Recap</p>
-      <div className="mt-3 text-[0.97rem] leading-relaxed [&_li]:flex [&_li]:gap-3 [&_li+li]:mt-2 [&_li]:before:font-mono [&_li]:before:opacity-50 [&_li]:before:content-['→'] [&_code]:font-mono [&_code]:text-[0.85em]">
+      {/* Arrow is absolutely placed so inline code in an item flows with the text instead of becoming a flex column. */}
+      <div className="mt-3 text-[0.97rem] leading-relaxed [&_li]:relative [&_li]:pl-7 [&_li+li]:mt-2 [&_li]:before:absolute [&_li]:before:left-0 [&_li]:before:font-mono [&_li]:before:opacity-50 [&_li]:before:content-['→'] [&_code]:font-mono [&_code]:text-[0.85em]">
         {children}
       </div>
     </aside>
