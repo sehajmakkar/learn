@@ -27,7 +27,8 @@ An image has two parts:
 - **Layers**: read-only snapshots of files. Each step of a Dockerfile that changes files adds one (<L id="02.02" />).
 - **Config**: environment variables, the working directory, the default command, exposed ports.
 
-Every image has a **digest**, a SHA-256 hash of its contents, like `sha256:4c0fdaa8b6341bfdeca5f18f7837462c80cff90527ee35ef185571e1c327beac`.
+Every image has a **digest**, a SHA-256 hash of its contents. When this lesson was written, `nginx:alpine` had the digest
+`sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606`.
 Change one byte and the digest changes. That makes it the only name that always means exactly the same image.
 
 ## Containers: an image plus a writable layer
@@ -39,12 +40,12 @@ the container writes, creates or deletes goes into that layer. The image underne
   title="Two containers, one image"
   columns={[
     {
-      title: "Container a",
-      layers: [[{ text: "writable layer (a)", tone: "accent" }], ["image layer 3"], ["image layer 2"], ["image layer 1"]],
+      title: "Container one",
+      layers: [[{ text: "writable layer (one)", tone: "accent" }], ["image layer 3"], ["image layer 2"], ["image layer 1"]],
     },
     {
-      title: "Container b",
-      layers: [[{ text: "writable layer (b)", tone: "accent" }], ["image layer 3"], ["image layer 2"], ["image layer 1"]],
+      title: "Container two",
+      layers: [[{ text: "writable layer (two)", tone: "accent" }], ["image layer 3"], ["image layer 2"], ["image layer 1"]],
     },
   ]}
   caption="The image layers are stored once and shared. Each container only adds its own thin writable layer."
@@ -55,11 +56,11 @@ writable layer is temporary. Delete the container and its changes are gone, unle
 (<L id="04.01" />).
 
 <Quiz
-  question="Containers a and b both run from nginx:alpine. Inside a, you create /tmp/hello.txt. Can b see it?"
+  question="Containers one and two both run from nginx:alpine. Inside one, you create /tmp/hello.txt. Can two see it?"
   options={[
     { text: "Yes, they share the same image", why: "They share the read-only image layers, but writes go to each container's own writable layer." },
-    { text: "No, the file is only in a's writable layer", correct: true, why: "Each container gets its own writable layer. The image itself never changes." },
-    { text: "Only after you restart b", why: "Restarting b doesn't pull in another container's changes. Its writable layer stays separate." },
+    { text: "No, the file is only in one's writable layer", correct: true, why: "Each container gets its own writable layer. The image itself never changes." },
+    { text: "Only after you restart two", why: "Restarting two doesn't pull in another container's changes. Its writable layer stays separate." },
     { text: "Yes, but only if they're on the same network", why: "Networking has nothing to do with files. To share files, use a volume." },
   ]}
 />
@@ -88,7 +89,7 @@ So the short name you type most often expands to something longer:
 | `nginx` | `docker.io/library/nginx:latest` |
 | `node:22-slim` | `docker.io/library/node:22-slim` |
 | `ghcr.io/sehaj/api:1.2.0` | exactly that |
-| `nginx@sha256:4c0f…` | that exact image, by digest |
+| `nginx@sha256:785835ea…` | that exact image, by digest |
 
 Tags are **movable labels**. `nginx:1.27` today may point at a different image next month after a patch release.
 Digests never move. That's why production deploys often pin by digest; more in <L id="02.06" />.
@@ -97,23 +98,29 @@ Digests never move. That's why production deploys often pin by digest; more in <
 
 <Checkpoint
   title="Two containers, one image, separate changes"
-  solution={<p>If <code>docker diff b</code> shows your file, check you ran the <code>sh -c</code> command against <code>a</code>. Other <code>C</code> lines from nginx's own cache directories are normal.</p>}
+  solution={<p>Both containers show changes under <code>/etc/nginx</code>, <code>/run</code> and <code>/var/cache/nginx</code>: that's nginx itself writing at startup. Only <code>one</code> should list <code>/tmp/hello.txt</code>. Container names must be at least two characters, which is why these aren't called <code>a</code> and <code>b</code>.</p>}
 >
   <p>Start two containers from the same image, write a file in one, and ask Docker what changed in each.</p>
 
 <Terminal>{`
-$ docker run -d --name a nginx:alpine
-$ docker run -d --name b nginx:alpine
-$ docker exec a sh -c 'echo hi > /tmp/hello.txt'
-$ docker diff a
+$ docker run -d --name one nginx:alpine
+$ docker run -d --name two nginx:alpine
+$ docker exec one sh -c 'echo hi > /tmp/hello.txt'
+$ docker diff one
+C /run
+A /run/nginx.pid
+...
 C /tmp
 A /tmp/hello.txt
 ...
-$ docker diff b
+$ docker diff two
+C /etc
+C /etc/nginx
 ...
+A /run/nginx.pid
 `}</Terminal>
 
-  <p>Output trimmed. <code>A</code> means added, <code>C</code> changed, <code>D</code> deleted. Only <code>a</code> has the new file. Clean up with <code>docker rm -f a b</code>.</p>
+  <p>Output trimmed. <code>A</code> means added, <code>C</code> changed, <code>D</code> deleted. Both list files nginx wrote when it started, but only <code>one</code> has your new file. Clean up with <code>docker rm -f one two</code>.</p>
 </Checkpoint>
 
 <Mistakes>

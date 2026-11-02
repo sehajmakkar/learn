@@ -54,30 +54,31 @@ $ docker exec web ps
 PID   USER     TIME  COMMAND
     1 root      0:00 nginx: master process nginx -g daemon off;
    30 nginx     0:00 nginx: worker process
+   31 nginx     0:00 nginx: worker process
    ...
+   40 root      0:00 ps
 $ docker top web
-UID     PID     PPID    C   STIME   TTY   TIME       CMD
-root    41728   41705   0   10:02   ?     00:00:00   nginx: master process nginx -g daemon off;
+UID      PID      PPID     C    STIME    TTY    TIME       CMD
+root     17525    17503    0    20:18    ?      00:00:00   nginx: master process nginx -g daemon off;
+statd    17564    17525    0    20:18    ?      00:00:00   nginx: worker process
 ...
 `}</Terminal>
 
-  <p>Output trimmed; your PIDs will differ. Inside, nginx is PID 1. On the host, the same process has a normal PID like 41728.</p>
+  <p>Output trimmed; your PIDs will differ. Inside, nginx is PID 1. On the host, the same process has a normal PID like 17525.</p>
+  <p>Notice the workers run as <code>nginx</code> inside but show as <code>statd</code> from outside. Both are the same numeric user ID, 101. The container and the host each translate that number using their own <code>/etc/passwd</code>, and on the host 101 happens to be named <code>statd</code>. User names are just labels; the kernel only knows the numbers.</p>
 </Checkpoint>
 
-You can even build a namespace by hand. Inside a privileged throwaway container (so this works on any OS), `unshare`
-starts a shell in a brand-new PID namespace:
+You can even build a namespace by hand. `unshare` runs a program in brand-new namespaces. Inside a privileged
+throwaway container (so this works on any OS), ask it for a new PID namespace and run `ps` there:
 
 <Terminal>{`
-$ docker run --rm -it --privileged ubuntu bash
-$ unshare --pid --fork --mount-proc bash
-$ ps
-    PID TTY          TIME CMD
-      1 pts/0    00:00:00 bash
-      8 pts/0    00:00:00 ps
+$ docker run --rm --privileged ubuntu unshare --pid --fork --mount-proc ps
+  PID TTY          TIME CMD
+    1 ?        00:00:00 ps
 `}</Terminal>
 
-The new shell thinks it's PID 1 and can't see anything else. That's the same kernel feature Docker uses, minus the
-convenience.
+`ps` is PID 1 and can't see a single other process, not even the container it's running in. That's the same kernel
+feature Docker uses, minus the convenience.
 
 ## Cgroups: a budget
 
@@ -90,13 +91,29 @@ docker stats --no-stream capped
 docker exec capped cat /sys/fs/cgroup/memory.max
 `}</Code>
 
-`docker stats` shows a memory limit of 64 MiB, and the last command prints `67108864`, the same limit in bytes, read
-straight from the cgroup files the kernel uses. (That path is for cgroup v2, which current Linux distributions and
+<Terminal>{`
+$ docker stats --no-stream capped
+CONTAINER ID   NAME      CPU %     MEM USAGE / LIMIT   MEM %     NET I/O       BLOCK I/O     PIDS
+9368b6d7002c   capped    0.00%     8.664MiB / 64MiB    13.54%    652B / 126B   0B / 8.19kB   11
+$ docker exec capped cat /sys/fs/cgroup/memory.max
+67108864
+`}</Terminal>
+
+`docker stats` shows the 64 MiB limit, and `67108864` is the same limit in bytes, read straight from the cgroup files
+the kernel uses. (That path is for cgroup v2, which current Linux distributions and
 Docker Desktop use.)
 
 When a container hits its memory limit and can't reclaim any, the kernel's **OOM killer** ends a process in it. If
-that's the main process, the container exits with code `137` (128 + signal 9, SIGKILL), and `docker inspect` reports
-`OOMKilled: true`. You'll tune limits properly in <L id="03.06" />.
+that's the main process, the container exits with code `137` (128 + signal 9, SIGKILL). Here's a Node one-liner that
+allocates memory forever, run with a 32 MB limit:
+
+<Terminal>{`
+$ docker run --name hog --memory 32m node:22-slim node -e 'const a=[];while(true)a.push(Buffer.alloc(1e6,1))'
+$ docker inspect --format '{{.State.Status}} {{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}' hog
+exited 137 OOMKilled=true
+`}</Terminal>
+
+You'll tune limits properly in <L id="03.06" />.
 
 <Quiz
   question="You start a container with --memory 64m. What actually enforces that limit?"

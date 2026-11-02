@@ -87,21 +87,21 @@ between your Mac and containers is slower than on Linux, and the memory you give
 
 <Checkpoint
   title="Same kernel, different userland"
-  solution={<p>On a Mac or Windows machine, the container shows Docker Desktop's VM kernel, which usually has <code>linuxkit</code> in its name. Your host's own <code>uname -r</code> will be different. That's the hidden VM from the section above.</p>}
+  solution={<p>On Linux, the two <code>uname -r</code> lines should be identical. On a Mac or Windows machine they differ, and the container's has <code>linuxkit</code> or <code>microsoft</code> in it: that's the Linux VM from the section above.</p>}
 >
   <p>Compare the kernel and the OS release, on your machine and inside a container.</p>
 
 <Terminal>{`
 $ uname -r
-6.8.0-45-generic
+25.6.0
 $ docker run --rm alpine uname -r
-6.8.0-45-generic
+6.12.54-linuxkit
 $ docker run --rm alpine cat /etc/os-release | head -2
 NAME="Alpine Linux"
 ID=alpine
 `}</Terminal>
 
-  <p>Output from an Ubuntu host. On Linux, both kernel versions match. The OS release says Alpine because that's the userland in the image.</p>
+  <p>Output from a Mac with Docker Desktop. The Mac reports its own kernel (<code>25.6.0</code>); the container reports the hidden Linux VM's kernel (<code>linuxkit</code>). On a Linux host, the two versions would match exactly. Either way, the OS release says Alpine, because that's only the userland in the image.</p>
 </Checkpoint>
 
 <Mistakes>
