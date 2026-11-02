@@ -1,0 +1,209 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Paper and ink. Green is the only brand colour; topic logos bring their own. */
+:root {
+  --paper: #f0efea;
+  --paper-2: #f7f6f2;
+  --ink: #1b1c18;
+  --ink-2: #3d3e37;
+  --muted: #6e6d64;
+  --line: #d9d7ce;
+  --line-soft: #e4e2da;
+  --hatch: #d3d1c7;
+  --accent: #4a6b1f;
+  --accent-ink: #3b5718;
+  --accent-soft: #e1e7d2;
+  --dot: #4f7322;
+  --danger: #a9442f;
+  --danger-soft: #f1ddd5;
+  --code: #f7f6f1;
+}
+
+.dark {
+  --paper: #0e0f0c;
+  --paper-2: #141511;
+  --ink: #ecebe3;
+  --ink-2: #c9c8bf;
+  --muted: #8f8e84;
+  --line: #262720;
+  --line-soft: #1c1d18;
+  --hatch: #24251f;
+  --accent: #9bc25a;
+  --accent-ink: #b5d67e;
+  --accent-soft: #1d2614;
+  --dot: #86ab48;
+  --danger: #e0745f;
+  --danger-soft: #2a1611;
+  --code: #121310;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-paper-2: var(--paper-2);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-code: var(--code);
+  --font-serif: var(--f-serif), Georgia, serif;
+  --font-sans: var(--f-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--f-mono), ui-monospace, monospace;
+  --font-pen: var(--f-pen), cursive;
+}
+
+html {
+  scroll-padding-top: 5rem;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  overflow-x: clip;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+/* Diagonal hatching, as in the portfolio rails and chanhdai's bands. */
+.hatch {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--hatch) 0 1px,
+    transparent 1px 7px
+  );
+}
+
+/* A hairline that runs the full width of the viewport from inside a column. */
+.rule-bleed {
+  position: relative;
+}
+.rule-bleed::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -100vw;
+  right: -100vw;
+  border-top: 1px solid var(--line);
+  pointer-events: none;
+}
+
+/* Shiki dual themes */
+.shiki,
+.shiki span {
+  background: transparent !important;
+}
+.dark .shiki,
+.dark .shiki span {
+  color: var(--shiki-dark) !important;
+}
+
+/* Lesson prose */
+.prose-lesson {
+  color: var(--ink-2);
+  font-size: 1.0625rem;
+  line-height: 1.75;
+}
+.prose-lesson > * + * {
+  margin-top: 1.25rem;
+}
+.prose-lesson h2 {
+  margin-top: 3.5rem;
+  color: var(--ink);
+  font-family: var(--font-serif);
+  font-size: 2rem;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+}
+.prose-lesson h3 {
+  margin-top: 2.25rem;
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 1.125rem;
+}
+.prose-lesson strong:not(.not-prose *) {
+  color: var(--ink);
+  font-weight: 600;
+}
+.prose-lesson a:not(.not-prose *) {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--accent) 40%, transparent);
+  text-underline-offset: 3px;
+}
+.prose-lesson :not(pre) > code:not(.not-prose *) {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  padding: 0.1em 0.35em;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper-2);
+  color: var(--ink);
+}
+.prose-lesson > ul {
+  list-style: none;
+  padding-left: 0;
+}
+.prose-lesson > ul > li {
+  position: relative;
+  padding-left: 1.25rem;
+}
+.prose-lesson > ul > li + li {
+  margin-top: 0.5rem;
+}
+.prose-lesson > ul > li::before {
+  content: "";
+  position: absolute;
+  left: 0.2rem;
+  top: 0.75em;
+  width: 5px;
+  height: 5px;
+  background: var(--dot);
+}
+.prose-lesson > ol {
+  list-style: decimal;
+  padding-left: 1.4rem;
+}
+.prose-lesson > ol > li::marker {
+  font-family: var(--font-mono);
+  color: var(--muted);
+  font-size: 0.85em;
+}
+.prose-lesson > table {
+  width: 100%;
+  font-size: 0.9375rem;
+  border-collapse: collapse;
+}
+.prose-lesson > table th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.prose-lesson > table th,
+.prose-lesson > table td {
+  padding: 0.6rem 0.75rem 0.6rem 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
