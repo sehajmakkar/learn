@@ -139,6 +139,44 @@ the action versions were a major behind, so the workflow moved to `checkout@v7`,
 `setup-buildx-action@v4`, `build-push-action@v7`, `metadata-action@v6` and `login-action@v4`. The second run had no
 warnings and reused the cache (<L id="07.05" />). Read your CI warnings; they're cheap to fix early.
 
+Then publishing was switched on and the workflow started by hand:
+
+<Terminal>{`
+$ gh variable set PUBLISH_IMAGE --body true
+$ gh workflow run notes-api.yml --ref main
+$ gh run view 41528110439
+✓ Build for scanning                 7s
+✓ Scan with Trivy                   13s
+✓ Image tags                         1s
+✓ Log in to GHCR                     0s
+✓ Build and push (amd64 + arm64)    59s
+`}</Terminal>
+
+(Step timings from the run.) The scan build took 7 seconds because every layer came from the cache. Then, from a
+laptop that wasn't logged in to GHCR:
+
+<Terminal>{`
+$ docker buildx imagetools inspect ghcr.io/sehajmakkar/notes-api:latest
+Name:      ghcr.io/sehajmakkar/notes-api:latest
+MediaType: application/vnd.oci.image.index.v1+json
+  Platform:    linux/amd64
+  Platform:    linux/arm64
+  Platform:    unknown/unknown
+  Platform:    unknown/unknown
+$ docker pull ghcr.io/sehajmakkar/notes-api:sha-9f30a1d
+$ docker image inspect -f '{{.Os}}/{{.Architecture}} user={{.Config.User}}' ghcr.io/sehajmakkar/notes-api:sha-9f30a1d
+linux/arm64 user=node
+$ docker run --rm --platform linux/amd64 --entrypoint node ghcr.io/sehajmakkar/notes-api:sha-9f30a1d -p 'process.arch'
+x64
+$ docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/sehajmakkar/notes-api:sha-9f30a1d
+9f30a1da127b447ea9efb68edd3864afb195c9e1
+`}</Terminal>
+
+Output trimmed. Both platforms are there (the `unknown/unknown` entries are the build's attestations,
+<L id="07.04" />). The Mac pulled the arm64 image, the amd64 one runs under emulation, and the label added by
+`metadata-action` records the exact commit the image came from. Because this repository is public, the package was
+readable without logging in.
+
 <Quiz
   question="A pull request from someone's fork changes the API. What does this workflow do?"
   options={[
