@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { repo } from "@/lib/site";
 
 const nav = [
   { href: "/", label: "Library" },
@@ -38,7 +39,7 @@ export function SiteHeader() {
             <kbd className="rounded border border-line px-1 font-mono text-[0.65rem]">⌘K</kbd>
           </button>
           <a
-            href="https://github.com/"
+            href={repo}
             className="grid size-8 place-items-center rounded-md text-muted transition-colors hover:text-ink"
             aria-label="Source on GitHub"
           >

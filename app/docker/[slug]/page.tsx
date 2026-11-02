@@ -10,6 +10,7 @@ import { CurriculumSidebar } from "@/components/lesson/sidebar";
 import { Toc } from "@/components/lesson/toc";
 import { MarkComplete } from "@/components/lesson/mark-complete";
 import { CopyButton } from "@/components/lesson/copy-button";
+import { editUrl, issueUrl } from "@/lib/site";
 
 /** What each lesson's MDX file exports next to its content. */
 type LessonMeta = {
@@ -135,10 +136,16 @@ export default async function LessonPage({ params }: PageProps<"/docker/[slug]">
           <div className="mt-14 flex flex-wrap items-center gap-4 border-t border-line pt-8">
             <MarkComplete id={lesson.id} />
             <a
-              href="https://github.com/"
+              href={issueUrl(`${lesson.id} ${lesson.title}`)}
               className="text-[0.85rem] text-muted underline decoration-line underline-offset-4 hover:text-ink"
             >
-              Report a mistake or suggest a fix
+              Report a mistake
+            </a>
+            <a
+              href={editUrl(`content/docker/${slug}.mdx`)}
+              className="text-[0.85rem] text-muted underline decoration-line underline-offset-4 hover:text-ink"
+            >
+              Edit this page
             </a>
           </div>
 

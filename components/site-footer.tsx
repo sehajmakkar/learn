@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { repo } from "@/lib/site";
 
 export function SiteFooter() {
   return (
@@ -19,7 +20,7 @@ export function SiteFooter() {
           <a href="https://x.com/kryptokodes" className="hover:text-ink">
             X
           </a>
-          <a href="https://github.com/" className="hover:text-ink">
+          <a href={repo} className="hover:text-ink">
             GITHUB
           </a>
         </div>
