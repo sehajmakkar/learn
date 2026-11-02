@@ -1,0 +1,159 @@
+export const meta = {
+  summary: "Push your image to a registry, learn why a tag can change under you, and how digests and multi-platform images actually work.",
+  uses: ["01.04", "02.04"],
+  usedIn: ["07.04", "07.06", "docker-step-01"],
+};
+
+<BeforeYouStart>
+  You know how image names are put together (<L id="01.04" />) and have a multi-stage notes API image
+  (<L id="02.04" />).
+</BeforeYouStart>
+
+## The core idea
+
+A **tag** is a human-friendly pointer, like a git branch: `notes-api:1.0.0` points at an image, and it can be moved to
+point at a different one. A **digest** is the image's content hash, like a git commit SHA: it can only ever mean one
+exact image. You push and pull by tag for convenience, and deploy by digest when you need certainty.
+
+## Push to a registry
+
+Pushing works the same for Docker Hub, GHCR or a private registry: tag the image with the registry's address, then
+push. To try it without an account, run a registry locally (the official `registry` image):
+
+<Terminal>{`
+$ docker run -d --name registry -p 5050:5000 registry:2
+$ docker tag notes-api localhost:5050/notes-api:1.0.0
+$ docker push localhost:5050/notes-api:1.0.0
+The push refers to repository [localhost:5050/notes-api]
+b902110041f8: Pushed
+3919ea552a8c: Pushed
+467306870dd0: Pushed
+...
+1.0.0: digest: sha256:ce278236dbb7cebf92d1289392cfdca2e8463f61c63cee64112d28ba527c1569 size: 856
+`}</Terminal>
+
+`docker tag` doesn't copy anything; it adds another name for the same image. The push uploads each layer the registry
+doesn't already have, then reports the **digest**. Push the same image again and every layer is skipped.
+
+For GitHub's registry, the only differences are the name and logging in first:
+
+<Code lang="bash" file="ghcr">{`
+echo $GITHUB_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin
+docker tag notes-api ghcr.io/YOUR_USERNAME/notes-api:1.0.0
+docker push ghcr.io/YOUR_USERNAME/notes-api:1.0.0
+`}</Code>
+
+The token needs the `write:packages` scope. You'll automate this from CI in <L id="07.06" />.
+
+## Tags move
+
+Nothing stops anyone with push access from pushing a different image under an existing tag. Official images do it on
+purpose: `node:22-alpine` is re-pushed for every Node 22 patch and every Alpine security fix. So the same `FROM` line
+can give you a different base next week.
+
+<Anatomy
+  title="Pinning a base image"
+  parts={[
+    { text: "node:22-alpine", label: "readable, moves" },
+    { text: "@" },
+    { text: "sha256:fe4f6d74e203…", label: "exact, never moves" },
+  ]}
+  caption="With both, Docker uses the digest and ignores the tag. The tag stays for humans."
+/>
+
+You can find an image's digest with `docker image inspect`:
+
+<Terminal>{`
+$ docker image inspect --format '{{json .RepoDigests}}' node:22-alpine
+["node@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914"]
+`}</Terminal>
+
+Your digest will differ: this one is from the day it was measured, which is exactly the point.
+
+## One tag, many platforms
+
+How does `node:22-alpine` work on both an Intel server and an Apple Silicon laptop? The tag doesn't point at one image.
+It points at an **index** (also called a manifest list) that lists one image per platform:
+
+<Terminal>{`
+$ docker buildx imagetools inspect node:22-alpine
+Name:      docker.io/library/node:22-alpine
+MediaType: application/vnd.oci.image.index.v1+json
+Digest:    sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
+
+Manifests:
+  Name:        docker.io/library/node:22-alpine@sha256:025b8e975a61…
+  Platform:    linux/amd64
+  ...
+`}</Terminal>
+
+Output trimmed. That index also lists `linux/arm64`, `linux/arm/v6`, `linux/arm/v7` and `linux/s390x`. When you pull,
+Docker picks the one that matches your machine. An image you build on an M-series Mac is `linux/arm64` only, and
+won't run on a typical amd64 server without emulation. Building for both is <L id="07.04" />.
+
+## A tagging scheme that works
+
+| Tag | Use |
+| --- | --- |
+| `1.4.2` | an exact release; never re-push it |
+| `1.4`, `1` | move to the latest patch or minor; convenient for consumers |
+| `sha-3f9a1c2` | the git commit it was built from; great for tracing a deploy back to code |
+| `latest` | at most a convenience for humans; don't deploy it |
+
+<Quiz
+  question="Production runs ghcr.io/acme/api:1.4. A teammate pushes a broken build as 1.4 by mistake. A server restarts and pulls. What runs?"
+  options={[
+    { text: "The old, working 1.4: tags are locked after the first push", why: "Registries generally allow overwriting tags unless you turn on tag immutability." },
+    { text: "The broken build: the tag now points at it", correct: true, why: "Pulling by tag resolves whatever the tag points at right now. Deploying by digest, or making release tags immutable, prevents this." },
+    { text: "Neither: the pull fails because the digest changed", why: "A pull by tag doesn't know or care what the digest used to be." },
+    { text: "Both, side by side", why: "A tag points at exactly one image (or one index) at a time." },
+  ]}
+/>
+
+<Checkpoint
+  title="Push, re-tag, and pin"
+  solution={<p><code>connection refused</code> on push: the local registry container isn't running, or it's on a different port. <code>docker ps</code> should show <code>registry</code> with <code>0.0.0.0:5050-&gt;5000/tcp</code>.</p>}
+>
+  <p>Start the local registry, push the notes API as <code>1.0.0</code>, and note the digest. Change a response in <code>server.ts</code>, rebuild, and push it as <code>1.0.0</code> again. Pull <code>localhost:5050/notes-api:1.0.0</code> and check which version you get. Then pull the first version back using its digest.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Deploying `latest`.** You can't tell what's running or roll back to a known version.</li>
+    <li>**Re-pushing release tags.** Treat `1.4.2` as immutable; many registries can enforce it.</li>
+    <li>**Building on Apple Silicon and deploying to amd64.** You get `exec format error` on the server.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Tags are movable pointers; digests are content hashes that never change.</li>
+    <li>Push = tag with the registry's name, then `docker push`. Only missing layers upload.</li>
+    <li>A tag can point at an index with one image per platform.</li>
+    <li>Use version and commit tags; deploy by digest when it matters.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between an image tag and an image digest?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How do multi-architecture images relate to digests?"]}
+>
+  <p>A tag is a mutable, human-readable name in a repository; it can be moved to a different image at any time. A digest is the SHA-256 hash of the image manifest (or index), so it identifies exactly one piece of content and can never change.</p>
+  <p>For a multi-platform image, the tag points at an index with its own digest, and each platform's image has a separate digest listed inside it.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "Your Mac-built image fails on the production server with 'exec format error'. What happened?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Debugging" }}
+  followUps={["How do you build for both architectures?"]}
+>
+  <p>The image was built for the Mac's CPU, `linux/arm64`, and the server is `linux/amd64`. The binaries inside can't execute on that CPU.</p>
+  <p>Build for the server's platform with `docker build --platform linux/amd64`, or build a multi-platform image with `docker buildx build --platform linux/amd64,linux/arm64 --push`, which publishes an index so each machine pulls the right one. Better still, build in CI on the target architecture.</p>
+</InterviewCard>

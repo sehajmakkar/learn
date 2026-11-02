@@ -1,0 +1,144 @@
+export const meta = {
+  summary: "Where image size actually comes from, the four changes that cut most of it, and how to find the layer that's bloating yours.",
+  uses: ["02.02", "02.04"],
+  usedIn: ["02.07", "07.03"],
+};
+
+<BeforeYouStart>
+  You've built the notes API as a multi-stage image (<L id="02.04" />) and can read `docker history`
+  (<L id="02.02" />).
+</BeforeYouStart>
+
+## The core idea
+
+An image's size is the sum of its layers, and layers only ever add. So making an image smaller comes down to two
+questions: **which base do you start from**, and **what does each of your steps leave behind**?
+
+Smaller images pull faster, start faster on new servers, cost less to store and contain fewer packages that can have
+vulnerabilities. But size is a means, not a goal. Don't trade away debuggability for the last few megabytes.
+
+## Where the bytes are
+
+Every number in this lesson was measured on the notes API (on an arm64 Mac; amd64 sizes differ slightly):
+
+| Image | Disk usage | Content size (compressed) |
+| --- | --- | --- |
+| `node:22` (full Debian base) | 1.63 GB | 416 MB |
+| first Dockerfile on `node:22-slim` | 425 MB | 95.5 MB |
+| …with a `.dockerignore` | 393 MB | 90.6 MB |
+| …as a multi-stage build | 349 MB | 80.4 MB |
+| multi-stage on `node:22-alpine` | 238 MB | 61.7 MB |
+| multi-stage on distroless | 212 MB | 52.2 MB |
+
+The biggest single decision is the base image. `node:22` ships compilers, git and Python, which are useful for building
+native modules and useless at runtime. Your own layers are usually small next to it.
+
+## The four changes that matter
+
+**1. Pick a slimmer base.** `-slim`, `-alpine` and distroless variants exist for exactly this. The trade-offs between
+them are the next lesson (<L id="02.07" />).
+
+**2. Multi-stage builds.** Build tools stay in a stage that's thrown away (<L id="02.04" />).
+
+**3. A `.dockerignore`.** Stops local `node_modules`, `.git` and build output riding along (<L id="02.03" />).
+
+**4. Clean up in the same step that made the mess.** This is the one people get wrong. Watch:
+
+<Code lang="dockerfile" file="Dockerfile (A, B, C)">{`
+# A: install curl
+RUN apt-get update && apt-get install -y curl
+
+# B: install, then clean up in a separate step
+RUN apt-get update && apt-get install -y curl
+RUN rm -rf /var/lib/apt/lists/*
+
+# C: install only what's needed and clean up in the same step
+RUN apt-get update \\
+ && apt-get install -y --no-install-recommends curl \\
+ && rm -rf /var/lib/apt/lists/*
+`}</Code>
+
+<Terminal>{`
+$ docker images
+IMAGE          DISK USAGE   CONTENT SIZE
+apt:A               404MB          101MB
+apt:B               404MB          101MB
+apt:C               363MB         84.4MB
+node:22-slim        349MB         82.6MB
+`}</Terminal>
+
+Output trimmed. B saved nothing: the package lists are still in the earlier layer, and the `rm` only adds a layer that
+hides them. C is 41 MB smaller because `--no-install-recommends` skips optional packages, and the cleanup happens
+before the layer is saved.
+
+<Quiz
+  question="Your Dockerfile downloads a 200 MB tarball, extracts a 5 MB binary, and deletes the tarball, each in its own RUN. Roughly how much do these steps add to the image?"
+  options={[
+    { text: "About 5 MB: only the binary is left", why: "That's what the final filesystem looks like, but the layers still hold everything each step wrote." },
+    { text: "About 205 MB: the tarball stays in its layer", correct: true, why: "The download layer keeps the 200 MB tarball forever. The later delete hides it but can't shrink the earlier layer. Do all three in one RUN, or download in a build stage and COPY --from the binary." },
+    { text: "Nothing: RUN steps don't add size", why: "Every RUN that writes files adds a layer containing those files." },
+    { text: "About 400 MB: the tarball counts twice", why: "The tarball is stored once, in the layer that downloaded it. The delete layer is tiny." },
+  ]}
+/>
+
+## Finding what's big
+
+`docker history` shows each layer's size, so the culprit usually jumps out:
+
+<Terminal>{`
+$ docker history apt:B
+CREATED BY                                      SIZE
+RUN /bin/sh -c rm -rf /var/lib/apt/lists/* #…   20.5kB
+RUN /bin/sh -c apt-get update && apt-get ins…   37.2MB
+...
+`}</Terminal>
+
+For a file-by-file view of each layer, the open-source tool **dive** (`dive notes-api`) lets you browse layers and
+see exactly which files each one added or changed.
+
+## Language-specific habits
+
+- **Node:** `npm ci --omit=dev` in the final stage; don't ship `node_modules` from your machine.
+- **Python:** `pip install --no-cache-dir`, and build wheels in an earlier stage.
+- **Go, Rust:** compile a static binary in a build stage and copy only that binary into a tiny final image.
+- **apt:** `--no-install-recommends`, and `rm -rf /var/lib/apt/lists/*` in the same `RUN`.
+
+<Checkpoint
+  title="Shrink it and prove it"
+  solution={<p>No change after adding a cleanup line: it's probably in its own <code>RUN</code>. Merge it into the step that created the files.</p>}
+>
+  <p>Build the notes API on <code>node:22-slim</code> and on <code>node:22-alpine</code> (change both <code>FROM</code> lines). Compare them with <code>docker images</code>, then run <code>docker history</code> on each and find the largest layer you added yourself.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Cleaning up in a separate `RUN`.** The files are already in the earlier layer.</li>
+    <li>**Chasing size by switching to alpine without testing.** Some packages behave differently on musl; see <L id="02.07" />.</li>
+    <li>**Squashing everything into one giant `RUN`.** You lose caching. Combine steps that create and clean up the same files, nothing more.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Size = base image + what each step leaves behind. Layers only add.</li>
+    <li>Biggest wins: slimmer base, multi-stage, `.dockerignore`.</li>
+    <li>Delete temporary files in the same `RUN` that created them.</li>
+    <li>`docker history` and dive show where the bytes are.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Your team's image is 1.5 GB. How would you make it smaller?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Scenario" }}
+  followUps={["What would you check before switching to alpine?", "Why doesn't deleting files in a later step help?"]}
+>
+  <p>First measure: `docker history` or dive to see which layers are large. Then, in order of impact: switch from a full base like `node:22` to a slim, alpine or distroless variant; use a multi-stage build so compilers and dev dependencies stay out of the final image; add a `.dockerignore`; and make sure temporary files (package caches, downloads) are removed in the same `RUN` that created them.</p>
+  <p>Layers are additive, so deleting in a later step only hides files. Before switching to alpine, test that native dependencies work with musl libc.</p>
+</InterviewCard>

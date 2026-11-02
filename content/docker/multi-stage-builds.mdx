@@ -1,0 +1,188 @@
+export const meta = {
+  summary: "Build with everything, ship with nothing extra. One Dockerfile, two images' worth of stages, and only the last one ships.",
+  uses: ["02.02", "02.03"],
+  usedIn: ["02.05", "02.08", "docker-step-01"],
+};
+
+<BeforeYouStart>
+  You can order a Dockerfile for the cache (<L id="02.02" />) and you have a `.dockerignore`
+  (<L id="02.03" />).
+</BeforeYouStart>
+
+## The core idea
+
+Building software needs tools that running it doesn't: compilers, dev dependencies, test frameworks. If you build in
+the same image you ship, all of that ships too.
+
+A **multi-stage build** has several `FROM` lines in one Dockerfile. Each starts a new stage. Earlier stages do the
+heavy work, and the final stage copies in only the results. Only the final stage becomes your image.
+
+## The problem, measured
+
+The single-stage notes API image contains TypeScript, the type definitions and the source, none of which run in
+production:
+
+<Terminal>{`
+$ docker run --rm notes-api ls
+Dockerfile
+dist
+node_modules
+package-lock.json
+package.json
+src
+tsconfig.json
+`}</Terminal>
+
+## Two stages
+
+<Code lang="dockerfile" file="Dockerfile">{`
+# syntax=docker/dockerfile:1
+
+# Stage 1: compile TypeScript. Has dev dependencies and the compiler.
+FROM node:22-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# Stage 2: what actually ships. Production dependencies and compiled JS only.
+FROM node:22-slim
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+USER node
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
+`}</Code>
+
+What's new:
+
+- `FROM ... AS build` names a stage so other stages can refer to it.
+- `COPY --from=build /app/dist ./dist` copies files **out of another stage** instead of from the build context.
+- `npm ci --omit=dev` installs only runtime dependencies in the final stage. The notes API has none yet, so this
+  installs nothing; it starts to matter once Postgres arrives in <L id="04.05" />.
+- `USER node` runs the app as the unprivileged `node` user that the official image provides.
+
+<Stacks
+  title="What ends up where"
+  columns={[
+    {
+      title: "Stage: build",
+      note: "thrown away",
+      layers: [["dist/ (compiled)"], ["src/", "tsconfig.json"], [{ text: "node_modules (typescript, @types)", tone: "danger" }], [{ text: "node:22-slim", tone: "muted" }]],
+    },
+    {
+      title: "Final image",
+      note: "shipped",
+      layers: [[{ text: "dist/ (copied)", tone: "accent" }], ["package.json", "lockfile"], [{ text: "node:22-slim", tone: "muted" }]],
+    },
+  ]}
+  caption="The build stage's layers never reach the final image. Only the files you COPY --from cross over."
+/>
+
+## The result
+
+<Terminal>{`
+$ docker build -t notes-api .
+$ docker run --rm notes-api ls
+dist
+node_modules
+package-lock.json
+package.json
+$ docker images
+IMAGE              DISK USAGE   CONTENT SIZE
+notes-api:naive         425MB         95.5MB
+notes-api:multi         349MB         80.4MB
+node:22-slim            349MB         82.6MB
+`}</Terminal>
+
+Output trimmed. The multi-stage image is essentially the base image: your app adds a few kilobytes. Everything that
+was only needed to build is gone. (`node_modules` here is an empty folder npm creates; there are no runtime
+dependencies yet.)
+
+The two columns: **disk usage** is the unpacked size on your machine, **content size** is the compressed size that
+gets pushed and pulled. Docker Desktop's newer image store shows both; older setups show a single `SIZE`.
+
+<Quiz
+  question="In the Dockerfile above, which stage's files can a container started from notes-api see?"
+  options={[
+    { text: "Both stages, merged together", why: "Stages aren't merged. Each FROM starts from a clean base." },
+    { text: "Only the final stage, plus anything it copied with COPY --from", correct: true, why: "The image is the last stage. Earlier stages only contribute the files you explicitly copy from them." },
+    { text: "Only the build stage, because it ran first", why: "Order doesn't decide this. The last stage in the file is the image (unless you pass --target)." },
+    { text: "Whichever stage is larger", why: "Size has nothing to do with it. The final stage is what gets tagged." },
+  ]}
+/>
+
+## Useful tricks
+
+**Build only one stage** with `--target`. Handy for debugging or for a test stage in CI:
+
+<Terminal>{`
+$ docker build --target build -t notes-api:build-stage .
+$ docker run --rm notes-api:build-stage ls
+dist
+node_modules
+package-lock.json
+package.json
+src
+tsconfig.json
+`}</Terminal>
+
+**Stages run in parallel when they can.** BuildKit works out which steps depend on which. In the build log for this
+Dockerfile, the final stage's `npm ci --omit=dev` starts before the build stage finishes compiling, because it doesn't
+need anything from it:
+
+<Terminal>{`
+#9 [build 3/7] COPY package.json package-lock.json ./
+#10 [stage-1 4/5] RUN npm ci --omit=dev
+#11 [build 4/7] RUN npm ci
+...
+#14 [build 7/7] RUN npm run build
+#15 [stage-1 5/5] COPY --from=build /app/dist ./dist
+`}</Terminal>
+
+**Copy from any image**, not just your stages: `COPY --from=busybox:1.36 /bin/busybox /bin/busybox`.
+
+<Checkpoint
+  title="Convert the notes API"
+  solution={<p><code>COPY --from=build</code> fails with "not found": check the stage is named <code>AS build</code> and the path matches where that stage wrote its output (<code>/app/dist</code>). Permission errors at startup: files copied in are owned by root but readable, which is fine; the app only needs to read them.</p>}
+>
+  <p>Rewrite your Dockerfile as two stages, rebuild, and confirm with <code>docker run --rm notes-api ls</code> that <code>src</code> and <code>tsconfig.json</code> are gone. Check that <code>docker exec</code> into a running container and <code>whoami</code> prints <code>node</code>.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Copying the whole build stage**: `COPY --from=build /app /app` brings the compiler right back. Copy only outputs.</li>
+    <li>**Installing dev dependencies in the final stage.** Use `--omit=dev`, or copy a pruned `node_modules` from a build stage.</li>
+    <li>**Forgetting stage names are case-sensitive and must be unique.**</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Each `FROM` starts a stage; only the last stage becomes the image.</li>
+    <li>`COPY --from=stage` moves just the outputs across.</li>
+    <li>Build tools and dev dependencies stay behind, so the image is smaller and has less to attack.</li>
+    <li>`--target` builds a single stage.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What are multi-stage builds and why use them?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How would you add a test stage that CI runs but production doesn't ship?"]}
+>
+  <p>A Dockerfile with several `FROM` stages, where later stages copy specific files from earlier ones with `COPY --from`. You compile or bundle in a stage that has the full toolchain, then copy only the artifacts into a minimal runtime stage.</p>
+  <p>The shipped image is smaller, pulls faster, and has a smaller attack surface because compilers, dev dependencies and source code aren't in it. It also replaces the old pattern of separate build and runtime Dockerfiles glued together with scripts.</p>
+</InterviewCard>

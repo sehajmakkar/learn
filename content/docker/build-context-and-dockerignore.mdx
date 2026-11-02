@@ -1,0 +1,150 @@
+export const meta = {
+  summary: "What docker build actually sends to the builder, why it was 26 MB for a one-file app, and how .dockerignore keeps secrets and junk out of your image.",
+  uses: ["02.01", "02.02"],
+  usedIn: ["02.04", "07.02", "docker-step-01"],
+};
+
+<BeforeYouStart>
+  You've built the notes API with the first Dockerfile (<L id="02.01" />) and know how `COPY` is cached
+  (<L id="02.02" />).
+</BeforeYouStart>
+
+## The core idea
+
+The `.` at the end of `docker build -t notes-api .` is the **build context**: a folder whose files the builder is
+allowed to see. `COPY` and `ADD` can only read from it. Everything in that folder is a candidate to end up in your
+image, unless a **`.dockerignore`** file says otherwise.
+
+## Why the builder needs a context
+
+The builder (BuildKit) isn't necessarily your machine. With Docker Desktop it runs inside a VM; in CI it might be a
+remote server. So `docker build` sends the files it needs from your folder over to the builder, and that transfer is
+the "transferring context" line you saw in the last two lessons.
+
+Without a `.dockerignore`, the notes API sends this:
+
+<Terminal>{`
+$ docker build -t notes-api .
+#5 transferring context: 26.18MB 0.2s done
+$ du -sh node_modules dist src
+ 26M	node_modules
+4.0K	dist
+4.0K	src
+`}</Terminal>
+
+Nearly all of it is `node_modules` from your own `npm install`, which the image doesn't even want: it runs `npm ci`
+itself, for its own platform.
+
+## .dockerignore
+
+A `.dockerignore` sits next to the Dockerfile and uses patterns like `.gitignore`:
+
+<Code lang="bash" file=".dockerignore">{`
+node_modules
+dist
+.git
+.env
+*.log
+Dockerfile
+.dockerignore
+`}</Code>
+
+The same build, from a clean cache:
+
+<Terminal>{`
+$ docker build -t notes-api .
+#4 transferring context: 3.88kB done
+`}</Terminal>
+
+From 26 MB to under 4 kB, and the `COPY . .` layer shrinks from 26.9 MB to 32.8 kB.
+
+<Quiz
+  question="Your project has a .env file with a database password. The Dockerfile has COPY . . and there's no .dockerignore. You never reference .env anywhere. Is the password in the image?"
+  options={[
+    { text: "No, Docker only copies files the app uses", why: "Docker has no idea what your app uses. COPY . . copies everything in the context." },
+    { text: "Yes, anyone who can pull the image can read it", correct: true, why: "COPY . . puts every file from the context into a layer, .env included. Anyone with the image can run cat .env or extract the layer." },
+    { text: "Only if the container is started with --env-file", why: "--env-file passes variables at run time. This file is already baked into the image's files." },
+    { text: "No, because .env files are hidden", why: "Dot-files aren't special to Docker. They're copied like any other file." },
+  ]}
+/>
+
+That quiz isn't hypothetical. With the first Dockerfile and no `.dockerignore`:
+
+<Terminal>{`
+$ echo "SECRET=hunter2" > .env
+$ docker build -t notes-api .
+$ docker run --rm notes-api cat .env
+SECRET=hunter2
+`}</Terminal>
+
+Once an image with a secret is pushed, rotating the secret is the only real fix. Deleting the file in a later layer
+doesn't remove it from the earlier one (<L id="02.02" />).
+
+## What to put in .dockerignore
+
+| Ignore | Why |
+| --- | --- |
+| `node_modules`, `vendor`, `.venv` | The image installs its own, for its own OS and CPU. |
+| build output: `dist`, `build`, `target` | The image builds its own; stale copies cause confusion. |
+| `.git` | Large, and it changes on every commit, which busts the cache. |
+| `.env`, keys, credentials | Secrets must never enter a layer. |
+| `Dockerfile`, `.dockerignore`, `*.md`, tests | Not needed at runtime; changing them shouldn't invalidate `COPY . .`. |
+
+You can also flip it around: ignore everything, then allow only what you need.
+
+<Code lang="bash" file=".dockerignore">{`
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+`}</Code>
+
+This allow-list style is stricter: a new secret file in the project can't leak by accident.
+
+<Checkpoint
+  title="Measure your context"
+  solution={<p>BuildKit only resends files that changed since the last build, so a second run can show a tiny number either way. Run <code>docker builder prune -af</code> before each build to measure from scratch.</p>}
+>
+  <p>Build the notes API without a <code>.dockerignore</code> and note the "transferring context" size. Add the file above, prune the build cache, build again, and compare. Then add a <code>.env</code>, build, and confirm with <code>docker run --rm notes-api ls -a</code> that it's no longer in the image.</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Assuming `.gitignore` applies.** Docker ignores `.gitignore` entirely. It only reads `.dockerignore`.</li>
+    <li>**Putting `.dockerignore` in the wrong place.** It must be in the root of the build context.</li>
+    <li>**Using a broad context like your home directory.** `docker build ~` sends everything in it to the builder.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>The build context is the folder `docker build` sends to the builder; `COPY` can only see it.</li>
+    <li>`.dockerignore` keeps dependencies, build output, `.git` and secrets out.</li>
+    <li>A secret copied into any layer is in the image for good. Rotate it.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is the Docker build context, and why does .dockerignore matter?", level: "Junior", frequency: 2, importance: "Must-know", kind: "Concept" }}
+  followUps={["Does .gitignore affect Docker builds?"]}
+>
+  <p>The build context is the set of files sent to the builder, usually the directory passed to `docker build`. Only those files are visible to `COPY` and `ADD`.</p>
+  <p>`.dockerignore` excludes files from the context. That makes builds faster (less to transfer), keeps the cache stable (unrelated changes like `.git` don't invalidate `COPY . .`), keeps images smaller, and stops secrets like `.env` files from being baked into layers.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "Someone pushed an image that contains a .env file with production credentials. What do you do?", level: "Senior", frequency: 2, importance: "Must-know", kind: "Scenario" }}
+  followUps={["How do you pass secrets to a build safely?"]}
+>
+  <p>Treat the credentials as leaked: rotate them first, because anyone who pulled the image has them and deleting the tag doesn't remove copies. Then delete the image and tag from the registry, add `.dockerignore` (ideally allow-list style) and rebuild.</p>
+  <p>Going forward, pass build-time secrets with BuildKit secret mounts (`RUN --mount=type=secret`), which never land in a layer, and pass runtime secrets as environment or mounted files when the container starts.</p>
+</InterviewCard>

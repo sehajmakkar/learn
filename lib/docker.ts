@@ -39,14 +39,14 @@ export const modules: Module[] = [
     title: "Images",
     blurb: "Write Dockerfiles that build fast, stay small and cache well.",
     lessons: [
-      l("02.01", "Your first Dockerfile", 12, "CODE"),
+      l("02.01", "Your first Dockerfile", 14, "CODE", "your-first-dockerfile"),
       l("02.02", "Layers and the build cache", 14, "CODE", "layers-and-build-cache"),
-      l("02.03", "Build context and .dockerignore", 8, "CODE"),
-      l("02.04", "Multi-stage builds", 13, "CODE"),
-      l("02.05", "Making images small", 11, "CODE"),
-      l("02.06", "Tags, digests and registries", 10, "CONCEPT"),
-      l("02.07", "Choosing a base image", 9, "CONCEPT"),
-      l("02.08", "Project: containerise the API", 25, "BUILD"),
+      l("02.03", "Build context and .dockerignore", 9, "CODE", "build-context-and-dockerignore"),
+      l("02.04", "Multi-stage builds", 13, "CODE", "multi-stage-builds"),
+      l("02.05", "Making images small", 11, "CODE", "making-images-small"),
+      l("02.06", "Tags, digests and registries", 12, "CODE", "tags-digests-and-registries"),
+      l("02.07", "Choosing a base image", 10, "CONCEPT", "choosing-a-base-image"),
+      l("02.08", "Project: containerise the API", 25, "BUILD", "project-containerise-the-api"),
     ],
   },
   {
@@ -137,13 +137,13 @@ export const stats = {
 };
 
 export const projectSteps = [
-  { tag: "step-01", title: "Containerise the API", after: "02", detail: "A multi-stage Dockerfile for a Node API, under 150 MB." },
-  { tag: "step-02", title: "Configure and health-check it", after: "03", detail: "Env-based config, a healthcheck and sensible limits." },
-  { tag: "step-03", title: "Persist Postgres", after: "04", detail: "A named volume that survives rebuilds, plus a backup command." },
-  { tag: "step-04", title: "Wire the services together", after: "05", detail: "API, Postgres, Redis and Nginx on one private network." },
-  { tag: "step-05", title: "One-command dev environment", after: "06", detail: "docker compose up with hot reload and seeded data." },
-  { tag: "step-06", title: "Ship from CI", after: "07", detail: "GitHub Actions builds, scans and pushes to GHCR." },
-  { tag: "step-07", title: "Deploy to a VPS", after: "07", detail: "Pull, migrate and roll forward with healthchecks." },
+  { tag: "docker-step-01", title: "Containerise the API", after: "02", detail: "A multi-stage Dockerfile for the notes API, built and pushed to a registry." },
+  { tag: "docker-step-02", title: "Configure and health-check it", after: "03", detail: "Env-based config, a healthcheck and sensible limits." },
+  { tag: "docker-step-03", title: "Persist Postgres", after: "04", detail: "A named volume that survives rebuilds, plus a backup command." },
+  { tag: "docker-step-04", title: "Wire the services together", after: "05", detail: "API, Postgres, Redis and Nginx on one private network." },
+  { tag: "docker-step-05", title: "One-command dev environment", after: "06", detail: "docker compose up with hot reload and seeded data." },
+  { tag: "docker-step-06", title: "Ship from CI", after: "07", detail: "GitHub Actions builds, scans and pushes to GHCR." },
+  { tag: "docker-step-07", title: "Deploy to a VPS", after: "07", detail: "Pull, migrate and roll forward with healthchecks." },
 ];
 
 export type InterviewQ = {

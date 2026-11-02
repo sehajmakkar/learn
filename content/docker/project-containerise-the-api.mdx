@@ -1,0 +1,151 @@
+export const meta = {
+  summary: "Put Module 02 together: take the notes API from source code to a small, non-root, cache-friendly image in a registry.",
+  uses: ["02.01", "02.02", "02.03", "02.04", "02.06"],
+  usedIn: ["03.07", "06.06", "07.06"],
+};
+
+<BeforeYouStart>
+  This is the first project step. You'll use everything from Module 02. The code is in the course repo under
+  `project/docker/api`; the finished result for this step is tagged `docker-step-01`.
+</BeforeYouStart>
+
+## The brief
+
+The notes API is going to production eventually. This step produces its image. Done means:
+
+<Recap>
+  <ul>
+    <li>A `.dockerignore` that keeps `node_modules`, `dist`, `.git` and `.env` out of the build context.</li>
+    <li>A multi-stage Dockerfile: TypeScript compiles in one stage, only `dist/` ships.</li>
+    <li>Dependencies install in a layer that survives source code changes.</li>
+    <li>The container runs as a non-root user and stops in well under a second.</li>
+    <li>The image is tagged with a version and the git commit, and pushed to a registry.</li>
+  </ul>
+</Recap>
+
+Try it yourself first. Each step below has the answer folded away under "Stuck?".
+
+## Get the code
+
+<Terminal>{`
+$ git clone https://github.com/sehajmakkar/learn.git
+$ cd learn/project/docker/api
+$ ls
+Dockerfile  README.md  package-lock.json  package.json  src  tsconfig.json
+`}</Terminal>
+
+If you want a clean start without the finished Dockerfile, delete `Dockerfile` and `.dockerignore` now.
+
+## Step 1: the build context
+
+<Checkpoint
+  title="Write .dockerignore"
+  solution={<p>Ignore at least <code>node_modules</code>, <code>dist</code>, <code>.git</code>, <code>.env</code> and <code>*.log</code>. Adding <code>Dockerfile</code> and <code>.dockerignore</code> keeps edits to them from busting the <code>COPY</code> cache.</p>}
+>
+  <p>Create a <code>.dockerignore</code>. When you build later, the "transferring context" line should be a few kilobytes, not megabytes.</p>
+</Checkpoint>
+
+## Step 2: the Dockerfile
+
+<Checkpoint
+  title="Write a multi-stage Dockerfile"
+  solution={<p>Compare with the finished <code>Dockerfile</code> in <code>project/docker/api</code> (tag <code>docker-step-01</code>). The key moves: name the first stage <code>AS build</code>; copy <code>package.json</code> and the lockfile before <code>npm ci</code>; in the final stage run <code>npm ci --omit=dev</code>, <code>COPY --from=build /app/dist ./dist</code>, then <code>USER node</code> and an exec-form <code>CMD</code>.</p>}
+>
+  <p>Two stages on <code>node:22-slim</code>. The build stage installs everything and runs <code>npm run build</code>. The final stage sets <code>NODE_ENV=production</code>, installs production dependencies only, copies <code>dist</code> from the build stage, switches to the <code>node</code> user and starts <code>node dist/server.js</code>.</p>
+</Checkpoint>
+
+## Step 3: build and inspect
+
+<Terminal>{`
+$ docker build -t notes-api .
+...
+#7 transferring context: 3.82kB done
+...
+$ docker images notes-api
+IMAGE              ID             DISK USAGE   CONTENT SIZE
+notes-api:latest   cf94b518b7ef        349MB         80.4MB
+$ docker run --rm notes-api ls
+dist
+node_modules
+package-lock.json
+package.json
+`}</Terminal>
+
+Output trimmed; your ID will differ. No `src`, no `tsconfig.json`, no TypeScript compiler.
+
+Now prove the cache works: change a message in `src/server.ts` and rebuild. Both `npm ci` steps should say `CACHED`;
+only the source copy, the compile and the final `COPY --from` should run.
+
+## Step 4: run it like production would
+
+<Terminal>{`
+$ docker run -d --name notes -p 8080:3000 notes-api
+$ curl localhost:8080/healthz
+{"status":"ok"}
+$ docker exec notes whoami
+node
+$ docker stop notes
+notes
+$ docker logs notes
+notes-api listening on :3000
+SIGTERM received, closing
+`}</Terminal>
+
+`docker stop` returns almost immediately, because the app handles `SIGTERM` and runs as PID 1 with the exec-form `CMD`. If
+yours takes ten seconds, check you used `CMD ["node", "dist/server.js"]` and not the shell form.
+
+## Step 5: tag and push
+
+Tag with the version from `package.json` and the short commit hash, so any running container can be traced back to
+its code:
+
+<Terminal>{`
+$ VERSION=$(node -p "require('./package.json').version")
+$ SHA=$(git rev-parse --short HEAD)
+$ docker run -d --name registry -p 5050:5000 registry:2
+$ docker tag notes-api localhost:5050/notes-api:$VERSION
+$ docker tag notes-api localhost:5050/notes-api:sha-$SHA
+$ docker push --all-tags localhost:5050/notes-api
+`}</Terminal>
+
+Both tags point at the same image, so each layer uploads once and the second tag only adds a name. To publish for real, swap
+`localhost:5050` for `ghcr.io/YOUR_USERNAME` after `docker login ghcr.io` (<L id="02.06" />).
+
+<Quiz
+  question="You edit src/server.ts and rebuild your finished multi-stage image. Which steps run again?"
+  options={[
+    { text: "Everything, because a source file changed", why: "Only steps after the first cache miss rerun, and the dependency installs come before the source copy." },
+    { text: "COPY src, npm run build and the final COPY --from; both npm ci steps stay cached", correct: true, why: "The lockfile didn't change, so both installs are reused. The source copy misses, so the compile reruns, and the final stage's COPY --from gets new files." },
+    { text: "Only COPY src", why: "A miss also reruns every later step in that stage, and anything that copies from it." },
+    { text: "Nothing, because the final stage didn't change", why: "The final stage copies dist from the build stage, which changed." },
+  ]}
+/>
+
+## Compare with the reference
+
+<Terminal>{`
+$ git diff docker-step-01 -- project/docker/api
+`}</Terminal>
+
+No output means your files match the reference exactly. Differences aren't necessarily wrong. If yours builds, the
+image contains only what it needs, runs as `node` and stops cleanly, it meets the brief.
+
+<Tripped>
+  Your note goes here after you finish this step: what took longest, and what you'd tell someone starting it.
+</Tripped>
+
+## What's next
+
+The image works, but it has no idea whether the app inside is healthy, takes its config from code, and keeps notes in
+memory. Module 03 adds configuration, limits and a healthcheck (<L id="03.07" />), and Module 04 moves the notes into
+Postgres (<L id="04.05" />).
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Walk me through how you'd write a production Dockerfile for a Node.js service.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How would you handle native dependencies?", "How do you make the build fast in CI?"]}
+>
+  <p>Multi-stage: a build stage on a pinned slim base copies `package.json` and the lockfile first, runs `npm ci`, then copies the source and builds. A runtime stage on the same base sets `NODE_ENV=production`, installs production dependencies only, copies the build output from the first stage, switches to a non-root user and starts the app with an exec-form `CMD` so it receives signals.</p>
+  <p>Add a `.dockerignore` so local `node_modules`, `.git` and secrets stay out, handle `SIGTERM` in the app, tag images with a version and commit SHA, and consider distroless for the runtime stage once it's stable.</p>
+</InterviewCard>

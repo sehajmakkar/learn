@@ -1,0 +1,190 @@
+export const meta = {
+  summary: "Turn a real TypeScript API into an image, one instruction at a time, then run it and talk to it.",
+  uses: ["01.04", "01.06"],
+  usedIn: ["02.02", "02.04", "docker-step-01"],
+};
+
+<BeforeYouStart>
+  You can run containers and read `docker` commands (<L id="01.06" />). Clone the course repo and open
+  `project/docker/api`: a small notes API in TypeScript that you'll containerise across this module.
+</BeforeYouStart>
+
+## The core idea
+
+A **Dockerfile** is a recipe for an image. Each line is an instruction, Docker runs them top to bottom, and the result
+of each one becomes part of the image. There are only a handful of instructions you'll use every day, and this lesson
+covers all of them.
+
+## The app
+
+The notes API is one file, `src/server.ts`, with three routes: `GET /healthz`, `GET /notes` and `POST /notes`. To run it
+without Docker you'd do three things: install dependencies, compile TypeScript, start Node. A Dockerfile writes those
+same steps down, plus the environment they need.
+
+<Code lang="bash" file="project/docker/api">{`
+package.json
+package-lock.json
+tsconfig.json
+src/server.ts
+`}</Code>
+
+## A first Dockerfile
+
+Create `Dockerfile` (no extension) next to `package.json`:
+
+<Code lang="dockerfile" file="Dockerfile">{`
+FROM node:22-slim
+WORKDIR /app
+COPY . .
+RUN npm ci
+RUN npm run build
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
+`}</Code>
+
+Line by line:
+
+| Instruction | What it does |
+| --- | --- |
+| `FROM node:22-slim` | Start from an existing image: Debian with Node 22 installed. Every Dockerfile starts with `FROM`. |
+| `WORKDIR /app` | Create `/app` if needed and make it the current directory for every following step. |
+| `COPY . .` | Copy files from your project (the build context) into `/app` in the image. |
+| `RUN npm ci` | Run a command at **build** time, inside the image being built. Here: install dependencies. |
+| `RUN npm run build` | Compile TypeScript into `dist/`. |
+| `EXPOSE 3000` | Document that the app listens on 3000. It doesn't publish anything; `-p` does that. |
+| `CMD [...]` | The command to run when a container **starts**. Nothing runs at build time. |
+
+The distinction that matters most: `RUN` happens once, when you build. `CMD` happens every time a container starts.
+
+## Build it
+
+<Terminal>{`
+$ docker build -t notes-api .
+...
+#5 transferring context: 26.18MB 0.2s done
+#6 [2/5] WORKDIR /app
+#7 [3/5] COPY . .
+#8 [4/5] RUN npm ci
+#8 0.661 added 3 packages, and audited 4 packages in 525ms
+#9 [5/5] RUN npm run build
+#9 0.135 > tsc
+#10 naming to docker.io/library/notes-api:latest done
+`}</Terminal>
+
+Output trimmed. `-t notes-api` names the image, and `.` is the **build context**: the folder whose files `COPY` can
+see. Notice that it sent 26 MB of context for a project with one source file. That's your local `node_modules`,
+and fixing it is the whole of <L id="02.03" />.
+
+## Run it
+
+<Terminal>{`
+$ docker run -d --name notes -p 8080:3000 notes-api
+$ curl localhost:8080/healthz
+{"status":"ok"}
+$ curl -X POST localhost:8080/notes -H 'content-type: application/json' -d '{"text":"hello from a container"}'
+{"id":"eea25c54-9642-4e70-a064-2b4a92007787","text":"hello from a container","createdAt":"2026-11-02T20:05:44.199Z"}
+$ docker logs notes
+notes-api listening on :3000
+$ docker stop notes
+$ docker logs notes
+notes-api listening on :3000
+SIGTERM received, closing
+`}</Terminal>
+
+`docker stop` returns almost instantly here, because `server.ts` handles `SIGTERM`. You saw in <L id="01.03" /> why
+that matters for PID 1.
+
+## Two forms of CMD
+
+`CMD` comes in two forms, and the difference bites later:
+
+<Code lang="dockerfile" file="Dockerfile">{`
+# Exec form: Docker runs node directly. node is PID 1 and receives signals.
+CMD ["node", "dist/server.js"]
+
+# Shell form: Docker runs /bin/sh -c "node dist/server.js". The shell is PID 1.
+CMD node dist/server.js
+`}</Code>
+
+Use the **exec form** (the JSON array) unless you specifically need shell features like `&&` or `$VARS`. With the shell
+form, `sh` receives `docker stop`'s `SIGTERM` and may not pass it on, so your app gets killed after the timeout instead
+of shutting down cleanly.
+
+## CMD and ENTRYPOINT
+
+`ENTRYPOINT` is the other half. When both are set, Docker runs `ENTRYPOINT` with `CMD` appended as arguments, and
+anything you type after the image name in `docker run` replaces `CMD`:
+
+| Dockerfile | `docker run notes-api` runs | `docker run notes-api --inspect` runs |
+| --- | --- | --- |
+| `CMD ["node", "dist/server.js"]` | `node dist/server.js` | `--inspect` (fails: not a command) |
+| `ENTRYPOINT ["node"]` + `CMD ["dist/server.js"]` | `node dist/server.js` | `node --inspect` |
+
+Rule of thumb: use `CMD` alone for apps. Use `ENTRYPOINT` when the image *is* a command, like a CLI tool, and `CMD`
+holds its default arguments.
+
+<Quiz
+  question="You add RUN date > /build-time.txt and CMD cat /build-time.txt, build once, then start three containers an hour apart. What do they print?"
+  options={[
+    { text: "Three different times, one per container start", why: "That would be true if date ran in CMD. RUN ran once, when the image was built." },
+    { text: "The same time, three times: when the image was built", correct: true, why: "RUN executes at build time and its output is baked into a layer. CMD only reads the file each time a container starts." },
+    { text: "Nothing: RUN output isn't saved", why: "Files written by RUN are saved in that step's layer. That's what layers are." },
+    { text: "An error, because CMD can't read files from RUN", why: "Everything RUN writes is part of the image, so every container sees it." },
+  ]}
+/>
+
+## Other instructions you'll meet
+
+- `ENV NODE_ENV=production` sets an environment variable for later build steps **and** for running containers.
+- `ARG VERSION` declares a build-time variable you pass with `docker build --build-arg VERSION=1.2`. It doesn't exist
+  when the container runs.
+- `USER node` runs everything after it, including the container's process, as that user instead of root
+  (<L id="07.01" />).
+- `ADD` is like `COPY` but can also fetch URLs and unpack archives. Prefer `COPY` unless you need those.
+
+<Checkpoint
+  title="Build and talk to your image"
+  solution={<p><code>port is already allocated</code>: something else uses 8080, so pick another host port, like <code>-p 8090:3000</code>. <code>Cannot find module '/app/dist/server.js'</code>: the build step didn't run or output somewhere else; check <code>RUN npm run build</code> is in the Dockerfile.</p>}
+>
+  <p>Write the Dockerfile above, build it, run it on port 8080, create two notes with <code>POST /notes</code> and list them with <code>GET /notes</code>. Then stop and start the container again and list the notes once more. Where did they go, and why?</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Expecting `EXPOSE` to open a port.** It's documentation. You still need `-p host:container` on `docker run`.</li>
+    <li>**Using the shell form of CMD by default.** Your app stops receiving signals cleanly.</li>
+    <li>**Running the app with `RUN`.** `RUN node server.js` would start the server during the build and hang it.</li>
+    <li>**Copying everything before installing.** It works, but it's slow to rebuild. That's next: <L id="02.02" />.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>`FROM` picks a base, `WORKDIR` sets the folder, `COPY` brings files in, `RUN` runs at build time.</li>
+    <li>`CMD` runs when a container starts. Prefer the exec (JSON) form.</li>
+    <li>`EXPOSE` documents a port; `-p` publishes it.</li>
+    <li>`ENTRYPOINT` + `CMD` = command + default arguments.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "CMD vs ENTRYPOINT: what's the difference, and when would you use both?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How do you override ENTRYPOINT at runtime?", "Why does the exec form matter for signals?"]}
+>
+  <p>Both define what runs when a container starts. `CMD` is the default command and is replaced by whatever you pass after the image name in `docker run`. `ENTRYPOINT` is the fixed executable; if both are set, `CMD` becomes its default arguments.</p>
+  <p>Use both when the image wraps one program: `ENTRYPOINT ["node"]` with `CMD ["dist/server.js"]`, or a CLI tool whose subcommand users pass at run time. Override the entrypoint with `docker run --entrypoint`. Use the exec form so the program is PID 1 and receives signals.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "What's the difference between RUN and CMD?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+>
+  <p>`RUN` executes during `docker build` and saves its filesystem changes as a layer in the image: installing packages, compiling code. `CMD` is stored in the image's config and executed each time a container starts. A Dockerfile can have many `RUN` steps but only the last `CMD` counts.</p>
+</InterviewCard>

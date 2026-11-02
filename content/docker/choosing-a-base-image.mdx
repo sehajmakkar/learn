@@ -1,0 +1,161 @@
+export const meta = {
+  summary: "Full, slim, alpine or distroless: what each actually contains, what breaks, and a default you can defend.",
+  uses: ["02.05"],
+  usedIn: ["07.01", "07.03"],
+};
+
+<BeforeYouStart>
+  You've seen how much the base image dominates size (<L id="02.05" />).
+</BeforeYouStart>
+
+## The core idea
+
+Your base image is most of your image. It decides your C library, your package manager, which debugging tools exist
+inside the container, and how many packages a security scanner will flag. There's no single best choice, but there are
+four families, and knowing what's inside each makes the choice easy.
+
+## The four families
+
+Measured with the notes API on top of each (arm64; amd64 differs slightly):
+
+| Base | What's inside | C library | Notes API image |
+| --- | --- | --- | --- |
+| `node:22` | Debian plus build tools: git, python3, gcc, curl | glibc | 1.63 GB base alone |
+| `node:22-slim` | minimal Debian: apt and bash, no curl or compilers | glibc | 349 MB |
+| `node:22-alpine` | Alpine Linux: busybox and apk | musl | 238 MB |
+| `gcr.io/distroless/nodejs22-debian12` | Node and its runtime libraries. No shell, no package manager | glibc | 212 MB |
+
+You can check these yourself:
+
+<Terminal>{`
+$ docker run --rm node:22 sh -c 'which curl git python3 gcc'
+/usr/bin/curl
+/usr/bin/git
+/usr/bin/python3
+/usr/bin/gcc
+$ docker run --rm node:22-slim sh -c 'which curl apt-get bash'
+/usr/bin/apt-get
+/usr/bin/bash
+$ docker run --rm node:22-slim sh -c 'ldd --version | head -1'
+ldd (Debian GLIBC 2.36-9+deb12u14) 2.36
+$ docker run --rm node:22-alpine sh -c 'ldd --version 2>&1 | head -1'
+musl libc (aarch64)
+`}</Terminal>
+
+Notice that `node:22-slim` has no `curl`. That matters the first time you write a healthcheck that calls `curl`.
+
+## glibc vs musl
+
+Alpine is small partly because it uses **musl** instead of glibc as its C library. Pure JavaScript, Python or Go code
+doesn't care. Native code does:
+
+- npm packages with native addons (for example `bcrypt`, `sharp`) need musl builds or compile from source.
+- Python wheels on PyPI are mostly built for glibc, so on Alpine `pip` often compiles from source, which is slow and
+  needs build tools.
+- DNS resolution and some locale and threading behaviour differ in small ways that occasionally surface as bugs.
+
+None of this makes Alpine bad. It means "switch to Alpine" is a change to test, not a free win.
+
+## Distroless: nothing to log into
+
+Distroless images contain your language runtime and the libraries it needs, and nothing else. No shell, so this fails:
+
+<Terminal>{`
+$ docker run --rm --entrypoint sh notes-api:distroless -c 'echo hi'
+docker: Error response from daemon: ... exec: "sh": executable file not found in $PATH
+`}</Terminal>
+
+Output trimmed. That's the point: an attacker who gets code execution has no shell, no package manager and no `curl`
+to work with, and scanners have far fewer packages to flag. The cost is that you can't `docker exec -it ... sh` to
+debug. You debug from outside instead, or use a `:debug` variant of the image temporarily.
+
+Distroless also changes how you write the Dockerfile: there's no `npm` in the final image, so you copy a pruned
+`node_modules` from the build stage, and `CMD` lists only the script because the entrypoint is already `node`:
+
+<Code lang="dockerfile" file="Dockerfile.distroless">{`
+FROM node:22-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build && npm prune --omit=dev
+
+FROM gcr.io/distroless/nodejs22-debian12:nonroot
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+EXPOSE 3000
+CMD ["dist/server.js"]
+`}</Code>
+
+The `:nonroot` tag runs as user 65532 by default.
+
+<Quiz
+  question="You switch a Python service from python:3.12-slim to python:3.12-alpine. The build now takes 6 minutes instead of 40 seconds. What's the likely cause?"
+  options={[
+    { text: "Alpine's package mirrors are slower", why: "Mirror speed rarely explains a 9× difference. The work being done changed." },
+    { text: "pip can't use prebuilt glibc wheels on musl, so it compiles packages from source", correct: true, why: "Most prebuilt wheels target glibc. On Alpine (musl), pip falls back to building from source, which is slow and needs a compiler." },
+    { text: "Alpine images are compressed and slower to unpack", why: "Alpine images are smaller, so they unpack faster, not slower." },
+    { text: "Python is slower on Alpine", why: "Runtime speed isn't what changed here; build time did." },
+  ]}
+/>
+
+## A default you can defend
+
+- **Start with `-slim`.** glibc compatibility, a package manager when you need one, a shell for debugging, and a
+  reasonable size. It's the least surprising choice.
+- **Move to distroless** for production services once your Dockerfile is stable and you're comfortable debugging
+  without a shell.
+- **Use Alpine** when size really matters and your dependencies are known to work on musl.
+- **Use the full image** for build stages that need compilers, not for what you ship.
+
+Whichever you choose, pin the major version (`node:22-slim`, not `node:slim`), and consider pinning by digest
+(<L id="02.06" />).
+
+<Checkpoint
+  title="Look inside each base"
+  solution={<p><code>pull access denied</code> for distroless: check the full name, <code>gcr.io/distroless/nodejs22-debian12</code>. It's hosted on Google's registry, not Docker Hub.</p>}
+>
+  <p>Run <code>sh -c 'cat /etc/os-release | head -2; which apt-get apk curl'</code> in <code>node:22-slim</code> and <code>node:22-alpine</code>. Then build the distroless variant above and try <code>docker exec -it</code> into it. What's the error, and how would you debug a problem in that container?</p>
+</Checkpoint>
+
+<Mistakes>
+  <ul>
+    <li>**Shipping the full `node` or `python` image.** Hundreds of megabytes of compilers and tools you never run.</li>
+    <li>**Assuming slim has curl.** It doesn't; install it or write healthchecks another way.</li>
+    <li>**Unpinned bases like `node:latest`.** A new major version can arrive on any rebuild.</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after this lesson.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Full → slim → alpine → distroless: less inside each step.</li>
+    <li>Alpine uses musl; native dependencies may need rebuilding.</li>
+    <li>Distroless has no shell; great for production, harder to debug.</li>
+    <li>Default to slim, pin versions, use full images only in build stages.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you choose a base image? Compare slim, alpine and distroless.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you debug a distroless container in production?"]}
+>
+  <p>Slim variants are minimal Debian or Ubuntu with glibc, a package manager and a shell: compatible and easy to debug, at moderate size. Alpine is much smaller and uses musl and apk, which can break or slow down native dependencies such as prebuilt Python wheels. Distroless contains only the runtime and its libraries, with no shell or package manager: the smallest attack surface, but no interactive debugging.</p>
+  <p>A sensible default is slim for most services, distroless for hardened production images, Alpine when size matters and dependencies are musl-safe, and full images only in build stages. Always pin a version, ideally by digest.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "What's the security argument for distroless images?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+>
+  <p>Fewer packages means fewer CVEs to patch and less noise in scans. With no shell, package manager or networking tools, an attacker who achieves code execution can't easily download tools, pivot or explore. Combined with a non-root user and a read-only filesystem, it significantly limits what a compromise can do. It's defence in depth, not a replacement for patching the runtime itself.</p>
+</InterviewCard>
