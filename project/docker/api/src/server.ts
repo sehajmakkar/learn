@@ -1,6 +1,7 @@
 // A deliberately small notes API: enough moving parts to containerise, nothing more.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import pg from "pg";
 import { createClient } from "redis";
 
@@ -24,7 +25,17 @@ if (!databaseUrl) {
   process.exit(1);
 }
 
-const pool = new pg.Pool({ connectionString: databaseUrl });
+// In production the password comes from a mounted secret file, not the environment (see 07.02).
+// It goes into the URL: pg lets the connection string override a separate password option.
+function connectionString(url: string) {
+  const file = process.env.DATABASE_PASSWORD_FILE;
+  if (!file) return url;
+  const parsed = new URL(url);
+  parsed.password = encodeURIComponent(readFileSync(file, "utf8").trim());
+  return parsed.toString();
+}
+
+const pool = new pg.Pool({ connectionString: connectionString(databaseUrl) });
 
 // Redis is optional and only a cache (see 05.05): if it's missing or down, every request goes to Postgres.
 const redisUrl = process.env.REDIS_URL;
