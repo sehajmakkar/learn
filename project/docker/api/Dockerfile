@@ -20,7 +20,10 @@ FROM node:22-slim
 ENV NODE_ENV=production
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# Install production dependencies, then delete npm itself: the app never runs it, and its bundled
+# packages were the only fixable HIGH findings in a scan (see 07.03). Same RUN, so they never reach a layer.
+RUN npm ci --omit=dev \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 COPY --from=build /app/dist ./dist
 USER node
 EXPOSE 3000

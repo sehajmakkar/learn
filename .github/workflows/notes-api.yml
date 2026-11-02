@@ -1,0 +1,79 @@
+# Builds, scans and (optionally) publishes the Docker course's notes API image (see 07.06).
+name: notes-api image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "project/docker/api/**"
+      - ".github/workflows/notes-api.yml"
+  pull_request:
+    paths:
+      - "project/docker/api/**"
+      - ".github/workflows/notes-api.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/notes-api
+  CONTEXT: project/docker/api
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build once for this runner's platform and load it, so it can be scanned before anything is published.
+      - name: Build for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CONTEXT }}
+          load: true
+          tags: notes-api:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Fail on HIGH or CRITICAL vulnerabilities that have a fix available (see 07.03).
+      - name: Scan with Trivy
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.76.1 image --scanners vuln --severity HIGH,CRITICAL \
+            --ignore-unfixed --exit-code 1 notes-api:scan
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Publishing is opt-in: set the repository variable PUBLISH_IMAGE to "true" to push to GHCR.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request' && vars.PUBLISH_IMAGE == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        if: github.event_name != 'pull_request' && vars.PUBLISH_IMAGE == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CONTEXT }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
