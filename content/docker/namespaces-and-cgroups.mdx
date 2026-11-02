@@ -129,7 +129,9 @@ You'll tune limits properly in <L id="03.06" />.
 
 Because your app is PID 1 in its namespace, it inherits a job normally done by `init`: the kernel won't apply default
 signal behaviour to PID 1. If your app doesn't explicitly handle `SIGTERM`, `docker stop` sends it, nothing happens,
-and ten seconds later Docker gives up and sends `SIGKILL`.
+and after a grace period Docker gives up and sends `SIGKILL`. On Docker Engine (what servers run) the grace period is
+10 seconds by default; check a container's with `docker inspect -f '{{.Config.StopTimeout}}' NAME`. The Docker Desktop
+used to test this course set it to 1 second, so the problem is easy to miss on a laptop.
 
 Two fixes: handle `SIGTERM` in your app (you should anyway, to shut down cleanly), or run with `docker run --init`,
 which puts a tiny init process in front of your app to forward signals.
@@ -138,7 +140,7 @@ which puts a tiny init process in front of your app to forward signals.
   <ul>
     <li>**Assuming namespaces limit resources.** They only hide things. Without cgroup limits, one container can starve the host.</li>
     <li>**Ignoring exit code 137.** It almost always means the container was killed, usually by the OOM killer. Check `docker inspect` for `OOMKilled`.</li>
-    <li>**Apps that ignore SIGTERM.** Every `docker stop` then takes ten seconds and ends with a hard kill.</li>
+    <li>**Apps that ignore SIGTERM.** Every `docker stop` waits out the whole grace period and ends with a hard kill.</li>
   </ul>
 </Mistakes>
 
@@ -168,9 +170,9 @@ which puts a tiny init process in front of your app to forward signals.
 </InterviewCard>
 
 <InterviewCard
-  q={{ q: "docker stop takes ten seconds for one of your containers, every time. Why, and how do you fix it?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Debugging" }}
+  q={{ q: "docker stop takes ten seconds for one of your containers on the server, every time. Why, and how do you fix it?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Debugging" }}
   followUps={["How does the shell form of CMD make this worse?"]}
 >
-  <p>`docker stop` sends SIGTERM, waits ten seconds by default, then sends SIGKILL. The app runs as PID 1, and the kernel doesn't apply default signal handling to PID 1, so if the app doesn't install a SIGTERM handler, the signal is ignored and it only dies at the timeout.</p>
+  <p>`docker stop` sends SIGTERM, waits for the stop timeout (10 seconds by default on Docker Engine), then sends SIGKILL. The app runs as PID 1, and the kernel doesn't apply default signal handling to PID 1, so if the app doesn't install a SIGTERM handler, the signal is ignored and it only dies at the timeout.</p>
   <p>Handle SIGTERM in the app and shut down cleanly, or run with `--init` so a small init process forwards signals. Also make sure the app really is PID 1: with the shell form of CMD, a shell is PID 1 and may not pass the signal on.</p>
 </InterviewCard>

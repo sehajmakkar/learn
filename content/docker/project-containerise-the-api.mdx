@@ -29,12 +29,15 @@ Try it yourself first. Each step below has the answer folded away under "Stuck?"
 
 <Terminal>{`
 $ git clone https://github.com/sehajmakkar/learn.git
-$ cd learn/project/docker/api
+$ cd learn
+$ git checkout docker-step-01
+$ cd project/docker/api
 $ ls
 Dockerfile  README.md  package-lock.json  package.json  src  tsconfig.json
 `}</Terminal>
 
-If you want a clean start without the finished Dockerfile, delete `Dockerfile` and `.dockerignore` now.
+`docker-step-01` is the finished state of this step, so delete `Dockerfile` and `.dockerignore` now for a clean start.
+Later steps change these files, which is why you check out the tag instead of using `main`.
 
 ## Step 1: the build context
 
@@ -92,7 +95,7 @@ SIGTERM received, closing
 `}</Terminal>
 
 `docker stop` returns almost immediately, because the app handles `SIGTERM` and runs as PID 1 with the exec-form `CMD`. If
-yours takes ten seconds, check you used `CMD ["node", "dist/server.js"]` and not the shell form.
+yours waits for the whole stop timeout and the logs don't show `SIGTERM received`, check you used `CMD ["node", "dist/server.js"]` and not the shell form.
 
 ## Step 5: tag and push
 
