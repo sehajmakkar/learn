@@ -9,6 +9,12 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
+# Development (06.05): the build stage plus a watcher. Node 22 runs TypeScript directly by
+# stripping the types, so edits restart the server with no compile step. Build with --target dev.
+FROM build AS dev
+ENV NODE_ENV=development
+CMD ["node", "--watch", "src/server.ts"]
+
 # Stage 2: what actually ships. Production dependencies and compiled JS only.
 FROM node:22-slim
 ENV NODE_ENV=production

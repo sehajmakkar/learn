@@ -20,25 +20,19 @@ Notes are stored in Postgres. The API needs `DATABASE_URL` and waits up to 30 se
 
 ## Run with Docker
 
-The full stack (Nginx, API, Postgres, Redis on two networks) is in lesson 05.05. From `project/docker`:
+From `project/docker`, one command starts Nginx, the API, Postgres and Redis, seeds the database and reloads the API
+as you edit (lesson 06.06):
 
 ```bash
-docker build -t notes-api api
-docker network create notes-backend
-docker network create notes-frontend
-docker volume create notes-pgdata
-docker run -d --name notes-db --network notes-backend \
-  -e POSTGRES_USER=notes -e POSTGRES_PASSWORD=notes -e POSTGRES_DB=notes \
-  -v notes-pgdata:/var/lib/postgresql postgres:18
-docker run -d --name notes-cache --network notes-backend redis:8-alpine
-docker run -d --name notes --network notes-backend \
-  -e DATABASE_URL=postgres://notes:notes@notes-db:5432/notes \
-  -e REDIS_URL=redis://notes-cache:6379 notes-api
-docker network connect notes-frontend notes
-docker run -d --name notes-proxy --network notes-frontend -p 8080:80 \
-  -v "$PWD/nginx/default.conf":/etc/nginx/conf.d/default.conf:ro nginx:alpine
+cp .env.example .env   # optional; defaults work without it
+docker compose up --watch
 curl localhost:8080/notes
 ```
+
+`docker compose down` stops everything and keeps the data; `docker compose down -v` also deletes it. Add
+`--profile tools` for Adminer, a database UI, on `localhost:8081`.
+
+The same stack started with plain `docker` commands is in lesson 05.05 (`git checkout docker-step-04`).
 
 ## Run without Docker
 
