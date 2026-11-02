@@ -1,0 +1,185 @@
+export const meta = {
+  summary: "Why a one-line change can rebuild your whole image, and how to order a Dockerfile so it doesn't.",
+  uses: ["01.04", "02.01"],
+  usedIn: ["02.04", "07.05", "step-01"],
+};
+
+<BeforeYouStart>
+  You should have written a small Dockerfile and run `docker build` once (<L id="02.01" />). Any Docker
+  Engine from 23.0 on, or a current Docker Desktop, uses BuildKit by default, which is what this lesson describes.
+</BeforeYouStart>
+
+## The core idea
+
+An image isn't one big file. It's a stack of read-only **layers**, each holding the files one step of your Dockerfile
+added or changed. When you rebuild, Docker reuses every step whose inputs haven't changed and only runs the rest.
+
+So fast builds come down to one habit: **put the things that change least at the top of the Dockerfile**. The rest of
+this lesson is why that works, and how to see it happen.
+
+## Every step leaves a record
+
+Here's a typical first Dockerfile for a Node API:
+
+<Code lang="dockerfile" file="Dockerfile">{`
+FROM node:22-slim
+WORKDIR /app
+COPY . .
+RUN npm ci
+CMD ["node", "src/index.js"]
+`}</Code>
+
+`FROM` brings in the base image's layers. `COPY` and `RUN` change files, so each adds a new layer on top. `CMD` only
+changes the image's settings (which command to start), so it adds no files at all.
+
+You can list an image's layers with `docker history`:
+
+<Terminal>{`
+$ docker build -t my-api .
+$ docker history my-api
+IMAGE          CREATED          CREATED BY                          SIZE
+3f9a1c2b7d4e   10 seconds ago   CMD ["node" "src/index.js"]         0B
+<missing>      10 seconds ago   RUN /bin/sh -c npm ci # buildkit    48.2MB
+<missing>      12 seconds ago   COPY . . # buildkit                 1.31MB
+<missing>      12 seconds ago   WORKDIR /app                        0B
+<missing>      3 weeks ago      ...layers from node:22-slim...
+`}</Terminal>
+
+Read it bottom to top: that's the order the layers stack. The `npm ci` layer is most of your image, which is why
+rebuilding it is what makes builds slow.
+
+Layers are also shared. If ten images on your machine start `FROM node:22-slim`, those base layers are stored once,
+and `docker pull` only downloads layers you don't already have.
+
+## How Docker decides a step is cached
+
+Before running a step, Docker asks: have I run exactly this before, on top of exactly the same layers? What
+"exactly this" means depends on the instruction:
+
+| Instruction | Reused when… |
+| --- | --- |
+| `COPY` / `ADD` | the step before was reused **and** the copied files have the same contents. Docker checksums them; timestamps don't matter. |
+| `RUN` | the step before was reused **and** the command text is identical. |
+| Everything else | the step before was reused **and** the line is identical. |
+
+That `RUN` rule surprises people. Docker never looks at what a command would do; it only compares the text.
+`RUN apt-get update` stays cached for months, even as new package versions ship.
+
+<Quiz
+  question="With the Dockerfile above, you change one line in src/index.js and rebuild. Which steps run again?"
+  options={[
+    { text: "Only COPY . .", why: "COPY . . does miss, because a file it copies changed. But a miss doesn't stop there." },
+    { text: "COPY . ., RUN npm ci, and everything after them", correct: true, why: "COPY misses because a copied file changed, and every step after a miss has to run again, including the slow npm ci." },
+    { text: "Nothing: npm ci only depends on package.json", why: "You know that, but Docker doesn't. It only sees that the layer below RUN npm ci is different." },
+    { text: "Every step, including FROM", why: "FROM and WORKDIR come before the change, so their cached layers are still valid." },
+  ]}
+/>
+
+## One miss rebuilds everything after it
+
+Each step's cache is tied to the exact layers beneath it. Once one step misses, every step after it is building on a
+layer Docker has never seen, so none of them can be reused. Step through it:
+
+<LayerCacheSteps />
+
+## Order your Dockerfile for the cache
+
+`npm ci` only needs `package.json` and `package-lock.json`. Copy those first, install, then copy the rest of your
+source:
+
+<Code lang="dockerfile" file="Dockerfile">{`
+FROM node:22-slim
+WORKDIR /app
+
+# Dependencies change rarely: install them first.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Source changes all the time: copy it last.
+COPY . .
+CMD ["node", "src/index.js"]
+`}</Code>
+
+Now editing your code only invalidates the final `COPY`. Dependencies only reinstall when the lockfile changes, which is
+exactly when they should.
+
+The same rule works for any language: copy the dependency manifest (`requirements.txt`, `go.mod` and `go.sum`,
+`Cargo.toml`), install, then copy the source. Order steps from **least often changed** to **most often changed**.
+
+<Aside title="Going further: cache mounts">
+  Even with good ordering, changing one dependency re-downloads all of them. A cache mount keeps npm's download cache
+  between builds without putting it in the image: `RUN --mount=type=cache,target=/root/.npm npm ci`. You'll use this
+  in 07.05 when builds move to CI.
+</Aside>
+
+## See it yourself
+
+<Checkpoint
+  title="Watch the cache work"
+  solution={<p>If <code>RUN npm ci</code> isn't <code>CACHED</code>, check that <code>COPY . .</code> comes after it, and that your edit didn't touch <code>package.json</code> or the lockfile.</p>}
+>
+  <p>Use the reordered Dockerfile. Build once, change a source file, then build again with plain progress output so you can read each step.</p>
+
+<Terminal>{`
+$ docker build -t my-api .
+$ echo "// touch" >> src/index.js
+$ docker build --progress=plain -t my-api .
+#6 [2/5] WORKDIR /app
+#6 CACHED
+
+#7 [3/5] COPY package.json package-lock.json ./
+#7 CACHED
+
+#8 [4/5] RUN npm ci
+#8 CACHED
+
+#9 [5/5] COPY . .
+#9 DONE 0.1s
+`}</Terminal>
+
+  <p>Output is trimmed. You're looking for <code>CACHED</code> on <code>RUN npm ci</code> and real work only on the last <code>COPY</code>.</p>
+</Checkpoint>
+
+## Common mistakes
+
+<Mistakes>
+  <ul>
+    <li>**Copying all the source before installing dependencies.** Every code change reinstalls everything.</li>
+    <li>**`RUN apt-get update` on its own line.** That layer stays cached and stale while later installs change. Keep them in one step: `RUN apt-get update && apt-get install -y curl`.</li>
+    <li>**No `.dockerignore`.** `COPY . .` then picks up `node_modules` and `.git`, so unrelated changes bust the cache. More in 02.03.</li>
+    <li>**Deleting files in a later step to shrink the image.** The earlier layer still contains them, so the image doesn't get smaller. Delete in the same `RUN` that created them, or use a multi-stage build (02.04).</li>
+  </ul>
+</Mistakes>
+
+<Tripped>
+  Your note goes here after you run this lesson: the thing that surprised you, in your own words.
+</Tripped>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>An image is a stack of layers. `RUN`, `COPY` and `ADD` add them.</li>
+    <li>`COPY` is cached by file contents. `RUN` is cached by command text only.</li>
+    <li>One cache miss rebuilds every step after it.</li>
+    <li>Order your Dockerfile from least to most often changed. Dependencies before source.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Every code change re-runs npm install during the Docker build. Why, and how do you fix it?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Debugging" }}
+  followUps={["What if package-lock.json changes on almost every commit?", "How would you keep the npm download cache between builds in CI?"]}
+>
+  <p>The Dockerfile copies the whole source before installing. `COPY . .` is cached by file contents, so any code change makes it miss, and every step after a miss rebuilds, including the install.</p>
+  <p>Fix the order: copy only the dependency manifest and lockfile, run the install, then copy the source. Now the install layer is only invalidated when the lockfile changes. A `.dockerignore` keeps `node_modules` and `.git` from busting the cache too.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "A teammate removes a 300 MB file with RUN rm in the last step, but the image is the same size. Why?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Debugging" }}
+  followUps={["How does a multi-stage build avoid this?", "How would you find which layer is large?"]}
+>
+  <p>Layers only add. The layer that created the file still contains it; the later `rm` just adds a layer that hides it. The image is the sum of all layers, so nothing shrinks.</p>
+  <p>Delete the file in the same `RUN` that creates it, or build in one stage and copy only the output into a clean final stage. `docker history` shows the size of each layer.</p>
+</InterviewCard>
