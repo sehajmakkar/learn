@@ -1,0 +1,87 @@
+Every component below is available in any lesson without importing it. The source of this page is
+`content/styleguide.mdx`; copy an example from there to start.
+
+## Architecture: `<Arch>`
+
+Boxes sit on a grid (`x` is the column, `y` the row). Arrows are `from`/`to` pairs. With `steps`, readers walk a
+request through the system; each step's arrows are numbered.
+
+<Arch
+  title="Snip: one request through the system"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+    { id: "cdn", label: "CDN", kind: "cdn", sub: "edge cache", x: 1, y: 0 },
+    { id: "lb", label: "Load balancer", kind: "lb", x: 1, y: 1 },
+    { id: "api", label: "Snip API", kind: "service", sub: "3 instances", x: 2, y: 1 },
+    { id: "cache", label: "Redis", kind: "cache", sub: "short → long", x: 3, y: 0 },
+    { id: "db", label: "Postgres", kind: "db", sub: "primary", x: 3, y: 2 },
+    { id: "queue", label: "Click events", kind: "queue", x: 2, y: 2 },
+  ]}
+  edges={[
+    { from: "user", to: "lb", label: "GET /x7Kp" },
+    { from: "lb", to: "api" },
+    { from: "api", to: "cache", label: "GET" },
+    { from: "api", to: "db", label: "on miss" },
+    { from: "api", to: "queue", label: "click", dashed: true },
+    { from: "api", to: "lb" },
+    { from: "lb", to: "user", label: "301" },
+    { from: "user", to: "cdn", dashed: true },
+  ]}
+  groups={[{ label: "Private network", nodes: ["api", "cache", "db", "queue"] }]}
+  steps={[
+    { caption: "The browser asks for snip.link/x7Kp. DNS sent it to the load balancer.", edges: ["user>lb"] },
+    { caption: "The load balancer picks one of the three API instances.", edges: ["lb>api"] },
+    { caption: "The API looks the short code up in Redis first. Most lookups end here.", edges: ["api>cache"] },
+    { caption: "On a cache miss it reads Postgres, then writes the answer back to Redis.", edges: ["api>db"] },
+    { caption: "It records the click without waiting for it to be saved.", edges: ["api>queue"] },
+    { caption: "And answers with a 301 redirect to the long URL, back through the load balancer.", edges: ["api>lb", "lb>user"] },
+  ]}
+  caption="Static assets come from the CDN; redirects always reach the API so every click is counted."
+/>
+
+## Before and after: `<Evolve>`
+
+Pass the two diagrams. What was added is worked out for you and drawn in green; what was removed is dashed red.
+
+<Evolve
+  title="Snip: reads are slow"
+  change="Put a cache in front of the database"
+  before={{
+    nodes: [
+      { id: "api", label: "Snip API", kind: "service", x: 0, y: 0 },
+      { id: "db", label: "Postgres", kind: "db", x: 2, y: 0 },
+    ],
+    edges: [{ from: "api", to: "db", label: "every read" }],
+  }}
+  after={{
+    nodes: [
+      { id: "api", label: "Snip API", kind: "service", x: 0, y: 0 },
+      { id: "cache", label: "Redis", kind: "cache", x: 1, y: 1 },
+      { id: "db", label: "Postgres", kind: "db", x: 2, y: 0 },
+    ],
+    edges: [
+      { from: "api", to: "cache", label: "read first" },
+      { from: "api", to: "db", label: "on miss" },
+    ],
+  }}
+/>
+
+## Sequence: `<Sequence>`
+
+Messages in order, top to bottom. `reply` draws a dashed response, `fail` a lost message, and notes sit over one or
+more participants. With `walk`, readers step through one message at a time and see each one's `explain`.
+
+<Sequence
+  title="A retry with an idempotency key"
+  walk
+  participants={[{ id: "c", label: "Client" }, { id: "api", label: "Payments API" }, { id: "db", label: "Database" }]}
+  messages={[
+    { from: "c", to: "api", label: "POST /charges  key=a1", explain: "The client sends a charge with a key it made up." },
+    { from: "api", to: "db", label: "insert key, charge", explain: "The API saves the key and the charge together." },
+    { from: "api", to: "c", label: "201 Created", reply: true, fail: true, explain: "The reply is lost on the way back." },
+    { note: "client times out", over: ["c"] },
+    { from: "c", to: "api", label: "POST /charges  key=a1", explain: "The client retries with the same key." },
+    { from: "api", to: "db", label: "find key a1", explain: "The API sees it has handled this key before…" },
+    { from: "api", to: "c", label: "201 (saved reply)", reply: true, explain: "…and returns the first answer instead of charging twice." },
+  ]}
+/>

@@ -7,6 +7,8 @@ import { Checkpoint } from "@/components/lesson/checkpoint";
 import { LayerCacheSteps } from "@/components/lesson/layer-cache-steps";
 import { InterviewCard } from "@/components/interview";
 import { Anatomy, Flow, L, Stacks } from "@/components/lesson/diagrams";
+import { Arch, Evolve } from "@/components/lesson/arch";
+import { Sequence } from "@/components/lesson/sequence";
 
 // Everything a lesson can use without importing it.
 const components: MDXComponents = {
@@ -26,6 +28,9 @@ const components: MDXComponents = {
   Flow,
   L,
   Stacks,
+  Arch,
+  Evolve,
+  Sequence,
 };
 
 export function useMDXComponents(): MDXComponents {
