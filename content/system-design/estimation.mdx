@@ -1,0 +1,131 @@
+export const meta = {
+  summary: "Turning users and habits into requests per second and storage, quickly enough to decide whether a design needs more than one machine.",
+  uses: ["01.02", "01.04"],
+  usedIn: ["01.07", "01.08"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.04" />. You'll need "a day is about 100,000 seconds" and the size steps (KB, MB, GB, TB).
+</BeforeYouStart>
+
+## Why estimate at all
+
+A design for 10 requests a second and one for 100,000 look nothing alike. The first fits on one machine; the second
+needs <Term t="cache">caches</Term>, many servers and probably split-up data. A **back-of-the-envelope estimate** is a two-minute calculation
+that tells you which world you're in.
+
+The rule for interviews and real work alike: **only estimate what changes a decision.** If the answer to "how much
+storage?" is "a few hundred gigabytes", that settles it (one disk) and you move on. Long tables of numbers that
+nobody uses are wasted time.
+
+<Analogy>
+  **Planning a party.** You don't count every crisp. You estimate guests, roughly how much each eats, and whether that's one trip to the shop or a van. The goal is the decision (one trip or two), not the exact number.
+</Analogy>
+
+## The method
+
+Five steps, each one a multiplication or division:
+
+<Flow
+  title="From users to machines"
+  steps={[
+    { label: "Actions per day", detail: "users × actions per user per day" },
+    { label: "Per second", detail: "divide by 100,000 (seconds in a day, rounded)" },
+    { label: "Peak", detail: "multiply by 2–3: traffic isn't flat" },
+    { label: "Storage", detail: "records × size × how long you keep them" },
+    { label: "Decide", detail: "does it fit one machine? which part doesn't?" },
+  ]}
+/>
+
+Round hard at every step. 86,400 becomes 100,000; 333,000 becomes 300,000. You're after the right power of ten, not
+the right digits.
+
+## Worked example: Snip
+
+From <L id="01.02" />: 10 million new links a month, and about 100 <Term t="redirect">redirects</Term> for every link created. Assume each
+stored link (short code, long URL, owner, timestamps) takes about **500 bytes**, and we keep links for five years.
+
+**Writes (creating links)**
+
+- 10 million a month ÷ 30 days ≈ 330,000 a day
+- 330,000 ÷ 100,000 seconds ≈ **3–4 writes per second**
+- Peak at three times average: about **10 writes per second**
+
+**Reads (redirects)**
+
+- 100 × the write rate ≈ **350 reads per second**, about **1,000** at peak
+
+**Storage**
+
+- 10 million links a month × 12 months × 5 years = 600 million links
+- 600 million × 500 bytes = **300 GB**
+
+**Decide.** Ten writes a second, a thousand reads a second and 300 GB of data: one ordinary database server handles
+that, with room to spare. Snip at this size doesn't need <Term t="sharding">sharding</Term>, a <Term t="message-queue">message queue</Term> or a fleet of caches. We'd still add
+a second database copy so a single failure doesn't take redirects down (that's <Term t="availability">availability</Term>, from <L id="01.03" />),
+but scale isn't the problem.
+
+Now multiply the traffic by a hundred: a billion new links a month. That's about 350 writes and 35,000 reads a second,
+and 30 TB over five years. Now the reads want a cache, and the data may need splitting across machines. **Same
+system, different design, and the estimate is what told you.**
+
+<Lab
+  id="sd-01-05-estimate"
+  title="Estimate Snip"
+  tasks={[
+    "Reproduce the worked example: 1M daily users each creating 0.33 links a day is about 10M links a month. Check the writes, reads and storage.",
+    "Raise reads per write from 100 to 1,000. Which numbers change, and which stay the same?",
+    "Slide daily users up until storage passes 10 TB. Roughly how many links a month is that?",
+    "Set bytes per link to 2,000 (long URLs and more metadata). Does the decision change?",
+  ]}
+>
+  <EstimateLab preset={{ users: 1000000, writes: 0.33, ratio: 100, size: 500, years: 5, peak: 3 }} />
+</Lab>
+
+## Things people forget
+
+- **Peaks.** Traffic follows the clock: evenings, launches, a link going viral. Design for peak, not average.
+- **Copies.** If you keep three copies of every record for <Term t="durability">durability</Term>, storage is three times the raw number.
+- **Indexes and overhead.** Databases store more than your raw rows. Adding 30–50% is a reasonable rough allowance.
+- **Growth.** If traffic doubles each year, five years of data is mostly the last two years.
+
+You don't need to apply all of these every time. Mention the ones that could change the decision.
+
+<Quiz
+  question="A service handles 1 billion requests a day. Roughly how many is that per second, on average?"
+  options={[
+    { text: "About 1,000", why: "That would be about 100 million a day. You're off by ten." },
+    { text: "About 10,000", correct: true, why: "1 billion ÷ 100,000 seconds = 10,000 per second (11,600 with the exact 86,400). At peak, plan for two to three times that." },
+    { text: "About 100,000", why: "That would be about 10 billion a day." },
+    { text: "About 1 million", why: "That's 100 billion requests a day, a hundred times more than the question says." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**False precision.** "11,574.07 requests per second" wastes time and suggests you've misunderstood the point. Say "about 10,000, 30,000 at peak".</li>
+    <li>**Estimating for the sake of it.** If a number won't change the design, skip it, or say "this is small enough not to matter".</li>
+    <li>**Stopping at the number.** The estimate is only useful once you say what it means: "fits on one machine", "needs a cache", "needs splitting".</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Estimate only what changes a decision, and round to powers of ten.</li>
+    <li>Per day ÷ 100,000 ≈ per second; multiply by 2–3 for peak.</li>
+    <li>Storage = records × size × retention, times copies.</li>
+    <li>Snip at 10M links a month fits on one database server; at 100× it doesn't.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Estimate the storage and request rate for a URL shortener that creates 100 million links a month.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Scenario" }}
+  followUps={["How does the estimate change your choice of database?", "What would you cache, and how much memory would it need?"]}
+>
+  <p>100 million a month is about 3.3 million a day, so roughly 35–40 writes a second on average and around 100 at peak. With 100 reads per write, that's about 4,000 redirects a second, maybe 10,000 at peak. At 500 bytes a link, five years is 100M × 60 months × 500 B = 3 TB, or about 9 TB with three copies.</p>
+  <p>The writes are easy for one database primary. The reads justify a cache in front of it, and 3 TB is large but still manageable on one well-provisioned server, so splitting the data is something I'd plan for rather than build on day one.</p>
+</InterviewCard>

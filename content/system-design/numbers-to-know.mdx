@@ -1,0 +1,121 @@
+export const meta = {
+  summary: "The handful of latencies, sizes and time conversions that make estimates fast and designs sensible.",
+  uses: ["01.03"],
+  usedIn: ["01.05", "01.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.03" /> so <Term t="latency">latency</Term> and <Term t="throughput">throughput</Term> mean something precise. No maths beyond multiplying by ten.
+</BeforeYouStart>
+
+## Why memorise any numbers?
+
+You can't judge a design without a sense of scale. Is one more network hop a big deal? Should this lookup hit memory or
+disk? Will five years of data fit on one machine? A few numbers, known to the nearest power of ten, answer most of
+these questions in your head.
+
+You don't need exact values. Hardware changes every year. What lasts are the **ratios**: memory is about a thousand
+times faster than an <Term t="ssd">SSD</Term> read, and a round trip across the world is hundreds of times slower than one inside a
+datacenter.
+
+## Latency
+
+These are the classic "latency numbers every programmer should know", first published by Jeff Dean and Peter Norvig
+around 2012 and updated since. Tick the box to see them on a human scale.
+
+<NumbersToKnow
+  title="Latency, around 2020"
+  rows={[
+    { label: "Read from the CPU's L1 cache", value: "1 ns", ns: 1 },
+    { label: "Read from main memory (RAM)", value: "100 ns", ns: 100 },
+    { label: "Read 1 MB sequentially from memory", value: "3 µs", ns: 3000 },
+    { label: "Random read from an SSD", value: "16 µs", ns: 16000 },
+    { label: "Read 1 MB sequentially from an SSD", value: "49 µs", ns: 49000 },
+    { label: "Round trip inside one datacenter", value: "500 µs", ns: 500000 },
+    { label: "Spinning disk seek", value: "~3 ms", ns: 3000000 },
+    { label: "Round trip California → Netherlands → California", value: "150 ms", ns: 150000000 },
+  ]}
+  source={<>Values from Colin Scott's <a href="https://colin-scott.github.io/personal_website/research/interactive_latency.html" className="underline">interactive latency page</a>, which projects the original list forward to 2020.</>}
+/>
+
+What to take away:
+
+- **Memory is fast; everything else is far away.** Reading RAM takes about 100 ns. That's why <Term t="cache">caches</Term> (memory) sit in
+  front of databases (disk), as you'll see in <L id="06.01" />.
+- **A network hop inside a datacenter costs about half a millisecond.** A request that calls ten services one after
+  another has spent 5 ms just travelling.
+- **Crossing an ocean costs about 150 ms**, and the speed of light means no hardware upgrade fixes it. The only fix is
+  to put data closer to users, which is what <Term t="cdn">CDNs</Term> and multi-region designs do.
+- **Sequential beats random.** Reading data that sits together is far cheaper than jumping around. Databases and logs
+  are built around this.
+
+## Sizes
+
+Data sizes go up in steps of about a thousand. Powers of two line up with them closely enough for estimates:
+
+| Power of two | Roughly | Name |
+| --- | --- | --- |
+| 2¹⁰ | a thousand (10³) | kilobyte (KB) |
+| 2²⁰ | a million (10⁶) | megabyte (MB) |
+| 2³⁰ | a billion (10⁹) | gigabyte (GB) |
+| 2⁴⁰ | a trillion (10¹²) | terabyte (TB) |
+| 2⁵⁰ | a quadrillion (10¹⁵) | petabyte (PB) |
+
+And the sizes of everyday things:
+
+| Thing | Size |
+| --- | --- |
+| A character of English text | 1 byte |
+| A 64-bit number or timestamp | 8 bytes |
+| A <Term t="uuid">UUID</Term> | 16 bytes (36 as text) |
+| A tweet-sized post with its metadata | about 1 KB |
+| A compressed photo | a few hundred KB to a few MB |
+| A minute of HD video | tens of MB |
+
+## Time
+
+Estimates usually turn "per day" into "per second". Two conversions do most of the work:
+
+- **A day has 86,400 seconds.** Call it **100,000** (10⁵). Then a million events a day is about 10 a second.
+- **A month has about 2.5 million seconds**, and a year about 30 million.
+
+Rounding a day up to 100,000 seconds makes your per-second numbers about 15% low. That's fine for an estimate, and you
+can say so.
+
+<Quiz
+  question="Which is slower: reading 1 MB sequentially from an SSD, or one round trip to another server in the same datacenter?"
+  options={[
+    { text: "Reading 1 MB from the SSD", why: "Sequential SSD reads are quick: about 49 µs for 1 MB. That's ten times faster than the network round trip." },
+    { text: "The round trip to another server", correct: true, why: "About 500 µs, roughly ten times slower than reading a whole megabyte from a local SSD. Network hops are expensive, which is why chatty designs get slow." },
+    { text: "They take about the same time", why: "They differ by roughly ten times: about 49 µs versus 500 µs." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Memorising digits instead of ratios.** Whether an SSD read is 16 µs or 100 µs matters less than knowing it's about a thousand times slower than memory.</li>
+    <li>**Ignoring the network.** A design that makes ten calls in a row for one user request pays for ten round trips before it does any work.</li>
+    <li>**Forgetting physics.** No amount of servers makes a single round trip between continents faster than about 100–150 ms.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Memory ~100 ns, SSD read ~16 µs, datacenter round trip ~0.5 ms, intercontinental ~150 ms.</li>
+    <li>Sizes step by a thousand: KB, MB, GB, TB, PB.</li>
+    <li>A day is about 10⁵ seconds: a million a day is about 10 a second.</li>
+    <li>Remember the ratios; the exact values change with hardware.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Why put a cache in front of a database? Answer with rough numbers.", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What does a cache cost you?", "When would a cache not help?"]}
+>
+  <p>A cache keeps hot data in memory. Reading memory takes about 100 ns, while a database query usually involves a network round trip (about 0.5 ms inside a datacenter) plus disk or index work, so a few milliseconds in total. Serving a popular item from a cache can be ten times faster or more, and it takes that load off the database.</p>
+  <p>The cost is a second copy of the data that can go stale, extra memory, and another component to run.</p>
+</InterviewCard>

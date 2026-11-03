@@ -1,0 +1,123 @@
+export const meta = {
+  summary: "Every design choice buys something and pays for it somewhere else. The common trade-offs, and how to talk about them.",
+  uses: ["01.03"],
+  usedIn: ["01.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.03" />. Most trade-offs set those five qualities against each other.
+</BeforeYouStart>
+
+## There is no best design
+
+"What's the best database?" has no answer. "What's the best database for 10 writes a second, strict consistency and a
+team that already knows Postgres?" does. A design is only good **relative to its requirements**, and every choice
+improves one thing by making another worse.
+
+That's why interviewers care so much about trade-offs. Anyone can list components. Knowing what each one costs, and
+when the cost is worth paying, is the skill.
+
+<Analogy>
+  **Packing for a trip.** A bigger suitcase holds more but is harder to carry. Packing light is easy to carry but you may be cold. There's no best suitcase, only the best one for this trip, and a good traveller can tell you why they chose theirs.
+</Analogy>
+
+## The trade-offs you'll meet most
+
+| You can have more… | …but you pay with | Example |
+| --- | --- | --- |
+| **Consistency** | <Term t="latency">latency</Term> and <Term t="availability">availability</Term> | Waiting for every copy to confirm a write before answering. |
+| **Read speed** | write speed and storage | Each extra index or precomputed copy speeds reads and slows writes. |
+| **Availability** | cost and consistency | More copies in more places, which may disagree for a moment. |
+| **Low latency** | freshness | Serving from a <Term t="cache">cache</Term> means sometimes serving old data. |
+| **Flexibility** | simplicity | Splitting into many services lets teams move apart, and adds network calls and failure modes. |
+| **Control** | your time | Running your own database versus paying for a managed one. |
+
+You'll meet each of these properly in Part 2. For now, notice the shape: nothing on the left is free.
+
+## A small trade-off with big effects: 301 or 302?
+
+When someone opens a Snip link, Snip answers with an HTTP redirect. There are two common kinds:
+
+- **301 Moved Permanently** tells the browser "this short link always goes there". Browsers remember it, so the next
+  time the same person clicks, the browser goes straight to the long URL **without asking Snip**.
+- **302 Found** (a temporary redirect) tells the browser "go there this time". Every click comes back to Snip.
+
+Step through what happens when the same person clicks a link twice:
+
+<Sequence
+  title="The second click, with a 301"
+  walk
+  participants={[{ id: "b", label: "Browser" }, { id: "snip", label: "Snip" }, { id: "site", label: "Long URL's site" }]}
+  messages={[
+    { from: "b", to: "snip", label: "GET /x7Kp", explain: "First click: the browser asks Snip where the short link goes." },
+    { from: "snip", to: "b", label: "301 → example.com/…", reply: true, explain: "Snip counts the click and answers with a permanent redirect. The browser stores it." },
+    { from: "b", to: "site", label: "GET example.com/…", explain: "The browser follows the redirect." },
+    { note: "later: same person clicks again", over: ["b"] },
+    { from: "b", to: "b", label: "cached 301", explain: "The browser already knows where /x7Kp goes, so it doesn't ask Snip at all." },
+    { from: "b", to: "site", label: "GET example.com/…", explain: "Straight to the long URL. Fast for the user, and Snip never sees this click." },
+  ]}
+/>
+
+So the choice is a trade-off:
+
+| | 301 (permanent) | 302 (temporary) |
+| --- | --- | --- |
+| Repeat clicks | Skip Snip entirely | Always go through Snip |
+| Load on Snip | Lower | Higher |
+| Speed of repeat clicks | Faster | One extra round trip |
+| Click counts | Miss repeat clicks | Every click counted |
+| Changing the target later | Hard: browsers cached the old one | Easy |
+
+Which is right? It depends on the requirements. Snip promised owners click counts (<L id="01.02" />), so Snip uses
+**302**, and pays for it with more traffic, which the estimate in <L id="01.05" /> says it can afford. A shortener with
+no analytics might rightly choose 301.
+
+<Quiz
+  question="A link shortener's main selling point is accurate click analytics. Which redirect should it return?"
+  options={[
+    { text: "301, because it's faster for users", why: "It is faster for repeat clicks, but those clicks never reach the shortener, so the analytics would undercount." },
+    { text: "302, so every click passes through the shortener", correct: true, why: "Accurate analytics is the core requirement, so you pay the cost of handling every click. The trade-off is chosen by the requirement." },
+    { text: "Either; browsers treat them the same", why: "They don't: browsers cache 301s and reuse them without asking the server again." },
+  ]}
+/>
+
+## How to talk about a trade-off
+
+A good answer has four parts. Use it whenever you make a choice in a design:
+
+1. **The options:** "We could return a 301 or a 302."
+2. **What each buys and costs:** "301 cuts our load but loses repeat clicks; 302 counts everything but every click hits
+   us."
+3. **The choice and the requirement behind it:** "Owners need click counts, so 302."
+4. **What would change your mind:** "If we dropped analytics, or load became a problem, I'd revisit it."
+
+The fourth part is what makes it sound like judgement rather than a memorised answer.
+
+<Mistakes>
+  <ul>
+    <li>**Presenting a choice without its cost.** "We'll add a cache" is half an answer. Say what goes stale and how you'll handle it.</li>
+    <li>**Calling one option "best".** Say "best for these requirements" and name them.</li>
+    <li>**Never changing your mind.** When the interviewer changes a requirement, the right answer often changes too. Showing that is a strength.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A design is only good relative to its requirements.</li>
+    <li>Every gain is paid for: consistency with latency, read speed with write speed, flexibility with simplicity.</li>
+    <li>Snip returns 302 because click counts are a requirement; that costs extra traffic.</li>
+    <li>State the options, their costs, your choice, and what would change it.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Should a URL shortener return a 301 or a 302 redirect?", level: "Junior", frequency: 3, importance: "Good to know", kind: "Design" }}
+  followUps={["How else could you count clicks if you used 301?", "What cache headers would you set on the redirect?"]}
+>
+  <p>It depends on whether the product needs accurate analytics. A 301 is permanent, so browsers cache it and later clicks go straight to the destination: less load and faster repeat visits, but the shortener never sees those clicks and can't easily change the target. A 302 sends every click through the shortener, which costs more traffic but counts every click and lets owners edit links.</p>
+  <p>For a product that sells analytics I'd use 302 and size the redirect path for every click; without analytics, 301 is reasonable.</p>
+</InterviewCard>

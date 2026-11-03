@@ -1,0 +1,131 @@
+export const meta = {
+  summary: "What designing a system means, what changes as it grows, and what interviewers are actually listening for.",
+  usedIn: ["01.07", "02.01"],
+};
+
+<BeforeYouStart>
+  You should have built a small web app or <Term t="api">API</Term> that talks to a database, even a toy one. Nothing else.
+</BeforeYouStart>
+
+## The core idea
+
+When you write code, you decide how one program works: its functions, its classes, its data structures. **System
+design** is one level up. You decide which programs exist, where each one runs, where the data lives, and how they
+talk to each other, so that the whole thing does its job for the number of people using it.
+
+A design is a set of answers to questions like:
+
+- Where is the data stored, and how many copies are there?
+- What happens when one machine dies in the middle of a request?
+- Which parts get slow first when traffic grows ten times, and what do we do about it?
+- What does all of this cost to run, and who has to keep it running?
+
+<Analogy>
+  **A building, not a brick.** Writing code is laying bricks well. System design is the architect's drawing: where the rooms go, where the stairs and fire exits are, how water and power reach every floor. A beautiful brick can't save a building with no fire exit, and a good drawing still needs good bricks.
+</Analogy>
+
+## Meet Snip
+
+Throughout this course we'll design one system and grow it: **Snip**, a link shortener. You paste a long URL and
+get back a short one like `snip.link/x7Kp`. Anyone who opens the short link is sent on to the long one.
+
+On day one, Snip is one program and one database on one machine:
+
+<Arch
+  title="Snip on day one"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 0 },
+    { id: "app", label: "Snip app", kind: "service", sub: "one machine", x: 1, y: 0 },
+    { id: "db", label: "Database", kind: "db", sub: "same machine", x: 2, y: 0 },
+  ]}
+  edges={[
+    { from: "user", to: "app", label: "GET /x7Kp" },
+    { from: "app", to: "db", label: "look up" },
+  ]}
+  groups={[{ label: "One server", nodes: ["app", "db"] }]}
+/>
+
+That's a perfectly good design for a few thousand users. The rest of the course is about what you change, and why,
+as Snip gets more users, more data and stricter promises to keep.
+
+## What changes as a system grows
+
+Small systems and large ones fail in different ways. As Snip grows, four things change:
+
+| What grows | What it forces you to think about |
+| --- | --- |
+| **Traffic** | One machine can't serve every request, so you need more machines and a way to spread work across them. |
+| **Data** | It no longer fits on one disk, or one database can't keep up, so you split it or copy it. |
+| **Failures** | With hundreds of machines, something is always broken. The design has to keep working anyway. |
+| **People** | Many teams work on the system at once, so its parts need clear boundaries and contracts. |
+
+None of these are problems on day one. A good designer adds each piece of machinery when a real need appears, and
+can say what that need is. You'll see this in <L id="01.08" />.
+
+## What interviews test
+
+A system design interview is usually 45 to 60 minutes. You get a vague prompt ("design a link shortener") and a
+whiteboard. There's no single right answer, and the interviewer knows that. They're watching how you think:
+
+| They're listening for | What it looks like |
+| --- | --- |
+| **Clarifying the problem** | You ask what the system must do and how big it is before drawing anything. |
+| **A design that works** | Your boxes and arrows actually serve the main use cases, end to end. |
+| **Depth where it matters** | You can go into detail on the hard parts: the data model, the busiest path, what breaks first. |
+| **Trade-offs** | You say what each choice costs, not just what it buys, and why it fits these requirements. |
+| **Communication** | You think out loud, keep the interviewer with you, and adjust when they push back. |
+
+The bar rises with seniority. A junior candidate is expected to reach a working design with some guidance; a senior
+one is expected to drive the conversation and pick the deep dives themselves. Every design lesson in this course ends
+with what's expected at each level.
+
+<Quiz
+  question="Two candidates design the same system. One names more technologies (Kafka, Cassandra, Kubernetes). The other uses fewer parts but explains why each is there and what it costs. Who usually does better?"
+  options={[
+    { text: "The first: naming the right tools shows experience", why: "Tool names without reasons are a red flag. Interviewers will ask why each piece is there, and 'because big companies use it' isn't an answer." },
+    { text: "The second: reasons and trade-offs are what's being assessed", correct: true, why: "The interview measures judgement. A simple design with clear reasoning beats a complicated one you can't defend." },
+    { text: "It doesn't matter as long as the final diagram is correct", why: "There's no single correct diagram. The reasoning that got you there is most of the signal." },
+  ]}
+/>
+
+## How this course is built
+
+The course follows the way people actually get good at this:
+
+1. **Part 1** gives you the approach: requirements, the numbers to know, estimation, trade-offs and one framework
+   you'll use for every design.
+2. **Part 2** teaches the building blocks one at a time: <Term t="cache">caches</Term>, queues, replication, <Term t="sharding">sharding</Term> and the rest. Each
+   starts from a system that breaks without it and ends with real companies that use it.
+3. **Part 3** applies the framework to 22 classic designs. You try each one yourself first, then compare.
+4. **Part 4** reads real case studies from the companies' own write-ups.
+
+Snip runs through all of it, picking up a cache, a <Term t="load-balancer">load balancer</Term>, a <Term t="message-queue">queue</Term> and more as each one becomes necessary.
+
+<Mistakes>
+  <ul>
+    <li>**Starting to draw before asking questions.** "Design Twitter" could mean the timeline, search, or direct messages. Pin down what matters first (<L id="01.02" />).</li>
+    <li>**Designing for Google's scale by default.** If the numbers say one database is enough, adding ten machines is a worse design, not a better one.</li>
+    <li>**Going quiet.** The interviewer can only credit what they hear. Narrate your reasoning, including the options you rejected.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>System design decides which parts a system has, where data lives and how parts talk.</li>
+    <li>Growth in traffic, data, failures and people is what forces design changes.</li>
+    <li>Interviews assess judgement: clarifying, a working design, depth, trade-offs and communication.</li>
+    <li>Snip, a link shortener, is the system we'll grow across the course.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you approach a system design question you've never seen before?", level: "Junior", frequency: 4, importance: "Must-know", kind: "Concept" }}
+  followUps={["How do you decide where to go deep?", "What do you do when the interviewer disagrees with a choice?"]}
+>
+  <p>I start by clarifying: which features matter most, roughly how many users and how much data, and which qualities matter (speed, availability, consistency). I write those down. Then I do quick estimates only where they'll change a decision, sketch the data and API, and draw a simple design that serves the main use cases end to end.</p>
+  <p>Once that works, I pick the riskiest or busiest parts and go deep on them, comparing options and saying what each costs. I finish by naming the bottlenecks and failure points I'd watch, and how the design would grow.</p>
+</InterviewCard>

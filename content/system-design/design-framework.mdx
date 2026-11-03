@@ -1,0 +1,174 @@
+export const meta = {
+  summary: "One six-step framework for any design question, with what to produce at each step and how long to spend on it.",
+  uses: ["01.02", "01.03", "01.05", "01.06"],
+  usedIn: ["02.01"],
+};
+
+<BeforeYouStart>
+  This lesson ties together <L id="01.02" />, <L id="01.05" /> and <L id="01.06" />. Read those first if you haven't.
+</BeforeYouStart>
+
+## Why a framework
+
+Open-ended questions are easy to get lost in. You go deep on the database before you've decided what the <Term t="api">API</Term> is, or
+run out of time before anyone has seen a working design. A framework is a fixed order of steps that keeps you
+moving, makes sure you cover the basics, and leaves time for the interesting parts.
+
+Every design lesson in this course uses the same six steps, so by the end of Part 3 they'll be habit.
+
+<Analogy>
+  **A pilot's checklist.** Experienced pilots still run through the same checklist before every flight. It isn't because they'd forget how to fly; it's so that their attention is free for the things that are actually different about today's flight.
+</Analogy>
+
+## The six steps
+
+<Flow
+  title="The design framework (about 45 minutes)"
+  steps={[
+    { label: "Requirements", detail: "~5 min. Core features, scale, key qualities." },
+    { label: "Estimates", detail: "~2–5 min. Only those that change a decision." },
+    { label: "Entities & API", detail: "~5 min. The data and the calls." },
+    { label: "High-level design", detail: "~10–15 min. Boxes and arrows that work end to end." },
+    { label: "Deep dives", detail: "~10–15 min. The hardest or busiest parts." },
+    { label: "Wrap-up", detail: "~3–5 min. Bottlenecks, failures, growth." },
+  ]}
+/>
+
+The times are a guide, not a rule. If the interviewer wants to spend twenty minutes on one deep dive, follow them.
+
+## 1. Requirements
+
+Write down three or so core features, an out-of-scope list, and the non-functional requirements that matter, with
+numbers (<L id="01.02" />). For Snip: create a short link, <Term t="redirect">redirect</Term>, see click counts; 10M links a month, 100 reads per
+write; fast, always-available redirects; never lose a link.
+
+## 2. Estimates
+
+Do the few calculations whose answers change the design (<L id="01.05" />). For Snip: about 1,000 redirects a second at
+peak and 300 GB over five years. Then say what it means: "<Term t="read-heavy">read-heavy</Term>, and it fits on one database".
+
+## 3. Core entities and API
+
+Name the main things the system stores, then the calls clients make. Keep it short; this is the contract the rest of
+the design has to satisfy.
+
+```text
+Link   { code, long_url, owner_id, created_at }
+Click  { code, at, country, referrer }
+
+POST /links          { long_url }   →  201 { code, short_url }
+GET  /{code}                        →  302, Location: long_url
+GET  /links/{code}/stats            →  200 { clicks, by_day }
+```
+
+## 4. High-level design
+
+Draw the simplest set of components that serves every core requirement, and walk one request through it to prove it
+works. Build it one requirement at a time: here's Snip's redirect path, the one that matters most.
+
+<Arch
+  title="Snip: high-level design"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+    { id: "lb", label: "Load balancer", kind: "lb", x: 1, y: 1 },
+    { id: "api", label: "Snip API", kind: "service", sub: "2+ instances", x: 2, y: 1 },
+    { id: "cache", label: "Cache", kind: "cache", sub: "code → URL", x: 3, y: 0 },
+    { id: "db", label: "Database", kind: "db", sub: "links", x: 3, y: 1 },
+    { id: "queue", label: "Click queue", kind: "queue", x: 2, y: 2 },
+    { id: "worker", label: "Stats worker", kind: "worker", x: 3, y: 2 },
+  ]}
+  edges={[
+    { from: "user", to: "lb" },
+    { from: "lb", to: "api" },
+    { from: "api", to: "cache", label: "1st" },
+    { from: "api", to: "db", label: "on miss" },
+    { from: "api", to: "queue", label: "click", dashed: true },
+    { from: "queue", to: "worker" },
+    { from: "worker", to: "db", label: "counts" },
+  ]}
+  steps={[
+    { caption: "A redirect arrives at the load balancer, which picks one of the API instances.", edges: ["user>lb", "lb>api"] },
+    { caption: "The API looks the code up in the cache. With 100 reads per write, most lookups end here.", edges: ["api>cache"] },
+    { caption: "On a cache miss it reads the database, and puts the answer in the cache for next time.", edges: ["api>db"] },
+    { caption: "It drops a click event on a queue instead of updating counts itself, so the redirect stays fast.", edges: ["api>queue"] },
+    { caption: "A worker reads clicks from the queue and updates the counts. They can lag a little, which the requirements allow.", edges: ["queue>worker", "worker>db"] },
+  ]}
+  caption="Each box is there because of a requirement: the cache for read-heavy traffic, the queue so counting never slows redirects, two API instances so one failure doesn't take redirects down."
+/>
+
+You'll learn each of these components in Part 2. For now, notice that every one is justified by something in steps 1
+and 2. If you can't say which requirement a box serves, it probably shouldn't be there.
+
+## 5. Deep dives
+
+Pick the two or three parts where the design is hardest, busiest or riskiest, and go into detail: compare options,
+name what each costs (<L id="01.06" />), and choose. For Snip, good candidates are:
+
+- **How short codes are made** so they're short, unique and hard to guess.
+- **Keeping the redirect path fast and available**, including what happens when the <Term t="cache">cache</Term> or database fails.
+- **Counting clicks accurately** without slowing down redirects.
+
+At senior levels, you're expected to choose these yourself. If you're not sure what the interviewer wants, ask.
+
+## 6. Wrap-up
+
+Finish by stepping back: where's the bottleneck now, what fails first, and how would the design change at ten times
+the traffic? This shows you see the design as something that keeps evolving, not a finished drawing.
+
+<Quiz
+  question="You're 10 minutes into a 45-minute interview and have a clear set of requirements. The interviewer hasn't asked about any particular area. What's the best next move?"
+  options={[
+    { text: "Start a deep dive on the database schema and indexes", why: "Too early. Without a working end-to-end design, a deep dive can end up on a part that doesn't matter." },
+    { text: "Sketch the entities and API, then a simple high-level design that works end to end", correct: true, why: "Get something that works first, then deepen it. That guarantees a complete answer even if time runs short." },
+    { text: "List every technology you might use", why: "Lists of tools without a design or reasons don't tell the interviewer anything about your judgement." },
+  ]}
+/>
+
+## Try it
+
+<DesignIt
+  id="sd-01-07-pastebin"
+  minutes={15}
+  levels={["junior"]}
+  patterns={["framework", "read-heavy"]}
+  rubric={[
+    "Requirements: create and read a paste, with out-of-scope items named",
+    "An estimate that changes a decision (for example: paste sizes mean the text belongs in object storage, not the database)",
+    "Entities and an API with at least create and read calls",
+    "A high-level design that serves a read end to end",
+    "One deep dive chosen and justified (for example: how paste IDs are generated, or caching popular pastes)",
+    "A wrap-up naming the first bottleneck",
+  ]}
+>
+  Run all six steps on a Pastebin: users paste text (up to 1 MB) and get a link anyone can open to read it. Assume a
+  million new pastes a day and 10 reads per paste. Keep each step short; the goal is to practise the order.
+</DesignIt>
+
+<Mistakes>
+  <ul>
+    <li>**Skipping step 4 to get to the interesting parts.** A deep dive on a design that doesn't work end to end is worth little.</li>
+    <li>**Treating the framework as a script.** It's a default order. If the interviewer steers you, go with them and come back to the steps you skipped if there's time.</li>
+    <li>**Boxes without reasons.** Every component should trace back to a requirement or an estimate.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Requirements → estimates → entities and API → high-level design → deep dives → wrap-up.</li>
+    <li>Get a working end-to-end design before going deep.</li>
+    <li>Every box should trace back to a requirement or an estimate.</li>
+    <li>Deep dives are where you show trade-off reasoning; pick the hardest or busiest parts.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Walk me through how you'd structure a 45-minute system design interview.", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How do you choose what to deep dive on?", "What do you do if you're running out of time?"]}
+>
+  <p>About five minutes on requirements: core features, scale and the qualities that matter, with numbers. A few minutes of estimates, only where they change a decision. Then the core entities and API, so the contract is clear. Then a simple high-level design, walked through end to end with a real request.</p>
+  <p>With a working design on the board, I spend the bulk of the remaining time on two or three deep dives, the hardest or busiest parts, comparing options and their costs. I save the last few minutes for bottlenecks, failure modes and how the design grows.</p>
+</InterviewCard>

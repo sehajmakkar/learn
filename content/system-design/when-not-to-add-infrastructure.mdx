@@ -1,0 +1,152 @@
+export const meta = {
+  summary: "Every component has a price. How to tell when a system needs another piece, and when the simple design is the better one.",
+  uses: ["01.05", "01.06"],
+  usedIn: ["02.01"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.05" />. This lesson leans on the Snip estimate from there: about 10 writes and 1,000 reads a second at
+  peak, and 300 GB of data.
+</BeforeYouStart>
+
+## The cost of one more box
+
+It's tempting to design like the big companies: a <Term t="message-queue">message queue</Term> here, a search cluster there, a separate service for
+every feature. Each piece is real and useful at the right scale. But every component you add brings costs with it:
+
+- **Another thing to fail.** Parts in a chain multiply their failure chances (<L id="01.03" />).
+- **Another hop.** Each network call adds about half a millisecond, plus its own slow tail.
+- **Another copy of data** that can drift out of step with the original.
+- **Another thing to run:** deploy, monitor, upgrade, secure, and understand at 3 a.m. when it breaks.
+- **Money.** Machines, managed services and the people's time to look after them.
+
+The best design is usually the **simplest one that meets the requirements, with a clear idea of what you'd add
+next and when.**
+
+<Analogy>
+  **Kitchen gadgets.** A bread maker, a pasta machine and a sous-vide cooker are all great, if you make bread, pasta and sous-vide every week. If you don't, they take up the counter, need cleaning, and a good knife and one pan would have done the job.
+</Analogy>
+
+## Snip, over-built and right-sized
+
+Here's a Snip design that looks impressive, and what's left when every component has to justify itself against the
+estimate:
+
+<Evolve
+  title="Snip: remove what the numbers don't need"
+  change="Keep only what a requirement or estimate calls for"
+  before={{
+    nodes: [
+      { id: "lb", label: "Load balancer", kind: "lb", x: 0, y: 1 },
+      { id: "api", label: "Snip API", kind: "service", x: 1, y: 1 },
+      { id: "cache", label: "Redis cluster", kind: "cache", sub: "6 nodes", x: 2, y: 0 },
+      { id: "kafka", label: "Kafka", kind: "queue", sub: "for every write", x: 1, y: 2 },
+      { id: "cass", label: "Cassandra", kind: "db", sub: "sharded", x: 2, y: 1 },
+      { id: "es", label: "Elasticsearch", kind: "store", sub: "link search", x: 2, y: 2 },
+    ],
+    edges: [
+      { from: "lb", to: "api" },
+      { from: "api", to: "cache" },
+      { from: "api", to: "kafka", label: "writes" },
+      { from: "kafka", to: "cass" },
+      { from: "kafka", to: "es" },
+      { from: "api", to: "cass", label: "reads" },
+    ],
+  }}
+  after={{
+    nodes: [
+      { id: "lb", label: "Load balancer", kind: "lb", x: 0, y: 1 },
+      { id: "api", label: "Snip API", kind: "service", sub: "2 instances", x: 1, y: 1 },
+      { id: "pg", label: "Postgres", kind: "db", sub: "primary + replica", x: 2, y: 1 },
+    ],
+    edges: [
+      { from: "lb", to: "api" },
+      { from: "api", to: "pg", label: "reads, writes" },
+    ],
+  }}
+  caption="At 10 writes and 1,000 reads a second, one Postgres server with a standby copy handles everything. The cache, queue and sharding all come back in Module 02, each at the moment Snip's numbers call for it."
+/>
+
+Each removed piece had a cost and no requirement behind it:
+
+- **A queue for writes** at 10 writes a second adds a hop and delays a link becoming usable, which breaks the
+  "works immediately" requirement.
+- **A <Term t="sharding">sharded</Term> database** for 300 GB splits data that fits comfortably on one machine, and makes every query that spans
+  shards harder.
+- **A search cluster** serves a feature (searching links) that isn't in the requirements at all.
+- **A six-node <Term t="cache">cache</Term>** for 1,000 reads a second solves a problem the database doesn't have yet.
+
+What stays is what a requirement asks for: a second API instance and a <Term t="replica">standby</Term> database copy, because <Term t="redirect">redirects</Term> must
+keep working when one machine fails.
+
+## When you do need it
+
+Add a component when you can point to one of these:
+
+- **A requirement:** "redirects must survive a server failure" calls for a second copy.
+- **An estimate:** "35,000 reads a second" is past what one database comfortably serves, so add a cache or replicas.
+- **A measurement:** in a real system, a graph showing the database at 90% CPU at peak beats any guess.
+
+And before reaching for a new system, check what you already run can do the job. Postgres alone can act as a job queue
+(`SELECT … FOR UPDATE SKIP LOCKED`), a full-text search engine and a key-value store well enough for many products.
+Using one well-understood tool for three jobs often beats running three tools.
+
+## In an interview
+
+Interviewers usually want to see you scale a design, so "one server is enough" can't be your whole answer. Show both
+halves: say what's enough for the stated numbers, then say what you'd add and **at what point**. "At this scale one
+Postgres primary handles the writes; past a few thousand reads a second I'd add a cache in front of it" shows you know
+both the tool and when it's needed.
+
+<SeenInProduction>
+  <Seen
+    company="Stack Overflow"
+    system="The whole site"
+    year={2016}
+    href="https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/"
+    source="Stack Overflow: The Architecture – 2016 Edition"
+    found="A very large site ran on a small, carefully tuned set of servers; they scaled up and tuned before they scaled out."
+  >
+    On one day in February 2016, Stack Overflow's <Term t="load-balancer">load balancers</Term> handled over 209 million HTTP requests. The sites ran
+    on 4 Microsoft SQL Servers, 11 IIS web servers, 2 Redis servers, 3 tag-engine servers, 3 Elasticsearch servers
+    and 4 HAProxy load balancers, with Redis instances below 2% CPU.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip creates about 10 links a second at peak. A teammate suggests putting a message queue in front of the database for all writes 'so it scales'. What's the best response?"
+  options={[
+    { text: "Agree: queues always make writes more scalable", why: "Queues help when writes are bursty or slow to process. At 10 a second the database isn't the problem, and the queue adds a delay before a new link works." },
+    { text: "Push back: at 10 writes a second the database copes easily, and a queue would delay new links, breaking a requirement", correct: true, why: "Tie the decision to the numbers and the requirements. Say when you would add one: if writes grew by orders of magnitude, or became slow to process." },
+    { text: "Agree, and add a second queue for reads", why: "Reads need an answer straight away, so a queue doesn't fit them, and nothing in the numbers calls for it." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Designing for the scale you hope for.** Build for the numbers you have, with a plan for the next step.</li>
+    <li>**Adding a tool for each feature.** Check whether what you already run can do it first.</li>
+    <li>**Saying "it's simple" without saying when it stops being enough.** Name the threshold where you'd add the next piece.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Every component adds failure modes, latency, data copies, work and cost.</li>
+    <li>Add a piece when a requirement, estimate or measurement calls for it.</li>
+    <li>Snip at 10M links a month needs two API instances and a database with a standby, and little else.</li>
+    <li>In interviews, state what's enough now and the point at which you'd add more.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "When would you not add a cache, queue or extra service to a design?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["How would you know when it's time to add a cache?", "What could Postgres do for you before you add a dedicated queue or search engine?"]}
+>
+  <p>When no requirement, estimate or measurement calls for it. Each component adds a network hop, a new way to fail, another copy of data to keep in step, and something to operate. If the numbers fit one database comfortably, adding a cache or queue makes the system slower to build, harder to run and often less reliable.</p>
+  <p>I'd start with the simplest design that meets the requirements, say what metric would trigger the next step (for example, database CPU or read latency at peak), and add the component then.</p>
+</InterviewCard>

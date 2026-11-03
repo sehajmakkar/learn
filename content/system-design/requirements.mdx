@@ -1,0 +1,132 @@
+export const meta = {
+  summary: "Turning a vague prompt into what the system must do, how well it must do it, and what's out of scope.",
+  uses: ["01.01"],
+  usedIn: ["01.03", "01.05", "01.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.01" /> first. You'll write requirements for Snip, the link shortener introduced there.
+</BeforeYouStart>
+
+## Why requirements come first
+
+"Design a link shortener" leaves almost everything open. Can users pick their own short codes? Do links expire? Does
+anyone need click statistics? Are we serving a hundred people or a hundred million? Each answer changes the design.
+
+Requirements turn the vague prompt into a short list you can design against. They come in two kinds:
+
+- **Functional requirements** say **what** the system does: the features, written as things a user can do.
+- **Non-functional requirements** say **how well** it does them: how fast, how available, how consistent, how much
+  data, at what cost.
+
+<Analogy>
+  **Ordering a house.** "Three bedrooms, a kitchen and a garden" is the functional part. "Warm in winter, built in six months, under budget, still standing in an earthquake" is the non-functional part. Two houses with the same rooms can be completely different buildings because of the second list.
+</Analogy>
+
+## Functional requirements
+
+Write them as short "users can…" sentences, then pick the few that matter most. In an interview, three is plenty:
+the rest go on an **out of scope** list so everyone agrees not to design them.
+
+For Snip:
+
+| Users can… | Priority |
+| --- | --- |
+| Create a short link from a long URL | Core |
+| Be redirected to the long URL when they open a short link | Core |
+| See how many times each of their links was opened | Core |
+| Choose a custom short code (`snip.link/launch`) | Nice to have |
+| Set an expiry date on a link | Out of scope |
+| Edit where a link points after creating it | Out of scope |
+
+Notice that "out of scope" isn't "never". It's "not in this design". Saying so out loud stops you designing features
+nobody asked for.
+
+## Non-functional requirements
+
+These are where most of the design comes from, and they're only useful when they're **specific**. "Fast" isn't a
+requirement; "a <Term t="redirect">redirect</Term> takes under 50 ms at the server for 99% of requests" is. Here are the usual ones:
+
+| Quality | Question to ask | Snip's answer |
+| --- | --- | --- |
+| **Scale** | How many users, requests and records? | 10 million new links a month; about 100 redirects per link created. |
+| **<Term t="latency">Latency</Term>** | How fast must each request be? | Redirects under 50 ms at the server for 99% of requests. Creating a link can be slower. |
+| **<Term t="availability">Availability</Term>** | How much downtime is acceptable? | Redirects should almost never fail: a broken short link is a broken link on someone else's site. |
+| **Consistency** | Must every reader see the latest write at once? | A new link must work the moment it's created. Click counts can lag by a minute. |
+| **<Term t="durability">Durability</Term>** | Can we ever lose data? | Never lose a link once we've handed out its short code. |
+
+Two things to notice. First, the numbers lead straight to design decisions: 100 reads for every write means Snip is
+**read-heavy**, so you'll design the redirect path first and hardest. Second, different features get different
+answers. Redirects need to be fast and always up; the stats page can be slower and a little out of date. That
+difference lets you build them differently.
+
+<Quiz
+  question="Which of these is a non-functional requirement?"
+  options={[
+    { text: "Users can choose a custom short code", why: "That's a feature a user can do, so it's functional." },
+    { text: "Users can see click counts for their links", why: "Also a feature: something the system does for the user." },
+    { text: "Click counts may be up to a minute behind", correct: true, why: "It describes how well the stats feature works (its consistency), not what it does. That makes it non-functional." },
+    { text: "Users can delete their links", why: "A feature, so functional." },
+  ]}
+/>
+
+## Questions worth asking
+
+When the prompt is vague, these questions cover most of what you need. You won't ask all of them every time; pick the
+ones whose answers would change your design.
+
+- **Users:** Who uses it? Roughly how many each day? Any very large users?
+- **Reads and writes:** What's the ratio? Which operation is most frequent?
+- **Data:** How big is each record? How long do we keep it? Does it ever change?
+- **Latency:** Which requests are user-facing and need to be fast?
+- **Consistency:** If one user writes, how soon must others see it?
+- **Availability:** What happens to users if this is down for a minute? For an hour?
+- **Geography:** Are users in one region or worldwide?
+
+If the interviewer says "you decide", make a reasonable assumption, say it out loud, and write it down. That's a
+good answer, not a dodge.
+
+<DesignIt
+  id="sd-01-02-pastebin"
+  minutes={5}
+  patterns={["requirements"]}
+  rubric={[
+    "Three or fewer core functional requirements (create a paste, read a paste, maybe expiry)",
+    "An explicit out-of-scope list",
+    "A number for scale: pastes per day and reads per paste",
+    "A latency target for reading a paste, written as a percentile",
+    "Different needs for different features (reads fast and available; analytics, if any, can lag)",
+  ]}
+>
+  Write the requirements for a Pastebin: users paste text and get a link anyone can open to read it. Write the
+  functional requirements, an out-of-scope list, and at least three non-functional requirements with numbers.
+</DesignIt>
+
+<Mistakes>
+  <ul>
+    <li>**Unquantified qualities.** "Highly available and scalable" says nothing. Put a number on it, or say which feature it applies to.</li>
+    <li>**Too many features.** Ten functional requirements means ten half-designed features. Pick the core few and park the rest.</li>
+    <li>**One set of qualities for everything.** The hot path and the admin page don't need the same latency or availability.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Functional requirements: what users can do. Keep three or so, and list what's out of scope.</li>
+    <li>Non-functional requirements: how well. Make each one specific and measurable.</li>
+    <li>Ratios like reads per write tell you where to focus the design.</li>
+    <li>Different features can have different qualities, and that's a design opportunity.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between functional and non-functional requirements? Give an example of each for a URL shortener.", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Which non-functional requirement would most change your design?", "How would the design change if links expired after a day?"]}
+>
+  <p>Functional requirements describe what the system does: users can create a short link, and opening it redirects to the long URL. Non-functional requirements describe how well it does it: redirects return in under 50 ms for 99% of requests, the redirect path is available 99.99% of the time, and a link is never lost once created.</p>
+  <p>The non-functional ones drive most of the architecture. A 100-to-1 read-to-write ratio and a tight latency target are what justify putting a cache in front of the database.</p>
+</InterviewCard>

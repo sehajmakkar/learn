@@ -1,0 +1,157 @@
+export const meta = {
+  summary: "The five qualities every design is judged on, what each one means precisely, and how to put a number on it.",
+  uses: ["01.02"],
+  usedIn: ["01.06", "01.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.02" />. This lesson takes the non-functional requirements introduced there and makes each one
+  precise.
+</BeforeYouStart>
+
+## Five words that need precise meanings
+
+People say "the system should be reliable and fast" and mean five different things. Separating them matters, because
+they're bought in different ways and they pull against each other:
+
+| Quality | The question it answers |
+| --- | --- |
+| **Availability** | Does the system answer when asked? |
+| **Durability** | Once it says "saved", is the data still there later? |
+| **Consistency** | Does everyone see the same, latest data? |
+| **Latency** | How long does one request take? |
+| **Cost** | What does it take, in money and effort, to run? |
+
+## Availability
+
+Availability is the share of time (or of requests) the system works. It's quoted in **nines**: 99.9% is "three
+nines". Each extra nine cuts the downtime you're allowed by ten:
+
+| Availability | Downtime per year | Per month | Per day |
+| --- | --- | --- | --- |
+| 99% | 3.65 days | 7.2 hours | 14.4 minutes |
+| 99.9% | 8.76 hours | 43.2 minutes | 1.44 minutes |
+| 99.99% | 52.6 minutes | 4.32 minutes | 8.64 seconds |
+| 99.999% | 5.26 minutes | 25.9 seconds | 0.87 seconds |
+
+Figures from the availability table in Google's <a href="https://sre.google/sre-book/availability-table/">Site Reliability Engineering</a> book.
+
+Two pieces of arithmetic come up again and again:
+
+- **Parts in a chain multiply.** If a request needs the app *and* the database, and each is up 99.9% of the time,
+  the request succeeds about 99.9% × 99.9% ≈ **99.8%** of the time. Every hop you add lowers availability.
+- **Spare copies multiply the failure chance.** If either of two independent copies can serve a request, and each is
+  down 1% of the time, both are down only 1% × 1% = 0.01% of the time: **99.99%** available. Redundancy is how you
+  buy nines, as long as the copies don't fail together.
+
+<Analogy>
+  **Christmas lights.** In an old string wired in series, one dead bulb takes out the whole string: more bulbs, more ways to fail. Wire them in parallel and one dead bulb leaves the rest shining. A request path through many services is the series string; <Term t="replica">replicas</Term> behind a <Term t="load-balancer">load balancer</Term> are the parallel one.
+</Analogy>
+
+## Durability
+
+Durability is the promise that data you've accepted won't be lost. It's different from availability: a system can be
+down for an hour and lose nothing (low availability, high durability), or stay up while quietly losing writes (the
+reverse, and much worse).
+
+Durability is bought with copies in separate places: several disks, several machines, several buildings. Amazon S3
+is designed for 99.999999999% ("eleven nines") durability of objects over a year, but 99.99% availability: the
+data is almost never lost, though now and then you briefly can't reach it.
+
+## Consistency
+
+Consistency here means: after a write, do readers see it? Two broad answers:
+
+- **Strong consistency:** every read sees the latest write. Simple to reason about, but every copy has to agree
+  before you answer, which costs time and availability.
+- **Eventual consistency:** copies catch up after a short delay, so a read may briefly return old data. Faster and
+  more available, but your design has to tolerate stale reads.
+
+Most systems mix them, feature by feature. Snip needs a new link to work the moment it's created (the person who made
+it will click it straight away), but click counts can lag by a minute and nobody will notice.
+
+## Latency and throughput
+
+**Latency** is how long one request takes. **Throughput** is how many requests the system handles per second. They're
+related but different: a highway can carry thousands of cars an hour (throughput) while each car still takes twenty
+minutes to drive it (latency).
+
+Never describe latency with an average. Suppose 98 of 100 requests take 20 ms and 2 take 2 seconds. The average is
+about 60 ms, a number no request actually experienced. Use **percentiles** instead:
+
+- **p50** (the median): half of requests are faster than this. Here, 20 ms.
+- **p99**: 99% are faster than this. Here, 2 seconds. That's the slow tail, and at high traffic it's someone every
+  second.
+
+That's why Snip's requirement reads "under 50 ms at p99", not "fast on average". You'll see why the tail matters so
+much in <L id="03.12" />.
+
+## Cost
+
+Cost is money (machines, storage, bandwidth, managed services) and also effort: every extra component is something
+to deploy, monitor, upgrade and get paged for at 3 a.m. A design that meets every other requirement but needs a team of
+ten to run it may still be the wrong design.
+
+<Quiz
+  question="A request passes through a load balancer, an app server and a database. Each is 99.9% available, and all three are needed. Roughly how available is the request path?"
+  options={[
+    { text: "99.9%, the same as each part", why: "That would only be true if the parts always failed at exactly the same moments. Independent failures add up." },
+    { text: "About 99.7%", correct: true, why: "Parts in a chain multiply: 0.999 × 0.999 × 0.999 ≈ 0.997. Three hops at three nines leave you with roughly 26 hours of downtime a year instead of 8.76." },
+    { text: "About 99.999%, because there are three parts", why: "Three parts only raise availability when any one of them can serve the request (redundancy). Here all three are needed." },
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="S3 object storage"
+    year="current"
+    href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html"
+    source="Data protection in Amazon S3"
+    found="Durability and availability are separate promises: eleven nines for keeping your data, four for reaching it."
+  >
+    S3 Standard is designed for 99.999999999% durability and 99.99% availability of objects over a year, by storing
+    every object redundantly across multiple devices and facilities.
+  </Seen>
+  <Seen
+    company="Google"
+    system="Site Reliability Engineering"
+    year={2016}
+    href="https://sre.google/sre-book/embracing-risk/"
+    source="Embracing Risk (SRE book, chapter 3)"
+    found="100% isn't the goal. The gap between the target and 100% is a budget you spend on shipping changes."
+  >
+    Google sets an availability target for each service and treats the allowed failures as an **error budget** for a
+    quarter. While budget remains, teams release freely; when it runs out, they slow down and focus on reliability.
+  </Seen>
+</SeenInProduction>
+
+<Mistakes>
+  <ul>
+    <li>**Mixing up availability and durability.** "Our database is replicated, so it's highly available" might be true, or the replicas might all be in one building that loses power together.</li>
+    <li>**Quoting average latency.** Averages hide the slow requests users complain about. Use p50 and p99.</li>
+    <li>**Asking for five nines everywhere.** Each nine costs roughly ten times more effort. Spend it on the paths that need it.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Availability: does it answer? Measured in nines; chains multiply, redundancy helps.</li>
+    <li>Durability: is saved data still there? Bought with copies in separate places.</li>
+    <li>Consistency: do readers see the latest write? Strong or eventual, chosen per feature.</li>
+    <li>Latency is per request and quoted as percentiles; throughput is requests per second.</li>
+    <li>Cost includes the people who run it, not just the machines.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between availability and durability? Give an example where you'd have one without the other.", level: "Mid", frequency: 2, importance: "Must-know", kind: "Concept" }}
+  followUps={["How would you raise the availability of a service from 99.9% to 99.99%?", "What does an error budget let a team do?"]}
+>
+  <p>Availability is whether the system answers requests; durability is whether data it accepted is still there later. A database that's offline during a two-hour maintenance window but loses nothing has low availability and high durability. A cache-only service that stays up but drops writes when a node restarts has high availability and poor durability.</p>
+  <p>You buy availability with redundancy and fast failover, and durability with copies in independent places, written before you acknowledge the write.</p>
+</InterviewCard>
