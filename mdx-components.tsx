@@ -1,6 +1,6 @@
 import type { MDXComponents } from "mdx/types";
 import { Code, Terminal } from "@/components/lesson/code";
-import { Analogy, Aside, BeforeYouStart, Mistakes, Recap, Tripped } from "@/components/lesson/callouts";
+import { Analogy, Aside, BeforeYouStart, Mistakes, Recap } from "@/components/lesson/callouts";
 import { Term } from "@/components/lesson/term";
 import { Quiz } from "@/components/lesson/quiz";
 import { Checkpoint } from "@/components/lesson/checkpoint";
@@ -18,7 +18,6 @@ const components: MDXComponents = {
   BeforeYouStart,
   Mistakes,
   Recap,
-  Tripped,
   Quiz,
   Checkpoint,
   LayerCacheSteps,

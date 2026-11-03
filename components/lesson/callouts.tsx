@@ -48,16 +48,6 @@ export function Analogy({ children }: { children: ReactNode }) {
   );
 }
 
-/** Written by Sehaj after doing the lesson: what actually went wrong. */
-export function Tripped({ children }: { children: ReactNode }) {
-  return (
-    <aside className="not-prose relative my-10 -rotate-[0.4deg] border border-line bg-paper-2 px-5 pt-4 pb-5 shadow-[3px_3px_0_var(--line)]">
-      <p className="font-pen text-[1.5rem] leading-none text-accent-ink">what tripped me up</p>
-      <div className="mt-2 font-pen text-[1.35rem] leading-snug text-ink-2">{children}</div>
-    </aside>
-  );
-}
-
 export function Recap({ children }: { children: ReactNode }) {
   return (
     <aside className="not-prose my-8 bg-ink px-6 py-5 text-paper">
