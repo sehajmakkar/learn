@@ -4,7 +4,8 @@ import { siDocker } from "simple-icons";
 import { CreationHero } from "@/components/creation-hero";
 import { Dimension, HatchBand, PenNote, SectionLabel } from "@/components/blueprint";
 import { QuestionMeta } from "@/components/interview";
-import { interviewSample, modules, projectSteps, stats } from "@/lib/docker";
+import { modules, projectSteps, stats } from "@/lib/docker";
+import { bank, frequencyDots, SOURCE_COUNT } from "@/lib/interview-bank";
 
 export const metadata: Metadata = {
   title: "Docker, from first principles",
@@ -12,6 +13,8 @@ export const metadata: Metadata = {
 };
 
 const docker = { title: siDocker.title, hex: siDocker.hex, path: siDocker.path };
+
+const mostAsked = [...bank].sort((a, b) => b.seenIn.length - a.seenIn.length).slice(0, 5);
 
 export default function DockerPage() {
   return (
@@ -47,9 +50,9 @@ export default function DockerPage() {
             >
               See the curriculum
             </a>
-            <a href="#interview" className="ml-1 text-[0.9rem] text-muted underline decoration-line underline-offset-4 hover:text-ink">
+            <Link href="/docker/interview" className="ml-1 text-[0.9rem] text-muted underline decoration-line underline-offset-4 hover:text-ink">
               Interview bank
-            </a>
+            </Link>
           </div>
         </section>
 
@@ -142,16 +145,24 @@ export default function DockerPage() {
 
         <SectionLabel id="interview">Interview bank</SectionLabel>
         <section className="border-t border-line">
-          {interviewSample.map((q) => (
-            <div key={q.q} className="flex flex-col gap-2 border-b border-line-soft px-5 py-4 sm:px-6">
-              <QuestionMeta q={q} />
-              <p className="text-[0.98rem] text-ink">{q.q}</p>
-            </div>
+          {mostAsked.map((q) => (
+            <Link
+              key={q.id}
+              href={`/docker/interview#${q.id}`}
+              className="flex flex-col gap-2 border-b border-line-soft px-5 py-4 transition-colors hover:bg-paper-2 sm:px-6"
+            >
+              <QuestionMeta q={{ ...q, frequency: frequencyDots(q) as 1 | 2 | 3 | 4 }} freq={`${q.seenIn.length}/${SOURCE_COUNT} guides`} />
+              <p className="text-[0.98rem] text-ink">{q.q.replace(/`/g, "")}</p>
+            </Link>
           ))}
-          <p className="px-5 py-4 text-[0.82rem] text-muted sm:px-6">
-            Frequency is our own estimate from public interview write-ups. A question only says “asked at” a company when
-            we can link to the source.
-          </p>
+          <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4 sm:px-6">
+            <p className="text-[0.82rem] text-muted">
+              The most-asked questions across {SOURCE_COUNT} widely read Docker interview guides, with model answers.
+            </p>
+            <Link href="/docker/interview" className="inline-flex h-9 items-center bg-ink px-4 text-[0.88rem] text-paper hover:opacity-85">
+              Open all {bank.length} questions →
+            </Link>
+          </div>
         </section>
       </div>
     </>

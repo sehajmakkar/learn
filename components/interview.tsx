@@ -3,9 +3,9 @@
 import { useState, type ReactNode } from "react";
 import type { InterviewQ } from "@/lib/docker";
 
-export function FrequencyMeter({ value }: { value: number }) {
+export function FrequencyMeter({ value, title }: { value: number; title?: string }) {
   return (
-    <span className="inline-flex items-center gap-[3px]" title={`Asked often: ${value} of 4 (our estimate)`}>
+    <span className="inline-flex items-center gap-[3px]" title={title ?? `Asked often: ${value} of 4 (our estimate)`}>
       {[1, 2, 3, 4].map((i) => (
         <span key={i} className={`size-[7px] ${i <= value ? "bg-accent" : "border border-line"}`} />
       ))}
@@ -19,7 +19,10 @@ const levelDot: Record<InterviewQ["level"], string> = {
   Senior: "bg-danger",
 };
 
-export function QuestionMeta({ q }: { q: InterviewQ }) {
+type MetaFields = Pick<InterviewQ, "level" | "frequency" | "importance" | "kind">;
+
+/** Level, how often it's asked, importance and kind. `freq` replaces the "freq" label, e.g. "8/11 guides". */
+export function QuestionMeta({ q, freq, freqTitle }: { q: MetaFields; freq?: string; freqTitle?: string }) {
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 font-mono text-[0.68rem] tracking-[0.06em] text-muted uppercase">
       <span className="inline-flex items-center gap-1.5">
@@ -27,8 +30,8 @@ export function QuestionMeta({ q }: { q: InterviewQ }) {
         {q.level}
       </span>
       <span className="inline-flex items-center gap-1.5">
-        <FrequencyMeter value={q.frequency} />
-        freq
+        <FrequencyMeter value={q.frequency} title={freqTitle} />
+        {freq ?? "freq"}
       </span>
       <span className={q.importance === "Must-know" ? "text-accent-ink" : ""}>{q.importance}</span>
       <span>{q.kind}</span>

@@ -144,11 +144,3 @@ export type InterviewQ = {
   kind: "Concept" | "Scenario" | "Debugging" | "Design";
   lesson?: string;
 };
-
-export const interviewSample: InterviewQ[] = [
-  { q: "What is the difference between a container and a virtual machine?", level: "Junior", frequency: 4, importance: "Must-know", kind: "Concept", lesson: "01.02" },
-  { q: "Every code change re-runs npm install during the build. Why, and how do you fix it?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Debugging", lesson: "02.02" },
-  { q: "CMD vs ENTRYPOINT: when would you use both together?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept", lesson: "02.01" },
-  { q: "How do you keep secrets out of an image's layers?", level: "Senior", frequency: 2, importance: "Must-know", kind: "Scenario", lesson: "07.02" },
-  { q: "Two services on the same Compose network can't reach each other by name. Walk me through debugging it.", level: "Senior", frequency: 2, importance: "Good to know", kind: "Debugging", lesson: "05.04" },
-];

@@ -5,7 +5,7 @@ import { repo } from "@/lib/site";
 const nav = [
   { href: "/", label: "Library" },
   { href: "/docker", label: "Docker" },
-  { href: "/docker#interview", label: "Interview" },
+  { href: "/docker/interview", label: "Interview" },
 ];
 
 export function SiteHeader() {
