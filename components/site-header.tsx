@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { Search } from "@/components/search";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { publishedCourses } from "@/lib/courses";
 import { repo } from "@/lib/site";
@@ -23,18 +24,7 @@ export function SiteHeader() {
         </nav>
 
         <div className="ml-auto flex items-center gap-2">
-          <button
-            type="button"
-            className="hidden h-8 items-center gap-2 rounded-md border border-line px-2.5 text-[0.8rem] text-muted transition-colors hover:text-ink md:flex"
-            title="Search arrives with the content pipeline"
-          >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
-              <circle cx="11" cy="11" r="7" />
-              <path d="m20 20-3.5-3.5" />
-            </svg>
-            Search
-            <kbd className="rounded border border-line px-1 font-mono text-[0.65rem]">⌘K</kbd>
-          </button>
+          <Search />
           <a
             href={repo}
             className="grid size-8 place-items-center rounded-md text-muted transition-colors hover:text-ink"
