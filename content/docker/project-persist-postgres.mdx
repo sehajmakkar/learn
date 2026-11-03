@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  Project step 3. You have the notes API from step 2 (`docker-step-02`) and know volumes (<L id="04.02" />). The
+  Project step 3. You have the notes <Term t="api">API</Term> from step 2 (`docker-step-02`) and know <Term t="volume">volumes</Term> (<L id="04.02" />). The
   finished state is tagged `docker-step-03`.
 </BeforeYouStart>
 
@@ -27,7 +27,7 @@ Notes currently live in the API's memory, so every restart wipes them. Done mean
 
 Check out the reference (`git checkout docker-step-03`) or make these changes yourself in `project/docker/api`:
 
-- `pg`, the Postgres client, is now a runtime dependency (`npm install pg`, and `npm install -D @types/pg`). For the
+- `pg`, the <Term t="postgres">Postgres</Term> client, is now a runtime <Term t="dependency">dependency</Term> (`npm install pg`, and `npm install -D @types/pg`). For the
   first time, the final stage's `npm ci --omit=dev` installs something.
 - `DATABASE_URL` is required; without it the API exits 1 with a message saying so (<L id="03.03" />).
 - At startup it retries `SELECT 1` every 2 seconds, up to 15 times, then creates the `notes` table if it doesn't exist.
@@ -54,7 +54,7 @@ async function waitForDatabase(attempts = 15) {
 ## Step 1: a network and a volume
 
 The API reaches Postgres by container name, `notes-db`. That works on a **user-defined network**, which gives
-containers DNS names for each other. You'll learn how in <L id="05.02" />; for now, create one:
+containers <Term t="dns">DNS</Term> names for each other. You'll learn how in <L id="05.02" />; for now, create one:
 
 <Terminal>{`
 $ docker network create notes-net
@@ -178,10 +178,14 @@ Note the `-i` on the restore: it keeps stdin open so `psql` can read the file fr
   Your note goes here after you finish this step.
 </Tripped>
 
+<Analogy>
+  **A clean copy, not a photo of a busy desk.** Copying a running database's files is like photographing a desk while someone is halfway through filing papers: you might capture half a change. `pg_dump` asks the database itself to hand over a clean, consistent copy of every record.
+</Analogy>
+
 ## What's next
 
 Three long `docker run` commands with a network, a volume and a password typed twice is a lot to get right by hand.
-Module 05 explains the network you just used (<L id="05.02" />), and Module 06 replaces all of this with one Compose
+Module 05 explains the network you just used (<L id="05.02" />), and Module 06 replaces all of this with one <Term t="compose">Compose</Term>
 file (<L id="06.06" />).
 
 ## Interview questions

@@ -16,10 +16,14 @@ things set up around it:
 
 - **Namespaces** control what the process can **see**: its own process list, network, hostname and mount points.
 - **Cgroups** (control groups) control what it can **use**: how much memory and CPU, how many processes.
-- **A root filesystem**, the image, becomes its `/`.
+- **A root filesystem**: the <Term t="image">image</Term>'s files become the whole disk the process sees, starting at `/`.
 
-Docker also drops some privileges (Linux capabilities) and blocks risky system calls (seccomp), but namespaces and
-cgroups are the heart of it.
+Docker also takes away some of root's powers (Linux <Term t="capability">capabilities</Term>) and blocks a few risky requests to the
+kernel (<Term t="seccomp">seccomp</Term>), but namespaces and cgroups are the heart of it.
+
+<Analogy>
+  **An office with frosted glass and a budget.** Give an employee a private office with frosted-glass walls: they can only see what's inside their own room. That's a namespace. Then give them a fixed budget for electricity and supplies: that's a cgroup. They're still in the same building as everyone else (the same kernel). They just can't see the others, and can't use more than their share.
+</Analogy>
 
 ## Namespaces: a private view
 
@@ -28,11 +32,11 @@ Each namespace type wraps one part of the system. A process inside sees only wha
 | Namespace | Isolates | Inside the container you see… |
 | --- | --- | --- |
 | `pid` | process IDs | your app as PID 1, and only its own processes |
-| `net` | network interfaces, ports, routes | its own `eth0` and `localhost` |
+| `net` | network interfaces, <Term t="port">ports</Term>, routes | its own `eth0` and `localhost` |
 | `mnt` | mount points | the image's filesystem as `/` |
 | `uts` | hostname | a hostname of its own |
 | `ipc` | shared memory, message queues | only its own |
-| `user` | user and group IDs | root inside can map to a normal user outside |
+| `user` | user and group IDs | <Term t="root">root</Term> inside can map to a normal user outside |
 
 Docker gives each container its own `pid`, `net`, `mnt`, `uts` and `ipc` namespaces by default. User namespaces are
 opt-in, and are how Docker's rootless mode runs containers without root on the host.
@@ -103,8 +107,8 @@ $ docker exec capped cat /sys/fs/cgroup/memory.max
 the kernel uses. (That path is for cgroup v2, which current Linux distributions and
 Docker Desktop use.)
 
-When a container hits its memory limit and can't reclaim any, the kernel's **OOM killer** ends a process in it. If
-that's the main process, the container exits with code `137` (128 + signal 9, SIGKILL). Here's a Node one-liner that
+When a container hits its memory limit and can't reclaim any, the kernel's **<Term t="oom-killer">OOM killer</Term>** ends a process in it. If
+that's the main process, the container exits with code `137` (128 + <Term t="signal">signal</Term> 9, SIGKILL). Here's a Node one-liner that
 allocates memory forever, run with a 32 MB limit:
 
 <Terminal>{`
@@ -147,6 +151,10 @@ which puts a tiny init process in front of your app to forward signals.
 <Tripped>
   Your note goes here after this lesson.
 </Tripped>
+
+<Analogy>
+  **The person told to lock up.** At closing time, the building manager announces "we're closing" (SIGTERM). Most people react to that by default. PID 1 is the one person who's expected to handle the announcement personally. If it ignores it, security eventually comes and removes it by force (SIGKILL).
+</Analogy>
 
 ## Recap
 

@@ -11,8 +11,9 @@ export const meta = {
 
 ## The core idea
 
-Every container has its own network stack: its own interfaces, IP address, routing table and ports. Docker connects
-that private stack to the outside world with three pieces of ordinary Linux networking:
+Every container has its own network stack: its own network card, its own address, its own list of where to send
+traffic, and its own ports. In plain words, it behaves like a separate small computer plugged into a network. Docker
+connects that private network to the outside world with three pieces of ordinary Linux networking:
 
 <Flow
   title="How a container reaches the network"
@@ -24,6 +25,10 @@ that private stack to the outside world with three pieces of ordinary Linux netw
   ]}
   caption="On Docker Desktop all of this happens inside the Linux VM; the idea is the same."
 />
+
+<Analogy>
+  **An office phone system.** Each container is a desk with its own phone (`eth0`), plugged into the office switchboard (the bridge). Desks can call each other directly by extension number (IP address). Outside calls all leave through the building's one public number (NAT out), and reception forwards incoming calls for a published number to the right desk (NAT in). On the default bridge there's no staff directory, so you have to know the extension.
+</Analogy>
 
 ## The networks Docker gives you
 
@@ -72,7 +77,7 @@ $ docker run --rm alpine wget -qO- http://example.com | grep -o '<title>.*</titl
 <title>Example Domain</title>
 `}</Terminal>
 
-By IP it works; **by name it doesn't**. The default bridge has no DNS for container names. And IPs are handed out
+By IP it works; **by name it doesn't**. The default bridge has no <Term t="dns">DNS</Term> for container names. And IPs are handed out
 fresh every time a container starts, so hard-coding them breaks on the next restart. That's why real setups use
 user-defined networks (<L id="05.02" />).
 

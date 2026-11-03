@@ -5,21 +5,25 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You should have written a small Dockerfile and run `docker build` once (<L id="02.01" />). Any Docker
+  You should have written a small <Term t="dockerfile">Dockerfile</Term> and run `docker build` once (<L id="02.01" />). Any Docker
   Engine from 23.0 on, or a current Docker Desktop, uses BuildKit by default, which is what this lesson describes.
 </BeforeYouStart>
 
 ## The core idea
 
-An image isn't one big file. It's a stack of read-only **layers**, each holding the files one step of your Dockerfile
+An <Term t="image">image</Term> isn't one big file. It's a stack of read-only **layers**, each holding the files one step of your Dockerfile
 added or changed. When you rebuild, Docker reuses every step whose inputs haven't changed and only runs the rest.
 
 So fast builds come down to one habit: **put the things that change least at the top of the Dockerfile**. The rest of
 this lesson is why that works, and how to see it happen.
 
+<Analogy>
+  **Save points in a video game.** Every Dockerfile step is a save point. When you rebuild, Docker loads the last save point before anything changed and replays the level from there. Change something near the start and you replay almost everything; change something near the end and you're done in seconds. That's why the things that change least go at the top.
+</Analogy>
+
 ## Every step leaves a record
 
-Here's a typical first Dockerfile for a Node API:
+Here's a typical first Dockerfile for a Node <Term t="api">API</Term>:
 
 <Code lang="dockerfile" file="Dockerfile">{`
 FROM node:22-slim
@@ -48,7 +52,7 @@ a9ded8c2f9c7   Less than a second ago   CMD ["node" "src/index.js"]             
 `}</Terminal>
 
 Read it bottom to top: that's the order the layers stack. Lines from "5 days ago" come from `node:22-slim`. Of the
-layers you added, `npm ci` is by far the biggest (here, one dependency: Express), and it's the slow one to rebuild.
+layers you added, `npm ci` is by far the biggest (here, one <Term t="dependency">dependency</Term>: Express), and it's the slow one to rebuild.
 
 Layers are also shared. If ten images on your machine start `FROM node:22-slim`, those base layers are stored once,
 and `docker pull` only downloads layers you don't already have.
@@ -102,7 +106,7 @@ COPY . .
 CMD ["node", "src/index.js"]
 `}</Code>
 
-Now editing your code only invalidates the final `COPY`. Dependencies only reinstall when the lockfile changes, which is
+Now editing your code only invalidates the final `COPY`. Dependencies only reinstall when the <Term t="lockfile">lockfile</Term> changes, which is
 exactly when they should.
 
 The same rule works for any language: copy the dependency manifest (`requirements.txt`, `go.mod` and `go.sum`,
@@ -111,7 +115,7 @@ The same rule works for any language: copy the dependency manifest (`requirement
 <Aside title="Going further: cache mounts">
   Even with good ordering, changing one dependency re-downloads all of them. A cache mount keeps npm's download cache
   between builds without putting it in the image: `RUN --mount=type=cache,target=/root/.npm npm ci`. You'll use this
-  in 07.05 when builds move to CI.
+  in 07.05 when builds move to <Term t="ci">CI</Term>.
 </Aside>
 
 ## See it yourself

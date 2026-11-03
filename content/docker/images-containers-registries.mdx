@@ -13,21 +13,25 @@ export const meta = {
 
 Almost everything in Docker is one of three things:
 
-- An **image** is a read-only template: a stack of filesystem layers plus settings like which command to run.
+- An **image** is a read-only template: a stack of filesystem <Term t="layer">layers</Term> plus settings like which command to run.
 - A **container** is a running (or stopped) instance of an image, with a thin writable layer of its own on top.
-- A **registry** is a server that stores images so you can push and pull them, like Docker Hub or GitHub's GHCR.
+- A **registry** is a server that stores images so you can push and pull them, like Docker Hub or GitHub's <Term t="ghcr">GHCR</Term>.
 
 If you write code, a familiar comparison helps: an image is like a class and a container is like an object. You can
 create many containers from one image, and changing one container doesn't change the image or its siblings.
+
+<Analogy>
+  **A recipe, the cakes, and a recipe website.** An image is a recipe: fixed instructions and ingredients that never change. A container is a cake baked from it. You can bake many cakes, decorate each one differently, and eat one without affecting the recipe or the other cakes. A registry is the recipe website, where people publish recipes and anyone can download them.
+</Analogy>
 
 ## Images: layers plus settings
 
 An image has two parts:
 
-- **Layers**: read-only snapshots of files. Each step of a Dockerfile that changes files adds one (<L id="02.02" />).
-- **Config**: environment variables, the working directory, the default command, exposed ports.
+- **Layers**: read-only snapshots of files. Each step of a <Term t="dockerfile">Dockerfile</Term> that changes files adds one (<L id="02.02" />).
+- **Config**: <Term t="env-var">environment variables</Term>, the working directory, the default command, exposed <Term t="port">ports</Term>.
 
-Every image has a **digest**, a SHA-256 hash of its contents. When this lesson was written, `nginx:alpine` had the digest
+Every image has a **<Term t="digest">digest</Term>**, a SHA-256 hash of its contents. When this lesson was written, `nginx:alpine` had the digest
 `sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606`.
 Change one byte and the digest changes. That makes it the only name that always means exactly the same image.
 

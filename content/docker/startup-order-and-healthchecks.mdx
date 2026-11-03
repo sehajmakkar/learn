@@ -5,19 +5,23 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know Docker healthchecks (<L id="03.07" />) and the notes stack in Compose (<L id="06.02" />).
+  You know Docker healthchecks (<L id="03.07" />) and the notes stack in <Term t="compose">Compose</Term> (<L id="06.02" />).
 </BeforeYouStart>
 
 ## The core idea
 
-`depends_on` tells Compose to start one service before another. On its own, it only waits until the dependency's
+`depends_on` tells Compose to start one service before another. On its own, it only waits until the <Term t="dependency">dependency</Term>'s
 container has **started**, not until the program inside is ready. Add `condition: service_healthy` and a healthcheck,
 and Compose waits until the dependency reports **healthy**.
 
+<Analogy>
+  **Preheating the oven.** Plain `depends_on` is switching the oven on and putting the cake straight in. `condition: service_healthy` waits for the "ready" beep first. And just as an oven can still cut out halfway through baking, your app has to cope if the database disappears later on.
+</Analogy>
+
 ## Started is not ready
 
-Postgres takes a few seconds after its container starts before it accepts connections. With plain `depends_on`, the
-API can start in that gap and fail its first connection:
+<Term t="postgres">Postgres</Term> takes a few seconds after its container starts before it accepts connections. With plain `depends_on`, the
+<Term t="api">API</Term> can start in that gap and fail its first connection:
 
 <Code lang="yaml" file="not enough">{`
   api:

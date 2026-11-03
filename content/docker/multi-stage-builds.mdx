@@ -5,17 +5,21 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You can order a Dockerfile for the cache (<L id="02.02" />) and you have a `.dockerignore`
+  You can order a <Term t="dockerfile">Dockerfile</Term> for the <Term t="cache">cache</Term> (<L id="02.02" />) and you have a `.dockerignore`
   (<L id="02.03" />).
 </BeforeYouStart>
 
 ## The core idea
 
 Building software needs tools that running it doesn't: compilers, dev dependencies, test frameworks. If you build in
-the same image you ship, all of that ships too.
+the same <Term t="image">image</Term> you ship, all of that ships too.
 
 A **multi-stage build** has several `FROM` lines in one Dockerfile. Each starts a new stage. Earlier stages do the
 heavy work, and the final stage copies in only the results. Only the final stage becomes your image.
+
+<Analogy>
+  **A workshop and a showroom.** Furniture is made in a workshop full of saws, glue and sawdust. Customers only ever see the showroom, where the finished table stands alone. A multi-stage build works the same way: the build stage is the messy workshop with compilers and tools, and only the finished piece is carried into the clean final stage that ships.
+</Analogy>
 
 ## The problem, measured
 
@@ -62,7 +66,7 @@ CMD ["node", "dist/server.js"]
 What's new:
 
 - `FROM ... AS build` names a stage so other stages can refer to it.
-- `COPY --from=build /app/dist ./dist` copies files **out of another stage** instead of from the build context.
+- `COPY --from=build /app/dist ./dist` copies files **out of another stage** instead of from the <Term t="build-context">build context</Term>.
 - `npm ci --omit=dev` installs only runtime dependencies in the final stage. The notes API has none yet, so this
   installs nothing; it starts to matter once Postgres arrives in <L id="04.05" />.
 - `USER node` runs the app as the unprivileged `node` user that the official image provides.
@@ -119,7 +123,7 @@ gets pushed and pulled. Docker Desktop's newer image store shows both; older set
 
 ## Useful tricks
 
-**Build only one stage** with `--target`. Handy for debugging or for a test stage in CI:
+**Build only one stage** with `--target`. Handy for debugging or for a test stage in <Term t="ci">CI</Term>:
 
 <Terminal>{`
 $ docker build --target build -t notes-api:build-stage .
@@ -132,7 +136,7 @@ src
 tsconfig.json
 `}</Terminal>
 
-**Stages run in parallel when they can.** BuildKit works out which steps depend on which. In the build log for this
+**Stages run in parallel when they can.** <Term t="buildkit">BuildKit</Term> works out which steps depend on which. In the build log for this
 Dockerfile, the final stage's `npm ci --omit=dev` starts before the build stage finishes compiling, because it doesn't
 need anything from it:
 

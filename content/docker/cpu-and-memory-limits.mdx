@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know cgroups enforce limits (<L id="01.03" />) and what exit code 137 means (<L id="03.01" />).
+  You know cgroups enforce limits (<L id="01.03" />) and what <Term t="exit-code">exit code</Term> 137 means (<L id="03.01" />).
 </BeforeYouStart>
 
 ## The core idea
@@ -13,6 +13,10 @@ export const meta = {
 Without limits, a container can use all of the host's memory and CPU. One leaking process then slows or kills
 everything else on the server. Limits are set per container with `docker run` flags, and the kernel enforces them
 through cgroups. The two that matter most behave very differently: **memory is a hard wall, CPU is a throttle**.
+
+<Analogy>
+  **A glass and a speed limit.** A memory limit is a glass: pour past the brim and it overflows, with no slowing down first (the OOM kill). A CPU limit is a speed limit: drive as far as you like, just no faster than allowed. You arrive later, but you arrive.
+</Analogy>
 
 ## Memory: a hard wall
 

@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You've made the notes API configurable (<L id="03.03" />) and know what restart policies react to
+  You've made the notes API configurable (<L id="03.03" />) and know what <Term t="restart-policy">restart policies</Term> react to
   (<L id="03.05" />). This lesson finishes project step 2, tagged `docker-step-02`.
 </BeforeYouStart>
 
@@ -13,7 +13,11 @@ export const meta = {
 
 Docker knows whether a container's process is **running**. It has no idea whether the app inside is **working**: it
 could be deadlocked, out of database connections, or returning 500 for everything. A **healthcheck** is a command
-Docker runs inside the container on a schedule. Exit code 0 means healthy, 1 means unhealthy.
+Docker runs inside the container on a schedule. <Term t="exit-code">Exit code</Term> 0 means healthy, 1 means unhealthy.
+
+<Analogy>
+  **Lights on, nobody at the counter.** A shop can have its lights on and its door unlocked while nobody is at the counter. "Running" only tells you the lights are on. A healthcheck is someone walking in every 10 seconds and asking for help. If nobody answers three times in a row, the shop is marked unhealthy.
+</Analogy>
 
 ## Add one to the notes API
 
@@ -36,7 +40,7 @@ CMD ["node", "dist/server.js"]
 | `--retries=3` | three failures in a row before it's marked unhealthy |
 
 Calling `127.0.0.1` is right here: the check runs **inside** the container, next to the app. And it reads `PORT`, so
-the check still works if someone reconfigures the port (<L id="03.03" />).
+the check still works if someone reconfigures the <Term t="port">port</Term> (<L id="03.03" />).
 
 ## Watch it
 
@@ -69,8 +73,8 @@ status=running health=unhealthy restarts=0
 Unhealthy, still running, zero restarts. **Plain Docker reports health; it doesn't act on it.** The value comes from
 the things that read it:
 
-- **Compose** can wait for a dependency to be healthy before starting a service (<L id="06.03" />).
-- **Docker Swarm** replaces unhealthy tasks; **Kubernetes** has its own liveness and readiness probes.
+- **<Term t="compose">Compose</Term>** can wait for a dependency to be healthy before starting a service (<L id="06.03" />).
+- **Docker Swarm** replaces unhealthy tasks; **<Term t="kubernetes">Kubernetes</Term>** has its own liveness and readiness probes.
 - **Deploy scripts** can wait for `healthy` before switching traffic to a new container (<L id="07.07" />).
 - **Monitoring** can alert on it.
 
@@ -89,7 +93,7 @@ the things that read it:
 - **Cheap and fast.** It runs every few seconds; it shouldn't run real queries or allocate much.
 - **The app's own ability to serve**: event loop responsive, server accepting requests.
 - **Careful with dependencies.** If `/healthz` fails whenever the database is down, every replica goes unhealthy at
-  once, and an orchestrator may restart all of them, which doesn't fix the database. Many teams split "am I alive?"
+  once, and an <Term t="orchestrator">orchestrator</Term> may restart all of them, which doesn't fix the database. Many teams split "am I alive?"
   (liveness) from "can I serve traffic right now?" (readiness).
 
 <Checkpoint

@@ -14,6 +14,10 @@ A **volume** is a directory that Docker creates and manages, separate from any c
 container at a path, and everything written there goes into the volume. Remove the container and the volume stays;
 mount it into a new container and the data is all there.
 
+<Analogy>
+  **A storage unit.** A volume is a storage unit you rent from Docker. Containers come and go like tenants; each new one is handed the key and finds everything where the last one left it. The building manages the unit, so you never need to know which floor it's on.
+</Analogy>
+
 ## Create, write, read again
 
 <Terminal>{`
@@ -65,7 +69,7 @@ sh: can't create /data/x: Read-only file system
 ## Named vs anonymous volumes
 
 If an image declares `VOLUME /some/path` and you don't mount anything there, Docker creates an **anonymous** volume
-with a random name. The official Postgres image does this:
+with a random name. The official <Term t="postgres">Postgres</Term> image does this:
 
 <Terminal>{`
 $ docker run -d --name pg -e POSTGRES_PASSWORD=x postgres:18
@@ -91,8 +95,8 @@ $ docker run --rm -v site:/x alpine ls /x
 index.html
 `}</Terminal>
 
-The second container is plain Alpine, but the volume already contains nginx's files. This only happens for empty
-volumes, never for bind mounts (<L id="04.03" />).
+The second container is plain Alpine, but the volume already contains <Term t="nginx">nginx</Term>'s files. This only happens for empty
+volumes, never for <Term t="bind-mount">bind mounts</Term> (<L id="04.03" />).
 
 ## Backing up a volume
 

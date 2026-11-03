@@ -13,8 +13,12 @@ Your code never runs alone. It runs on top of a language runtime, system librari
 system, and every one of those has a version. When any of them differ between your laptop and the server, the same
 code behaves differently.
 
-A **container** packages your app together with everything it needs above the kernel, and runs it as an isolated
-process. The package is called an **image**. The same image runs the same way on your laptop, in CI and in production.
+A **container** packages your app together with everything it needs above the <Term t="kernel">kernel</Term>, and runs it as an isolated
+<Term t="process">process</Term>. The package is called an **<Term t="image">image</Term>**. The same image runs the same way on your laptop, in <Term t="ci">CI</Term> and in production.
+
+<Analogy>
+  **Shipping containers.** Before them, every cargo ship was loaded by hand: sacks, barrels and crates of every shape, repacked at every port. Then came one standard steel box. Whatever is inside, every crane, truck and ship in the world knows how to lift and move it. A Docker container does the same for software: whatever's inside (Python, Node, Java, a database), every machine with Docker runs it the same way.
+</Analogy>
 
 ## "It works on my machine"
 
@@ -22,7 +26,7 @@ Picture a small Python API. On your laptop it needs:
 
 - Python 3.12, because you used a newer syntax feature
 - `libpq`, the C library the Postgres driver links against
-- an environment variable pointing at the database
+- an <Term t="env-var">environment variable</Term> pointing at the database
 - a particular version of OpenSSL, which the OS happens to ship
 
 The server has Python 3.9, a different OpenSSL, and another team's app that needs Python 3.9 to stay. Each mismatch
@@ -57,7 +61,7 @@ What you get in practice:
 ## What Docker actually added
 
 The pieces containers are made of existed long before Docker. `chroot` (changing a process's root directory) dates back
-to 1979, FreeBSD jails arrived in 2000, and the Linux features containers rely on, **namespaces** and **cgroups**,
+to 1979, FreeBSD jails arrived in 2000, and the Linux features containers rely on, **<Term t="namespace">namespaces</Term>** and **<Term t="cgroup">cgroups</Term>**,
 landed in the kernel through the 2000s. LXC combined them in 2008.
 
 Docker, released in 2013, didn't invent the isolation. It made it usable:

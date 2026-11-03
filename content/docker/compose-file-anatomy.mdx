@@ -12,9 +12,13 @@ export const meta = {
 
 ## The core idea
 
-**Docker Compose** reads a YAML file describing containers, networks and volumes, and makes reality match it. Instead of
+**Docker Compose** reads a <Term t="yaml">YAML</Term> file describing containers, networks and volumes, and makes reality match it. Instead of
 remembering a dozen commands and their order, you write down what you want once and run `docker compose up`. It's
 declarative: run it again and Compose only changes what's different.
+
+<Analogy>
+  **Sheet music.** Starting containers by hand is an orchestra where every musician has to remember their part and their cue. A compose file is the sheet music: every part written down once, so the performance is the same every time, and a new player can join just by reading it.
+</Analogy>
 
 ## From docker run to YAML
 
@@ -63,7 +67,7 @@ volumes:
 ## The four top-level keys
 
 - **`name`**: the project name. Compose prefixes everything it creates with it.
-- **`services`**: one entry per container. The key (`db`) is the service name, and also its **DNS name** on the
+- **`services`**: one entry per container. The key (`db`) is the service name, and also its **<Term t="dns">DNS</Term> name** on the
   project's networks.
 - **`networks`** and **`volumes`**: declared once here, referenced from services. If you declare no networks at all,
   Compose creates one called `<project>_default` and puts every service on it.

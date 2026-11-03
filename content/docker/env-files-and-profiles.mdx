@@ -10,11 +10,15 @@ export const meta = {
 
 ## The core idea
 
-Two different things in Compose both get called "env", and mixing them up causes most of the confusion:
+Two different things in <Term t="compose">Compose</Term> both get called "env", and mixing them up causes most of the confusion:
 
 - **Variables in the compose file**, like `${POSTGRES_PASSWORD}`. Compose fills these in from your shell or a `.env`
   file **before** it does anything else.
 - **Environment variables in a container**, set with `environment:` or `env_file:`. These are what the app sees.
+
+<Analogy>
+  **A note for the chef versus ingredients in the dish.** `.env` is a note pinned up for the chef (Compose): it changes how the recipe is read. `environment:` and `env_file:` are ingredients that go into the dish itself (the container). A note for the chef only ends up in the food if the recipe says to use it.
+</Analogy>
 
 ## Variables in the file
 
@@ -100,7 +104,7 @@ $ curl -s -o /dev/null -w "%{http_code}\\n" localhost:8081
 200
 `}</Terminal>
 
-Adminer is a web UI for Postgres at `localhost:8081`, published on `127.0.0.1` only so it isn't reachable from your
+Adminer is a web UI for <Term t="postgres">Postgres</Term> at `localhost:8081`, published on `127.0.0.1` only so it isn't reachable from your
 network. You can also set `COMPOSE_PROFILES=tools` in `.env` to turn it on by default for yourself.
 
 <Quiz

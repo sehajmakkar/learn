@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know what volumes are (<L id="04.02" />).
+  You know what <Term t="volume">volumes</Term> are (<L id="04.02" />).
 </BeforeYouStart>
 
 ## The core idea
@@ -13,6 +13,10 @@ export const meta = {
 A **bind mount** maps a specific folder (or file) on your machine to a path in the container. It isn't a copy: both
 sides see the same files, and a change on one side shows up on the other immediately. That makes it ideal for
 development and for handing a container config files. It's a poor fit for production data, which belongs in volumes.
+
+<Analogy>
+  **A window between two rooms.** A bind mount isn't a copy. It's a window from the container straight into a folder on your machine: both sides see the same things at the same moment. And like a window cut into a wall, whatever was painted on that part of the wall (the image's own files at that path) can't be seen any more.
+</Analogy>
 
 ## Live editing
 
@@ -45,7 +49,7 @@ $ docker run --rm -v "$PWD/site":/usr/share/nginx/html nginx:alpine ls /usr/shar
 index.html
 `}</Terminal>
 
-nginx's own `50x.html` is gone; only your folder's contents show. The classic case is mounting a Node project over
+<Term t="nginx">nginx</Term>'s own `50x.html` is gone; only your folder's contents show. The classic case is mounting a Node project over
 `/app` for development: the image's `node_modules` disappears behind your folder, which has none (or has packages built
 for macOS):
 
@@ -80,7 +84,7 @@ In scripts, prefer `--mount`.
 
 ## Trap 3: who owns the files
 
-A container running as root that writes into a bind mount creates files owned by UID 0. On a **Linux** host, those
+A container running as <Term t="root">root</Term> that writes into a bind mount creates files owned by <Term t="uid">UID</Term> 0. On a **Linux** host, those
 files are then owned by root on your machine too, and you need `sudo` to delete them. Run the container as your own
 user to avoid it:
 
@@ -89,7 +93,7 @@ docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/work -w /work node:22-slim npm
 `}</Code>
 
 Docker Desktop on macOS and Windows hides this: its file sharing maps ownership to your user, so the same file shows
-as yours on the Mac. Code that works on your laptop can still leave root-owned files on a Linux CI runner.
+as yours on the Mac. Code that works on your laptop can still leave root-owned files on a Linux <Term t="ci">CI</Term> runner.
 
 <Aside title="Performance on Mac and Windows">
   On Docker Desktop, bind mounts cross from your machine into the Linux VM. File sharing (VirtioFS on recent versions)

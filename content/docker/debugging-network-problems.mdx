@@ -16,6 +16,10 @@ export const meta = {
 anything listening, can packets get there, and is the app using the right address?** Work from the outside in and
 stop guessing.
 
+<Analogy>
+  **A doctor's checklist.** A good doctor doesn't guess. They check pulse, breathing and blood pressure, in order, until something's off. "It can't connect" works the same way: same network? Does the name resolve? Is anything listening? Does the port answer? Is the app using that address? The first "no" is your diagnosis.
+</Analogy>
+
 ## The toolbox
 
 Most images don't ship `dig`, `curl`, `nc` or `ss`, and distroless ones don't even have a shell. Bring your own:
@@ -41,7 +45,7 @@ notes-proxy 172.21.0.2/16
 `}</Terminal>
 
 If the caller isn't listed next to the target, nothing else matters. A container started without `--network` is on
-the default bridge and can't resolve anyone:
+the default <Term t="bridge">bridge</Term> and can't resolve anyone:
 
 <Terminal>{`
 $ docker run --rm alpine wget -qO- -T 3 http://notes:3000/healthz
@@ -67,8 +71,8 @@ LISTEN 0      4096      127.0.0.11:46567      0.0.0.0:*
 LISTEN 0      511                *:3000             *:*
 `}</Terminal>
 
-`*:3000` means the API listens on all interfaces. If you saw `127.0.0.1:3000` instead, other containers could never
-reach it: the bind-address bug from <L id="03.02" />. (`127.0.0.11` is Docker's DNS server.)
+`*:3000` means the <Term t="api">API</Term> listens on all interfaces. If you saw `127.0.0.1:3000` instead, other containers could never
+reach it: the bind-address bug from <L id="03.02" />. (`127.0.0.11` is Docker's <Term t="dns">DNS</Term> server.)
 
 **4. Does the port answer?**
 
@@ -79,7 +83,7 @@ nc: connect to notes-db (172.20.0.2) port 5433 (tcp) failed: Connection refused
 `}</Terminal>
 
 "Connection refused" means the host is reachable but nothing listens on that port. A **timeout** means packets aren't
-getting there at all: a different network, or a firewall.
+getting there at all: a different network, or a <Term t="firewall">firewall</Term>.
 
 **5. Is the app actually using that address?** Read its config and logs. The most common culprit is in the next
 section.
@@ -128,7 +132,7 @@ $ docker exec notes-proxy wget -S -qO- -T 3 http://notes:3000/healthz
 
 Output trimmed. From netshoot, `curl -v` gives the same view with more detail. For anything deeper, netshoot also has
 `tcpdump`: `docker run --rm --network container:notes nicolaka/netshoot tcpdump -i eth0 port 5432` shows every packet
-the API sends to Postgres.
+the API sends to <Term t="postgres">Postgres</Term>.
 
 <Checkpoint
   title="Break it, then find it"

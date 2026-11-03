@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You've built the notes API with the first Dockerfile (<L id="02.01" />) and know how `COPY` is cached
+  You've built the notes API with the first <Term t="dockerfile">Dockerfile</Term> (<L id="02.01" />) and know how `COPY` is cached
   (<L id="02.02" />).
 </BeforeYouStart>
 
@@ -13,11 +13,15 @@ export const meta = {
 
 The `.` at the end of `docker build -t notes-api .` is the **build context**: a folder whose files the builder is
 allowed to see. `COPY` and `ADD` can only read from it. Everything in that folder is a candidate to end up in your
-image, unless a **`.dockerignore`** file says otherwise.
+<Term t="image">image</Term>, unless a **`.dockerignore`** file says otherwise.
+
+<Analogy>
+  **Packing a suitcase.** `docker build .` packs the whole folder into a suitcase and sends it to the builder, who unpacks only what the Dockerfile asks for. Without a `.dockerignore`, you're packing everything in the room: the heavy things you never use, and the envelope with your passwords. `.dockerignore` is the list of things to leave at home.
+</Analogy>
 
 ## Why the builder needs a context
 
-The builder (BuildKit) isn't necessarily your machine. With Docker Desktop it runs inside a VM; in CI it might be a
+The builder (<Term t="buildkit">BuildKit</Term>) isn't necessarily your machine. With Docker Desktop it runs inside a VM; in <Term t="ci">CI</Term> it might be a
 remote server. So `docker build` sends the files it needs from your folder over to the builder, and that transfer is
 the "transferring context" line you saw in the last two lessons.
 
@@ -56,7 +60,7 @@ $ docker build -t notes-api .
 #4 transferring context: 3.88kB done
 `}</Terminal>
 
-From 26 MB to under 4 kB, and the `COPY . .` layer shrinks from 26.9 MB to 32.8 kB.
+From 26 MB to under 4 kB, and the `COPY . .` <Term t="layer">layer</Term> shrinks from 26.9 MB to 32.8 kB.
 
 <Quiz
   question="Your project has a .env file with a database password. The Dockerfile has COPY . . and there's no .dockerignore. You never reference .env anywhere. Is the password in the image?"
@@ -77,7 +81,7 @@ $ docker run --rm notes-api cat .env
 SECRET=hunter2
 `}</Terminal>
 
-Once an image with a secret is pushed, rotating the secret is the only real fix. Deleting the file in a later layer
+Once an image with a <Term t="secret">secret</Term> is pushed, rotating the secret is the only real fix. Deleting the file in a later layer
 doesn't remove it from the earlier one (<L id="02.02" />).
 
 ## What to put in .dockerignore

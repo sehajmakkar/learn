@@ -10,9 +10,13 @@ export const meta = {
 
 ## The core idea
 
-An image contains hundreds of packages you didn't write: the OS, the language runtime, your dependencies. Some of them
+An image contains hundreds of packages you didn't write: the OS, the language runtime, your <Term t="dependency">dependencies</Term>. Some of them
 have known vulnerabilities (CVEs). A **scanner** lists every package in the image and matches it against vulnerability
 databases. The skill isn't running the scanner; it's reading the result: which findings matter, and which you can fix.
+
+<Analogy>
+  **Checking a car against recall notices.** A scanner is like checking your car against the manufacturer's recall list: it reads every part number and tells you which parts have known faults. For some faults a replacement part already exists (fixable); for others, nobody has made one yet.
+</Analogy>
 
 ## Run a scan
 
@@ -23,7 +27,7 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \\
   -v trivy-cache:/root/.cache aquasec/trivy:0.76.1 image notes-api
 `}</Code>
 
-The socket mount lets Trivy read your local images; the cache volume keeps its vulnerability database between runs.
+The socket mount lets Trivy read your local images; the <Term t="cache">cache</Term> volume keeps its vulnerability database between runs.
 (Docker Desktop also includes **Docker Scout**, `docker scout cves`, which does the same job with a Docker account.)
 
 ## The numbers
@@ -33,10 +37,10 @@ Counts from this course's scans, all with the same Trivy version on the same day
 | Image | Critical | High | Medium | Low | Total |
 | --- | --- | --- | --- | --- | --- |
 | `node:22` | 20 | 455 | 2042 | 1789 | 4397 |
-| notes API on `node:22-slim` | 1 | 42 | 110 | 84 | 239 |
+| notes <Term t="api">API</Term> on `node:22-slim` | 1 | 42 | 110 | 84 | 239 |
 | `node:22-alpine` | 0 | 10 | 12 | 1 | 23 |
 
-The full Debian image has nearly twenty times the findings of the slim one, because it ships far more packages: compilers, git, Python and their libraries. Base
+The full <Term t="debian">Debian</Term> image has nearly twenty times the findings of the slim one, because it ships far more packages: compilers, git, Python and their libraries. Base
 image choice (<L id="02.07" />) is your biggest lever. But 239 still sounds alarming, so filter to what you can act on.
 
 ## Only what's fixable

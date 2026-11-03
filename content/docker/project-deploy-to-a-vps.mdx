@@ -5,14 +5,14 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  Project step 7, the last one. You need an image in a registry (<L id="07.06" />) and a Linux server you can SSH
+  Project step 7, the last one. You need an image in a registry (<L id="07.06" />) and a Linux server you can <Term t="ssh">SSH</Term>
   into: any small VPS with 1 GB of RAM will do. The finished files are tagged `docker-step-07`, in `project/docker`.
 </BeforeYouStart>
 
 <Aside title="What was verified, and what wasn't">
   Everything in this lesson that runs Docker (the production compose file, the deploy script, the hardening checks,
   rollbacks) was run for real against Docker 29, on a local machine standing in for the server. The server-specific
-  parts (SSH, the firewall, DNS and TLS) are standard steps but weren't run while writing this. Follow your provider's
+  parts (SSH, the <Term t="firewall">firewall</Term>, DNS and <Term t="tls">TLS</Term>) are standard steps but weren't run while writing this. Follow your provider's
   docs where they differ.
 </Aside>
 
@@ -52,7 +52,7 @@ export const meta = {
 `}</Code>
 
 - **`image:` instead of `build:`**, with the tag set by `NOTES_API_IMAGE` so a deploy picks an exact version.
-- **Hardening** from <L id="07.01" />, **the secret file** from <L id="07.02" />, **limits** from
+- **Hardening** from <L id="07.01" />, **the <Term t="secret">secret</Term> file** from <L id="07.02" />, **limits** from
   <L id="03.06" />, **restarts** from <L id="03.05" />.
 - **The proxy** is `nginxinc/nginx-unprivileged`, read-only with a tmpfs for `/tmp`, using the same `nginx/default.conf`.
 - **The cache** runs Redis as a pure cache: no snapshots, a 64 MB memory cap, least-recently-used eviction.
@@ -190,6 +190,10 @@ Every image CI publishes is tagged with its commit (<L id="07.06" />). Rolling b
 `}</Code>
 
 Avoid deploying `latest` for exactly this reason: you can't roll back to "the latest before this one".
+
+<Analogy>
+  **Putting the old box back.** Every release is a separate, labelled box on the shelf (a `sha-` tag). Rolling back isn't repairing anything: you take the previous box off the shelf and put it back on the counter.
+</Analogy>
 
 ## Keep it running
 

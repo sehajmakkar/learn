@@ -28,6 +28,10 @@ on the host to a port in the container.
   caption="Host side first, container side last. Leave out the address and Docker listens on every interface."
 />
 
+<Analogy>
+  **A building's front desk.** Your machine is a building with one street address. Each container is an office inside it, with its own room numbers. Publishing a port tells the front desk: "visitors who ask for door 8080 go to room 3000 in that office". And an app listening only on `127.0.0.1` is like someone who only answers calls from inside their own office: reception can never put a visitor through.
+</Analogy>
+
 ## Three ways to publish
 
 <Terminal>{`
@@ -49,8 +53,8 @@ p1      0.0.0.0:8080->3000/tcp, [::]:8080->3000/tcp
 `docker port NAME` lists a container's mappings at any time.
 
 <Aside title="Linux servers and firewalls">
-  On Linux, Docker publishes ports by writing its own firewall rules, which take effect before rules from tools like
-  `ufw`. So `-p 5432:5432` on a server can expose Postgres to the internet even when `ufw` says the port is closed. Bind
+  On Linux, Docker publishes ports by writing its own <Term t="firewall">firewall</Term> rules, which take effect before rules from tools like
+  `ufw`. So `-p 5432:5432` on a server can expose <Term t="postgres">Postgres</Term> to the internet even when `ufw` says the port is closed. Bind
   to `127.0.0.1`, or don't publish ports that only other containers need; containers on the same network can reach
   each other without `-p` at all (<L id="05.02" />).
 </Aside>
@@ -70,7 +74,7 @@ hi
 
 It works from inside and fails from outside. `127.0.0.1` inside the container is the **container's** loopback, which
 forwarded traffic never arrives on. Docker delivers published traffic to the container's network interface, so the app
-must listen on `0.0.0.0` (all interfaces). The notes API does this by not passing an address to `listen`.
+must listen on `0.0.0.0` (all interfaces). The notes <Term t="api">API</Term> does this by not passing an address to `listen`.
 
 Many frameworks default to `127.0.0.1` in development mode, which is why this bites so often: Vite needs `--host`,
 Flask needs `--host=0.0.0.0`, Rails needs `-b 0.0.0.0`.

@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know how image names are put together (<L id="01.04" />) and have a multi-stage notes API image
+  You know how <Term t="image">image</Term> names are put together (<L id="01.04" />) and have a <Term t="multi-stage">multi-stage</Term> notes API image
   (<L id="02.04" />).
 </BeforeYouStart>
 
@@ -14,6 +14,10 @@ export const meta = {
 A **tag** is a human-friendly pointer, like a git branch: `notes-api:1.0.0` points at an image, and it can be moved to
 point at a different one. A **digest** is the image's content hash, like a git commit SHA: it can only ever mean one
 exact image. You push and pull by tag for convenience, and deploy by digest when you need certainty.
+
+<Analogy>
+  **A nickname and a fingerprint.** A tag is a nickname: "the latest one", "version 1.4". Tomorrow the same nickname can be given to someone else. A digest is a fingerprint: it belongs to exactly one image, forever. Day to day you use nicknames, but when it really matters, like what runs in production, you check the fingerprint.
+</Analogy>
 
 ## Push to a registry
 
@@ -43,12 +47,12 @@ docker tag notes-api ghcr.io/YOUR_USERNAME/notes-api:1.0.0
 docker push ghcr.io/YOUR_USERNAME/notes-api:1.0.0
 `}</Code>
 
-The token needs the `write:packages` scope. You'll automate this from CI in <L id="07.06" />.
+The token needs the `write:packages` scope. You'll automate this from <Term t="ci">CI</Term> in <L id="07.06" />.
 
 ## Tags move
 
 Nothing stops anyone with push access from pushing a different image under an existing tag. Official images do it on
-purpose: `node:22-alpine` is re-pushed for every Node 22 patch and every Alpine security fix. So the same `FROM` line
+purpose: `node:22-alpine` is re-pushed for every Node 22 patch and every <Term t="alpine">Alpine</Term> security fix. So the same `FROM` line
 can give you a different base next week.
 
 <Anatomy
@@ -89,7 +93,11 @@ Manifests:
 
 Output trimmed. That index also lists `linux/arm64`, `linux/arm/v6`, `linux/arm/v7` and `linux/s390x`. When you pull,
 Docker picks the one that matches your machine. An image you build on an M-series Mac is `linux/arm64` only, and
-won't run on a typical amd64 server without emulation. Building for both is <L id="07.04" />.
+won't run on a typical <Term t="architecture">amd64</Term> server without <Term t="emulation">emulation</Term>. Building for both is <L id="07.04" />.
+
+<Analogy>
+  **One book, several translations.** A bookshop shelves one title in several languages and hands you the one you can read. An image index is one tag with a version per CPU type, and Docker picks the one your machine can run.
+</Analogy>
 
 ## A tagging scheme that works
 

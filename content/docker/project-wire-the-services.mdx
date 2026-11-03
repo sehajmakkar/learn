@@ -5,8 +5,8 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  Project step 4. You have the Postgres-backed API from step 3 (`docker-step-03`), and know user-defined networks
-  (<L id="05.02" />) and bind mounts (<L id="04.03" />). The finished state is tagged `docker-step-04`.
+  Project step 4. You have the <Term t="postgres">Postgres</Term>-backed <Term t="api">API</Term> from step 3 (`docker-step-03`), and know user-defined networks
+  (<L id="05.02" />) and <Term t="bind-mount">bind mounts</Term> (<L id="04.03" />). The finished state is tagged `docker-step-04`.
 </BeforeYouStart>
 
 ## The brief
@@ -31,7 +31,7 @@ export const meta = {
 
 ## What changed in the API
 
-The API gets an optional `REDIS_URL` (`npm install redis`). The rule that matters: **a cache must never be able to take
+The API gets an optional `REDIS_URL` (`npm install redis`). The rule that matters: **a <Term t="cache">cache</Term> must never be able to take
 the app down.** So the API doesn't wait for Redis at startup, checks `isReady` before using it, and falls back to
 Postgres on any error. Responses carry an `x-cache: hit` or `miss` header so you can see it working.
 
@@ -50,6 +50,10 @@ async function cached<T>(load: () => Promise<T>): Promise<{ value: T; hit: boole
   return { value, hit: false };
 }
 `}</Code>
+
+<Analogy>
+  **A sticky note on your desk.** Reading notes from Postgres is a walk to the archive room. Redis is a sticky note on your desk with the answer from your last trip: quick to read, thrown away after 30 seconds, and if you lose it you just walk to the archive again. That's why a missing cache must never stop the API.
+</Analogy>
 
 ## The Nginx config
 
@@ -84,8 +88,12 @@ $ docker logs naive-proxy
 [emerg] 1#1: host not found in upstream "notes" in /etc/nginx/conf.d/default.conf:4
 `}</Terminal>
 
-Output trimmed. And even when it starts, it keeps the old IP after the API container is replaced. Using a variable
-makes Nginx ask Docker's DNS at request time instead.
+Output trimmed. And even when it starts, it keeps the old <Term t="ip-address">IP</Term> after the API container is replaced. Using a variable
+makes Nginx ask Docker's <Term t="dns">DNS</Term> at request time instead.
+
+<Analogy>
+  **A reception desk.** Nginx is reception at the building's only entrance. Every visitor arrives there and gets walked to the right room. Visitors never learn where the database is, because reception is the only part of the building that faces the street.
+</Analogy>
 
 ## Run it
 

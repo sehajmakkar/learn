@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You've built the notes API image (<L id="02.01" />).
+  You've built the notes <Term t="api">API</Term> image (<L id="02.01" />).
 </BeforeYouStart>
 
 ## The core idea
@@ -13,6 +13,10 @@ export const meta = {
 The same image should run in development, staging and production. What changes between them (database address,
 log level, feature limits) is **configuration**, and the standard way to hand it to a container is environment
 variables. Build once, configure at run time.
+
+<Analogy>
+  **Same phone, your settings.** Everyone gets the same phone model from the factory (the image). Language, Wi-Fi and wallpaper are settings you choose after unboxing (environment variables). Nobody builds a separate phone for every language, and you shouldn't build a separate image for every environment.
+</Analogy>
 
 ## Setting variables
 
@@ -28,7 +32,7 @@ Four ways in, from least to most specific:
 
 | Where | Example | Notes |
 | --- | --- | --- |
-| `ENV` in the Dockerfile | `ENV NODE_ENV=production` | a default baked into the image |
+| `ENV` in the <Term t="dockerfile">Dockerfile</Term> | `ENV NODE_ENV=production` | a default baked into the image |
 | `--env-file` | `--env-file app.env` | one `KEY=value` per line; `#` lines are comments |
 | `-e KEY=value` | `-e LOG_LEVEL=debug` | wins over `ENV` and the env file |
 | `-e KEY` | `-e PORT` | copies `PORT` from your shell; if it isn't set there, nothing is passed |
@@ -69,12 +73,12 @@ $ echo $?
 1
 `}</Terminal>
 
-Failing fast matters more in containers than anywhere else: a restart policy or orchestrator will notice the exit
+Failing fast matters more in containers than anywhere else: a <Term t="restart-policy">restart policy</Term> or <Term t="orchestrator">orchestrator</Term> will notice the exit
 immediately, while a service that starts with bad config and limps along can go unnoticed for days.
 
 ## Where environment variables leak
 
-Environment variables are convenient, not secret. Anyone who can talk to the Docker daemon can read them:
+Environment variables are convenient, not <Term t="secret">secret</Term>. Anyone who can talk to the Docker daemon can read them:
 
 <Terminal>{`
 $ docker run -d --name envy --env-file app.env alpine sleep 100

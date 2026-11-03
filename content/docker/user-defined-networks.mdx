@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know why the default bridge isn't enough: no names, unstable IPs (<L id="05.01" />). You already used a
+  You know why the default <Term t="bridge">bridge</Term> isn't enough: no names, unstable <Term t="ip-address">IPs</Term> (<L id="05.01" />). You already used a
   user-defined network in project step 3 (<L id="04.05" />); this is how it works.
 </BeforeYouStart>
 
@@ -14,6 +14,10 @@ export const meta = {
 A **user-defined bridge** is a bridge network you create with `docker network create`. It works like the default one,
 plus two things that matter: containers on it can find each other **by name**, through DNS built into Docker, and
 it's **isolated** from containers on other networks.
+
+<Analogy>
+  **A staff directory per floor.** A user-defined network is a floor with its own directory: ask for "db" and it gives you today's extension, even if they moved desks yesterday. Separate networks are separate floors with no stairs between them: someone on one floor can't reach, or even look up, someone on the other.
+</Analogy>
 
 ## Names, not IPs
 
@@ -48,7 +52,7 @@ Address: 172.20.0.3
 `}</Terminal>
 
 Clients pick one of the addresses, which gives you crude load-spreading. It's a DNS trick, not a load balancer: there are
-no health checks, and clients often cache the answer.
+no health checks, and clients often <Term t="cache">cache</Term> the answer.
 
 ## Isolation between networks
 

@@ -11,10 +11,14 @@ export const meta = {
 
 ## The core idea
 
-Unless an image sets `USER`, its process runs as **root (UID 0)**. Namespaces limit what that root can see, but it's
+Unless an image sets `USER`, its process runs as **root (<Term t="uid">UID</Term> 0)**. Namespaces limit what that root can see, but it's
 still UID 0 talking to the same kernel as the host. If there's ever a container escape bug, root inside is much closer
 to root outside. Running as a normal user is the cheapest, biggest security win available, and Docker gives you four
 more layers to stack on top.
+
+<Analogy>
+  **A master key versus a room key.** Running as root is handing a contractor the building's master key to fix one sink. A normal user gets a key to that one room. Capabilities are the individual keys on root's key ring: `--cap-drop ALL` takes the whole ring away, and `no-new-privileges` makes sure nobody can get a copy cut later.
+</Analogy>
 
 ## Who are you in there?
 
@@ -25,7 +29,7 @@ $ docker run --rm --entrypoint id notes-api
 uid=1000(node) gid=1000(node) groups=1000(node)
 `}</Terminal>
 
-The notes API has run as `node` since its multi-stage build (<L id="02.04" />), thanks to `USER node` in the final
+The notes <Term t="api">API</Term> has run as `node` since its multi-stage build (<L id="02.04" />), thanks to `USER node` in the final
 stage. The official Node images create that user for exactly this. Root can rewrite system files in its container;
 `node` can't:
 
@@ -43,7 +47,7 @@ RUN groupadd --system app && useradd --system --gid app --no-create-home app
 USER app
 `}</Code>
 
-Prefer a numeric ID (`USER 1000`) when you can: Kubernetes can only verify "not root" from a number, not a name.
+Prefer a numeric ID (`USER 1000`) when you can: <Term t="kubernetes">Kubernetes</Term> can only verify "not root" from a number, not a name.
 
 ## Layer 2: drop capabilities
 

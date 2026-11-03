@@ -22,9 +22,13 @@ export const meta = {
   </ul>
 </Recap>
 
+<Analogy>
+  **An assembly line with an inspector.** Every change travels down the same line: it gets built, then inspected (the scan), and only if it passes is it boxed and put on the shelf (published). A rejected part never reaches the shelf, and every box is stamped with the batch it came from (the `sha-` tag).
+</Analogy>
+
 ## The workflow, part by part
 
-**When it runs.** Only when the API or the workflow itself changes, plus a manual button:
+**When it runs.** Only when the <Term t="api">API</Term> or the workflow itself changes, plus a manual button:
 
 <Code lang="yaml" file=".github/workflows/notes-api.yml">{`
 on:
@@ -71,7 +75,7 @@ runs before anything leaves the runner:
             --ignore-unfixed --exit-code 1 notes-api:scan
 `}</Code>
 
-The scan is the same gate as in <L id="07.03" />, with a pinned Trivy version so results don't change underneath you.
+The scan is the same gate as in <L id="07.03" />, with a pinned <Term t="trivy">Trivy</Term> version so results don't change underneath you.
 
 **Tags.** `docker/metadata-action` turns the commit into tags:
 
@@ -86,8 +90,8 @@ The scan is the same gate as in <L id="07.03" />, with a pinned Trivy version so
             type=raw,value=latest,enable={{is_default_branch}}
 `}</Code>
 
-**Publish.** Log in to GHCR with the built-in token, then build both platforms and push. The amd64 layers come
-straight from the cache the scan build just wrote:
+**Publish.** Log in to GHCR with the built-in token, then build both platforms and push. The <Term t="architecture">amd64</Term> layers come
+straight from the <Term t="cache">cache</Term> the scan build just wrote:
 
 <Code lang="yaml" file=".github/workflows/notes-api.yml">{`
       - name: Log in to GHCR
@@ -113,7 +117,7 @@ straight from the cache the scan build just wrote:
 
 Two guards on publishing: pull requests never publish (code from a fork shouldn't push images), and a **repository
 variable**, `PUBLISH_IMAGE`, must be `true`. That makes publishing a deliberate switch. Set it under the repo's
-Settings → Secrets and variables → Actions → Variables, or with `gh variable set PUBLISH_IMAGE --body true`.
+Settings → <Term t="secret">Secrets</Term> and variables → Actions → Variables, or with `gh variable set PUBLISH_IMAGE --body true`.
 
 ## What the real runs looked like
 
@@ -172,7 +176,7 @@ $ docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}
 9f30a1da127b447ea9efb68edd3864afb195c9e1
 `}</Terminal>
 
-Output trimmed. Both platforms are there (the `unknown/unknown` entries are the build's attestations,
+Output trimmed. Both platforms are there (the `unknown/unknown` entries are the build's <Term t="attestation">attestations</Term>,
 <L id="07.04" />). The Mac pulled the arm64 image, the amd64 one runs under emulation, and the label added by
 `metadata-action` records the exact commit the image came from. Because this repository is public, the package was
 readable without logging in.

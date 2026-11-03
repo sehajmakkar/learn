@@ -14,6 +14,10 @@ Docker captures whatever a container's main process writes to **stdout** and **s
 So the rule for apps in containers is simple: log to the console, not to files, and let Docker (or whatever collects
 Docker's logs) handle storage.
 
+<Analogy>
+  **A transcript.** A container's main process speaks out loud (stdout and stderr), and Docker writes down every word. `docker logs` reads the transcript back. An app that writes to a log file instead is talking into a notebook in a locked room: Docker hears nothing, and the notebook is thrown away with the room.
+</Analogy>
+
 ## Reading logs
 
 <Terminal>{`
@@ -83,7 +87,7 @@ root
 `}</Terminal>
 
 `exec` runs as the image's `USER` unless you pass `-u`. It only works on running containers, and only if the image
-has the program you ask for: distroless images have no `sh` at all (<L id="02.07" />).
+has the program you ask for: <Term t="distroless">distroless</Term> images have no `sh` at all (<L id="02.07" />).
 
 To move files without a shell, use `docker cp`, which works on stopped containers too:
 
@@ -102,7 +106,7 @@ docker cp ./debug.json notes:/tmp/debug.json
   ]}
 />
 
-The official nginx image handles this by symlinking its log files to `/dev/stdout` and `/dev/stderr`, a handy trick
+The official <Term t="nginx">nginx</Term> image handles this by symlinking its log files to `/dev/stdout` and `/dev/stderr`, a handy trick
 for software you can't reconfigure.
 
 <Checkpoint

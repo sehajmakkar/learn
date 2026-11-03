@@ -10,9 +10,13 @@ export const meta = {
 
 ## The core idea
 
-A multi-service app in Compose is the same set of containers you'd run by hand, but the relationships are written
+A multi-service app in <Term t="compose">Compose</Term> is the same set of containers you'd run by hand, but the relationships are written
 down: which services share a network, which volume holds the data, which service is built from source. Compose turns
 those relationships into the right `docker` calls, in the right order.
+
+<Analogy>
+  **Name badges.** Every service in a Compose project wears a name badge: its service name. Anyone on the same network calls out "db" and the right container answers, wherever it happens to be sitting today.
+</Analogy>
 
 ## The notes stack as services
 
@@ -59,8 +63,8 @@ the missing parts.
 
 Things worth noticing:
 
-- **Service names are hostnames.** `db`, `cache` and `api` resolve through Docker's DNS, exactly like container names
-  did in <L id="05.02" />. That's why `DATABASE_URL` says `@db:5432`, and why the Nginx config now proxies to
+- **Service names are hostnames.** `db`, `cache` and `api` resolve through Docker's <Term t="dns">DNS</Term>, exactly like container names
+  did in <L id="05.02" />. That's why `DATABASE_URL` says `@db:5432`, and why the <Term t="nginx">Nginx</Term> config now proxies to
   `http://api:3000`.
 - **Networks are the security boundary.** `api` is on both; `proxy` can't see `db` or `cache`.
 - **Only `proxy` has `ports:`.** Services talk to each other over their networks without publishing anything.
@@ -87,7 +91,7 @@ PONG
 
 - **`exec`** runs a command in the service's **running** container, like `docker exec`.
 - **`run`** starts a **new, one-off** container from the service's definition, with its networks and environment.
-  `--rm` removes it afterwards and `--no-deps` skips starting its dependencies. It's how you run migrations, scripts or
+  `--rm` removes it afterwards and `--no-deps` skips starting its <Term t="dependency">dependencies</Term>. It's how you run migrations, scripts or
   a one-time shell.
 - **`restart api`**, **`stop cache`**, **`up -d proxy`** all work per service too.
 

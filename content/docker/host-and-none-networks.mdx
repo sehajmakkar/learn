@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know how bridge networking works (<L id="05.01" />).
+  You know how <Term t="bridge">bridge</Term> networking works (<L id="05.01" />).
 </BeforeYouStart>
 
 ## The core idea
@@ -16,6 +16,10 @@ Bridge networks give each container its own isolated network stack. Two modes sk
 - **`--network none`**: a network namespace with nothing in it but loopback.
 
 And one mode borrows: **`--network container:NAME`** joins another container's network namespace.
+
+<Analogy>
+  **Rooms, no walls, and roommates.** Bridge networking gives each container its own room. `host` removes the walls: the container lives in the main hall and uses the building's doors directly. `none` is a soundproof room with no phone. `container:NAME` moves a second person into an existing room, sharing its phone and its address.
+</Analogy>
 
 ## none: nothing in, nothing out
 
@@ -30,7 +34,7 @@ proving that a build doesn't secretly download anything.
 
 ## host: the machine's network
 
-With `--network host`, a server listening on port 80 in the container listens on port 80 of the host. No NAT, no
+With `--network host`, a server listening on port 80 in the container listens on port 80 of the host. No <Term t="nat">NAT</Term>, no
 `-p`; Docker even warns if you pass one:
 
 <Terminal>{`
@@ -54,14 +58,14 @@ $ curl -m 3 localhost:80
 curl: (7) Failed to connect to localhost port 80 after 0 ms: Couldn't connect to server
 `}</Terminal>
 
-nginx is listening, but on the VM's port 80, which your Mac can't see. Recent Docker Desktop versions have an opt-in
+<Term t="nginx">nginx</Term> is listening, but on the VM's port 80, which your Mac can't see. Recent Docker Desktop versions have an opt-in
 host networking setting; without it, use `-p` on Mac and Windows. This is a classic "works on my Linux box, not on my
 Mac" difference.
 
 ## container: borrow a network
 
 `--network container:NAME` puts a new container into an existing container's network namespace. They share
-interfaces, IP and `localhost`:
+interfaces, <Term t="ip-address">IP</Term> and `localhost`:
 
 <Terminal>{`
 $ docker run --rm --network container:web1 alpine wget -qO- http://127.0.0.1 | grep -o '<title>.*</title>'
@@ -70,7 +74,7 @@ $ docker run --rm --network container:web1 alpine wget -qO- http://127.0.0.1 | g
 
 `127.0.0.1` reached nginx, because "localhost" is now the nginx container's. This is how you debug a container that
 has no tools of its own, like a distroless image: attach a toolbox container to its network (<L id="05.04" />).
-It's also how Kubernetes pods work: all containers in a pod share one network namespace.
+It's also how <Term t="kubernetes">Kubernetes</Term> pods work: all containers in a pod share one network namespace.
 
 | Mode | Own network stack | Reachable via `-p` | Typical use |
 | --- | --- | --- | --- |

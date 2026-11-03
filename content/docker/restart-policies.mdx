@@ -5,7 +5,7 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know the container lifecycle and exit codes (<L id="03.01" />).
+  You know the container lifecycle and <Term t="exit-code">exit codes</Term> (<L id="03.01" />).
 </BeforeYouStart>
 
 ## The core idea
@@ -13,6 +13,10 @@ export const meta = {
 By default, when a container's main process exits, the container just stays exited. A **restart policy** tells the
 Docker daemon to start it again, depending on how it exited and whether you stopped it on purpose. It's the simplest
 form of self-healing, and on a single server it's often all you need.
+
+<Analogy>
+  **Instructions for a babysitter.** `no`: if the toddler sits down, leave them. `on-failure`: if they fall over, help them up, but only a few times. `always`: whenever they sit down, stand them back up. `unless-stopped`: the same, unless you told them to sit. Notice the babysitter only reacts to falling over (the process exiting), not to the toddler looking unwell (unhealthy).
+</Analogy>
 
 ## The four policies
 
@@ -89,8 +93,8 @@ docker update --restart unless-stopped notes
 
 <Aside title="What restart policies don't do">
   They only react to the process **exiting**. A process that's still running but stuck, deadlocked or returning errors
-  won't be restarted, even if its healthcheck says it's unhealthy (<L id="03.07" />). Restart policies are also per
-  machine: if the server dies, nothing moves your containers elsewhere. That's an orchestrator's job.
+  won't be restarted, even if its <Term t="healthcheck">healthcheck</Term> says it's unhealthy (<L id="03.07" />). Restart policies are also per
+  machine: if the server dies, nothing moves your containers elsewhere. That's an <Term t="orchestrator">orchestrator</Term>'s job.
 </Aside>
 
 <Checkpoint

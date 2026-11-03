@@ -5,18 +5,22 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know what images and containers are (<L id="01.04" />). You'll need admin rights on your machine to install
+  You know what <Term t="image">images</Term> and <Term t="container">containers</Term> are (<L id="01.04" />). You'll need admin rights on your machine to install
   software.
 </BeforeYouStart>
 
 ## The core idea
 
-Docker has two halves. The **`docker` CLI** you type into is only a client. The work is done by the **Docker daemon**
-(`dockerd`), a background service that builds images, pulls them from registries and runs containers. The CLI sends it
+Docker has two halves. The **`docker` <Term t="cli">CLI</Term>** you type into is only a client. The work is done by the **Docker daemon**
+(`dockerd`), a background service that builds images, pulls them from <Term t="registry">registries</Term> and runs containers. The CLI sends it
 requests over a local socket and prints the replies.
 
 Installing Docker means getting both halves running. Most problems in this lesson come from the daemon not running,
 or the CLI not being allowed to talk to it.
+
+<Analogy>
+  **A restaurant.** The `docker` command is the waiter: it takes your order and carries it to the kitchen. The Docker daemon is the kitchen, where the cooking actually happens. If the kitchen is closed (the daemon isn't running), the waiter can't do anything, however nicely you ask. That's exactly what the error 'Cannot connect to the Docker daemon' means.
+</Analogy>
 
 ## Pick an install
 
@@ -31,7 +35,7 @@ Docker's apt or dnf repository over your distribution's own `docker.io` package,
 
 ### Linux: running without sudo
 
-On Linux the daemon's socket, `/var/run/docker.sock`, belongs to root and the `docker` group. To run `docker` without
+On Linux the daemon's socket, `/var/run/docker.sock`, belongs to <Term t="root">root</Term> and the `docker` group. To run `docker` without
 `sudo`, add yourself to that group, then log out and back in:
 
 <Terminal>{`
@@ -105,7 +109,7 @@ $ docker stop web
 $ docker rm web
 `}</Terminal>
 
-`-d` runs it in the background. `-p 8080:80` forwards port 8080 on your machine to port 80 in the container. You'll
+`-d` runs it in the background. `-p 8080:80` forwards <Term t="port">port</Term> 8080 on your machine to port 80 in the container. You'll
 look at each flag properly in <L id="01.06" />.
 
 <Quiz

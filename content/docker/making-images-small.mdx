@@ -5,30 +5,34 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You've built the notes API as a multi-stage image (<L id="02.04" />) and can read `docker history`
+  You've built the notes API as a <Term t="multi-stage">multi-stage</Term> <Term t="image">image</Term> (<L id="02.04" />) and can read `docker history`
   (<L id="02.02" />).
 </BeforeYouStart>
 
 ## The core idea
 
-An image's size is the sum of its layers, and layers only ever add. So making an image smaller comes down to two
+An image's size is the sum of its <Term t="layer">layers</Term>, and layers only ever add. So making an image smaller comes down to two
 questions: **which base do you start from**, and **what does each of your steps leave behind**?
 
 Smaller images pull faster, start faster on new servers, cost less to store and contain fewer packages that can have
 vulnerabilities. But size is a means, not a goal. Don't trade away debuggability for the last few megabytes.
 
+<Analogy>
+  **Writing in pen.** Each layer is a page written in pen. Crossing something out on a later page doesn't remove the ink from the earlier one, so the notebook doesn't get any lighter. To keep it light, you write your rough work and erase it on the same page, before the page is saved. That's cleaning up in the same `RUN` step.
+</Analogy>
+
 ## Where the bytes are
 
-Every number in this lesson was measured on the notes API (on an arm64 Mac; amd64 sizes differ slightly):
+Every number in this lesson was measured on the notes API (on an <Term t="architecture">arm64</Term> Mac; amd64 sizes differ slightly):
 
 | Image | Disk usage | Content size (compressed) |
 | --- | --- | --- |
 | `node:22` (full Debian base) | 1.63 GB | 416 MB |
-| first Dockerfile on `node:22-slim` | 425 MB | 95.5 MB |
+| first <Term t="dockerfile">Dockerfile</Term> on `node:22-slim` | 425 MB | 95.5 MB |
 | …with a `.dockerignore` | 393 MB | 90.6 MB |
 | …as a multi-stage build | 349 MB | 80.4 MB |
 | multi-stage on `node:22-alpine` | 238 MB | 61.7 MB |
-| multi-stage on distroless | 212 MB | 52.2 MB |
+| multi-stage on <Term t="distroless">distroless</Term> | 212 MB | 52.2 MB |
 
 The biggest single decision is the base image. `node:22` ships compilers, git and Python, which are useful for building
 native modules and useless at runtime. Your own layers are usually small next to it.

@@ -11,15 +11,19 @@ export const meta = {
 
 ## The core idea
 
-During development you want edits to show up immediately. **Compose watch** watches folders on your machine and, when
+During development you want edits to show up immediately. **<Term t="compose">Compose</Term> watch** watches folders on your machine and, when
 something changes, either **copies the changed files into the running container** or **rebuilds the image** and
 replaces the container, depending on rules you write. Combined with a process that restarts on change inside the
 container, you get hot reload.
 
+<Analogy>
+  **Live preview.** It's like editing a document with live preview: you type, and a moment later the preview updates. Watch copies the files you save into the running container (sync), and `node --watch` notices and restarts. Change the ingredients list (`package.json`) and the whole dish is cooked again from scratch (rebuild).
+</Analogy>
+
 ## A dev stage
 
-The production image compiles TypeScript and ships only `dist`. For development, the notes API's Dockerfile now has a
-`dev` stage that keeps the source and dev dependencies and runs a watcher:
+The production image compiles <Term t="typescript">TypeScript</Term> and ships only `dist`. For development, the notes <Term t="api">API</Term>'s Dockerfile now has a
+`dev` stage that keeps the source and dev <Term t="dependency">dependencies</Term> and runs a watcher:
 
 <Code lang="dockerfile" file="api/Dockerfile">{`
 # Development (06.05): the build stage plus a watcher. Node 22 runs TypeScript directly by

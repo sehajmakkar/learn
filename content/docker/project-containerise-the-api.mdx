@@ -11,7 +11,7 @@ export const meta = {
 
 ## The brief
 
-The notes API is going to production eventually. This step produces its image. Done means:
+The notes API is going to production eventually. This step produces its <Term t="image">image</Term>. Done means:
 
 <Recap>
   <ul>
@@ -37,7 +37,7 @@ Dockerfile  README.md  package-lock.json  package.json  src  tsconfig.json
 `}</Terminal>
 
 `docker-step-01` is the finished state of this step, so delete `Dockerfile` and `.dockerignore` now for a clean start.
-Later steps change these files, which is why you check out the tag instead of using `main`.
+Later steps change these files, which is why you check out the git tag instead of using `main`.
 
 ## Step 1: the build context
 
@@ -94,12 +94,12 @@ notes-api listening on :3000
 SIGTERM received, closing
 `}</Terminal>
 
-`docker stop` returns almost immediately, because the app handles `SIGTERM` and runs as PID 1 with the exec-form `CMD`. If
+`docker stop` returns almost immediately, because the app handles `SIGTERM` and runs as <Term t="pid-1">PID 1</Term> with the exec-form `CMD`. If
 yours waits for the whole stop timeout and the logs don't show `SIGTERM received`, check you used `CMD ["node", "dist/server.js"]` and not the shell form.
 
 ## Step 5: tag and push
 
-Tag with the version from `package.json` and the short commit hash, so any running container can be traced back to
+Tag with the version from `package.json` and the short commit hash, so any running <Term t="container">container</Term> can be traced back to
 its code:
 
 <Terminal>{`
@@ -111,7 +111,7 @@ $ docker tag notes-api localhost:5050/notes-api:sha-$SHA
 $ docker push --all-tags localhost:5050/notes-api
 `}</Terminal>
 
-Both tags point at the same image, so each layer uploads once and the second tag only adds a name. To publish for real, swap
+Both tags point at the same image, so each <Term t="layer">layer</Term> uploads once and the second tag only adds a name. To publish for real, swap
 `localhost:5050` for `ghcr.io/YOUR_USERNAME` after `docker login ghcr.io` (<L id="02.06" />).
 
 <Quiz
@@ -140,7 +140,7 @@ image contains only what it needs, runs as `node` and stops cleanly, it meets th
 ## What's next
 
 The image works, but it has no idea whether the app inside is healthy, takes its config from code, and keeps notes in
-memory. Module 03 adds configuration, limits and a healthcheck (<L id="03.07" />), and Module 04 moves the notes into
+memory. Module 03 adds configuration, limits and a <Term t="healthcheck">healthcheck</Term> (<L id="03.07" />), and Module 04 moves the notes into
 Postgres (<L id="04.05" />).
 
 ## Interview questions

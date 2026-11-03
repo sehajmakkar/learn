@@ -5,14 +5,14 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know why containers exist (<L id="01.01" />). It helps to know that the **kernel** is the core of the operating
-  system: the part that manages processes, memory, files and the network for every program.
+  You know why <Term t="container">containers</Term> exist (<L id="01.01" />). It helps to know that the **kernel** is the core of the operating
+  system: the part that manages <Term t="process">processes</Term>, memory, files and the network for every program.
 </BeforeYouStart>
 
 ## The core idea
 
 A **virtual machine** pretends to be a whole computer. It gets virtual CPUs, memory and disks, and boots its own
-operating system with its own kernel.
+<Term t="operating-system">operating system</Term> with its own kernel.
 
 A **container** doesn't pretend to be a computer at all. It's a normal process running on the host's kernel, which has
 been told to show that process a private view of the system.
@@ -48,14 +48,18 @@ Everything else in this lesson follows from that.
   caption="A VM image carries a whole operating system. A container image carries only the files above the kernel."
 />
 
+<Analogy>
+  **A house versus an apartment.** A virtual machine is a detached house: its own foundation, its own plumbing, its own wiring (its own kernel). Very private, but slow and expensive to build. A container is an apartment in a shared building: its own locked door and its own furniture, but the foundation and the plumbing are shared (the host's kernel). That's why apartments are quick and cheap to move into, and also why a crack in the shared foundation affects every tenant.
+</Analogy>
+
 ## What follows from sharing a kernel
 
 | | Virtual machine | Container |
 | --- | --- | --- |
 | Starts in | tens of seconds (it boots an OS) | about as long as the app takes to start |
-| Image size | gigabytes | often tens to hundreds of megabytes |
+| <Term t="image">Image</Term> size | gigabytes | often tens to hundreds of megabytes |
 | Runs a different OS | yes, Windows on a Linux host is fine | only one built for the host's kernel |
-| Isolation boundary | the hypervisor, a small, hardened layer | the shared kernel, a much larger surface |
+| Isolation boundary | the hypervisor, a small, hardened <Term t="layer">layer</Term> | the shared kernel, a much larger surface |
 | Overhead per instance | a whole OS's memory | close to a normal process |
 
 The speed and size come for free: there's no second OS to boot or store. The trade-off is the isolation boundary.

@@ -5,18 +5,22 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You've seen how much the base image dominates size (<L id="02.05" />).
+  You've seen how much the base <Term t="image">image</Term> dominates size (<L id="02.05" />).
 </BeforeYouStart>
 
 ## The core idea
 
 Your base image is most of your image. It decides your C library, your package manager, which debugging tools exist
-inside the container, and how many packages a security scanner will flag. There's no single best choice, but there are
+inside the <Term t="container">container</Term>, and how many packages a security <Term t="scanner">scanner</Term> will flag. There's no single best choice, but there are
 four families, and knowing what's inside each makes the choice easy.
+
+<Analogy>
+  **Moving into a new home.** The full image is a furnished house with a workshop in the garage: everything you might ever need, most of it never used. Slim is a furnished flat with just the essentials. Alpine is a tiny home with smaller, different appliances, so some of your gadgets need adapters (that's musl). Distroless is a vending machine: it does one job, and there's no door to walk in through, for you or for a burglar.
+</Analogy>
 
 ## The four families
 
-Measured with the notes API on top of each (arm64; amd64 differs slightly):
+Measured with the notes API on top of each (<Term t="architecture">arm64</Term>; amd64 differs slightly):
 
 | Base | What's inside | C library | Notes API image |
 | --- | --- | --- | --- |
@@ -42,7 +46,7 @@ $ docker run --rm node:22-alpine sh -c 'ldd --version 2>&1 | head -1'
 musl libc (aarch64)
 `}</Terminal>
 
-Notice that `node:22-slim` has no `curl`. That matters the first time you write a healthcheck that calls `curl`.
+Notice that `node:22-slim` has no `curl`. That matters the first time you write a <Term t="healthcheck">healthcheck</Term> that calls `curl`.
 
 ## glibc vs musl
 
@@ -52,7 +56,7 @@ doesn't care. Native code does:
 - npm packages with native addons (for example `bcrypt`, `sharp`) need musl builds or compile from source.
 - Python wheels on PyPI are mostly built for glibc, so on Alpine `pip` often compiles from source, which is slow and
   needs build tools.
-- DNS resolution and some locale and threading behaviour differ in small ways that occasionally surface as bugs.
+- <Term t="dns">DNS</Term> resolution and some locale and threading behaviour differ in small ways that occasionally surface as bugs.
 
 None of this makes Alpine bad. It means "switch to Alpine" is a change to test, not a free win.
 

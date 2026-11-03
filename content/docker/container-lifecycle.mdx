@@ -25,6 +25,10 @@ running?"
   caption="docker run is just create + start. A running container can also be Paused, and a crashing one can be Restarting."
 />
 
+<Analogy>
+  **A laptop.** Created is a laptop still in its box. Running is switched on; paused is asleep, with everything still open. Exited is shut down: your files are still on the disk. Removed is recycled. And `docker stop` versus `docker kill` is choosing "Shut down" versus pulling out the battery.
+</Analogy>
+
 ## Walk through it
 
 <Terminal>{`
@@ -81,7 +85,7 @@ tiny init process is PID 1; it forwards `SIGTERM` to `sleep`, which dies from it
 | `1` (or any small number) | the app exited with an error; check `docker logs` |
 | `125` | `docker run` itself failed (bad flag, name taken) |
 | `126` / `127` | the command couldn't run / wasn't found in the image |
-| `137` | killed with `SIGKILL` (128 + 9): `docker kill`, a stop timeout, or the OOM killer |
+| `137` | killed with `SIGKILL` (128 + 9): `docker kill`, a stop timeout, or the <Term t="oom-killer">OOM killer</Term> |
 | `143` | ended by `SIGTERM` (128 + 15) without handling it more gracefully |
 
 For `137`, `docker inspect -f '{{.State.OOMKilled}}'` tells you whether memory was the reason (<L id="03.06" />).

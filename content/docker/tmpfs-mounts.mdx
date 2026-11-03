@@ -14,6 +14,10 @@ A **tmpfs mount** is a directory that lives in memory. It's fast, it's never wri
 the container stops. You won't use it often, but it solves two problems neatly: scratch space for files that must
 never be persisted, and making a **read-only** container work.
 
+<Analogy>
+  **A whiteboard.** tmpfs is a whiteboard in the room: quick to write on, wiped when you leave, and nothing written on it ever reaches the filing cabinet (the disk). Perfect for rough work, and for anything you'd rather never be stored.
+</Analogy>
+
 ## Read-only containers
 
 `--read-only` makes the container's whole filesystem read-only. An attacker who gets in can't drop files, modify
@@ -28,7 +32,7 @@ tmpfs                    16.0M         0     16.0M   0% /tmp
 `}</Terminal>
 
 Everything is read-only except a 16 MB in-memory `/tmp`. Add a tmpfs for each path the app really needs to write, and
-a volume for anything it needs to keep. You'll apply this to the notes API in <L id="07.01" />.
+a <Term t="volume">volume</Term> for anything it needs to keep. You'll apply this to the notes <Term t="api">API</Term> in <L id="07.01" />.
 
 ## Syntax and limits
 
@@ -56,14 +60,14 @@ tmpfs                     3.8G         0      3.8G   0% /scratch
 `}</Terminal>
 
 Even inside a container limited to 64 MB, the tmpfs *reports* 3.8 GB. Files written there count against the
-container's memory limit, so filling it can get the container OOM-killed (<L id="03.06" />).
+container's memory limit, so filling it can get the container <Term t="oom-killer">OOM-killed</Term> (<L id="03.06" />).
 
-| | Volume | Bind mount | tmpfs |
+| | Volume | <Term t="bind-mount">Bind mount</Term> | tmpfs |
 | --- | --- | --- | --- |
 | Stored on | disk, managed by Docker | disk, your path | memory |
 | Survives the container | yes | yes | no |
 | Shared between containers | yes | yes | no |
-| Typical use | databases, uploads | dev code, config | scratch, secrets, read-only roots |
+| Typical use | databases, uploads | dev code, config | scratch, <Term t="secret">secrets</Term>, read-only roots |
 
 <Quiz
   question="An app writes decrypted credentials to a temporary file while it starts. You want to be sure they never reach any disk. Where should that path be?"

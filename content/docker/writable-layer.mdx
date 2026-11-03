@@ -15,6 +15,10 @@ Everything a container writes, unless you say otherwise, goes into its **writabl
 container: it survives `stop` and `start`, and it's deleted with `docker rm`. Containers are meant to be thrown away
 and replaced, so anything you want to keep has to live **outside** the container.
 
+<Analogy>
+  **A hotel room.** A container is a hotel room: unpack, rearrange, leave notes everywhere, and it's all still there if you pop out and come back (stop and start). Check out (`docker rm`) and housekeeping wipes the room clean. Anything you want to keep goes in a storage locker outside the room: a volume.
+</Analogy>
+
 ## Watch data disappear
 
 <Terminal>{`
@@ -37,7 +41,7 @@ cat: can't open '/data.txt': No such file or directory
 `docker ps -s` shows the writable layer's size (52.4 MB) and, in brackets, that plus the image underneath. A stop and
 start keeps the file. Removing the container deletes it, and a new container from the same image starts clean.
 
-That's fine for a cache. It's a disaster for a database, which is exactly what happens if you run Postgres and later
+That's fine for a cache. It's a disaster for a database, which is exactly what happens if you run <Term t="postgres">Postgres</Term> and later
 recreate the container to upgrade it.
 
 ## Why not just keep the container forever?
@@ -46,7 +50,7 @@ Because you can't, in practice:
 
 - **Deploying means replacing.** A new image version means a new container.
 - **Writable layers are slow for heavy writes.** Changing a file from the image first copies it into the writable layer
-  (copy-on-write), and the storage driver adds overhead that databases feel.
+  (<Term t="copy-on-write">copy-on-write</Term>), and the storage driver adds overhead that databases feel.
 - **Writable layers are hard to back up**, move to another server or share between containers.
 
 ## Three places data can live
@@ -70,9 +74,9 @@ Because you can't, in practice:
 
 | Mount | Lives in | Use it for | Lesson |
 | --- | --- | --- | --- |
-| **Volume** | storage Docker manages (`/var/lib/docker/volumes/…`) | databases, uploads: data the app owns | <L id="04.02" /> |
-| **Bind mount** | a folder you choose on the host | source code in development, config files | <L id="04.03" /> |
-| **tmpfs** | memory, never disk | scratch space, secrets that must never touch disk | <L id="04.04" /> |
+| **<Term t="volume">Volume</Term>** | storage Docker manages (`/var/lib/docker/volumes/…`) | databases, uploads: data the app owns | <L id="04.02" /> |
+| **<Term t="bind-mount">Bind mount</Term>** | a folder you choose on the host | source code in development, config files | <L id="04.03" /> |
+| **<Term t="tmpfs">tmpfs</Term>** | memory, never disk | scratch space, <Term t="secret">secrets</Term> that must never touch disk | <L id="04.04" /> |
 
 <Quiz
   question="You run Postgres in a container with no mounts, add data, then docker stop and docker start it. Then you upgrade by docker rm and docker run with the newer image. What happens to the data?"

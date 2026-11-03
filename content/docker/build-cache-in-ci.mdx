@@ -5,14 +5,18 @@ export const meta = {
 };
 
 <BeforeYouStart>
-  You know how the layer cache works on one machine (<L id="02.02" />).
+  You know how the layer <Term t="cache">cache</Term> works on one machine (<L id="02.02" />).
 </BeforeYouStart>
 
 ## The core idea
 
-On your laptop, the build cache lives in Docker and persists between builds. A CI runner is usually a fresh virtual
-machine every time: **no cache at all**, so every build installs every dependency from scratch. The fix is to **export**
+On your laptop, the build cache lives in Docker and persists between builds. A <Term t="ci">CI</Term> runner is usually a fresh virtual
+machine every time: **no cache at all**, so every build installs every <Term t="dependency">dependency</Term> from scratch. The fix is to **export**
 the cache somewhere that outlives the runner at the end of a build, and **import** it at the start of the next.
+
+<Analogy>
+  **An exam in an empty hall.** Your laptop is your desk at home, covered in notes from last time. A CI runner is an exam hall where you start at an empty desk every single time. Exporting the cache is taking your notes with you and laying them out before you begin.
+</Analogy>
 
 ## Simulate a fresh CI runner
 
@@ -51,7 +55,7 @@ dependencies or a compile step that takes minutes, the cached build is minutes f
 
 | `--cache-to` / `--cache-from` | Stored | Good for |
 | --- | --- | --- |
-| `type=gha` | GitHub Actions' cache service | GitHub Actions; the simplest option |
+| `type=gha` | <Term t="github-actions">GitHub Actions</Term>' cache service | GitHub Actions; the simplest option |
 | `type=registry,ref=…:buildcache` | a separate tag in your registry | any CI; shared between pipelines |
 | `type=local,dest=…` | a folder | CI systems that persist folders between jobs |
 | `type=inline` | inside the image itself | very simple setups; final stage only |
@@ -96,7 +100,7 @@ package again. A **cache mount** keeps a directory between builds without puttin
 RUN --mount=type=cache,target=/root/.npm npm ci
 `}</Code>
 
-npm's download cache in `/root/.npm` survives between builds, so after a lockfile change only the new packages are
+npm's download cache in `/root/.npm` survives between builds, so after a <Term t="lockfile">lockfile</Term> change only the new packages are
 downloaded. It works for any package manager: `/root/.cache/pip`, `/go/pkg/mod`, `/var/cache/apt`. Cache mounts live in
 the builder, so on CI they share the same "fresh runner" problem; layer-cache export is the bigger win there.
 

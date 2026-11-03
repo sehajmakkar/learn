@@ -25,7 +25,7 @@ A new contributor clones the repo and runs one command. Done means:
 
 ## Seeding with init scripts
 
-The official Postgres image runs any `.sql` or `.sh` file it finds in `/docker-entrypoint-initdb.d/`, **once**, when it
+The official <Term t="postgres">Postgres</Term> image runs any `.sql` or `.sh` file it finds in `/docker-entrypoint-initdb.d/`, **once**, when it
 creates a new database in an empty data directory. Mount a seed file there:
 
 <Code lang="sql" file="db/seed.sql">{`
@@ -50,12 +50,16 @@ INSERT INTO notes (id, text) VALUES
       - ./db/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
 `}</Code>
 
+<Analogy>
+  **Move-in day.** Init scripts only run on move-in day: when Postgres finds an empty volume, it sets up the database and unpacks the boxes (`seed.sql`). On every later day it sees the furniture is already in place and skips the unpacking.
+</Analogy>
+
 ## The whole file
 
 `project/docker/compose.yaml` puts together everything from this module: the four services, both networks, the
 volume, healthchecks with `service_healthy` ordering (<L id="06.03" />), variables with defaults
 (<L id="06.04" />), the `dev` build target with watch rules (<L id="06.05" />), and Adminer behind the `tools`
-profile. One change from step 4: the API is now the service `api`, so the Nginx config proxies to `http://api:3000`.
+profile. One change from step 4: the <Term t="api">API</Term> is now the service `api`, so the <Term t="nginx">Nginx</Term> config proxies to `http://api:3000`.
 
 ## Run it
 
@@ -77,7 +81,7 @@ cache-1  | 1:C 02 Nov 2026 20:53:47.202 * oO0OoO0OoO0Oo Redis is starting oO0OoO
 `}</Terminal>
 
 Output trimmed. Watch is enabled straight away, then every service's logs stream into this terminal, prefixed with
-its name, while Compose works through the health waits. Give it a few seconds, then in another terminal:
+its name, while <Term t="compose">Compose</Term> works through the health waits. Give it a few seconds, then in another terminal:
 
 <Terminal>{`
 $ curl -s localhost:8080/notes | jq -r '.[].text'
@@ -145,7 +149,7 @@ health waits live in a file that's reviewed and versioned with the code.
 ## What's next
 
 This is a development setup: the dev target, no resource limits, passwords in `.env`. Module 07 makes the image
-production-ready, ships it from CI, and deploys it to a server.
+production-ready, ships it from <Term t="ci">CI</Term>, and deploys it to a server.
 
 ## Interview questions
 

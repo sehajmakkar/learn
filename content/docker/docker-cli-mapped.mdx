@@ -67,9 +67,9 @@ docker run \\
 | --- | --- |
 | `-d` | detached: run in the background and print the container ID |
 | `--name api` | a name to use instead of the random one Docker picks |
-| `-p 8080:3000` | host port 8080 forwards to container port 3000 |
-| `-e KEY=value` | set an environment variable |
-| `-v api-data:/data` | mount the volume `api-data` at `/data` (<L id="04.02" />) |
+| `-p 8080:3000` | host <Term t="port">port</Term> 8080 forwards to container port 3000 |
+| `-e KEY=value` | set an <Term t="env-var">environment variable</Term> |
+| `-v api-data:/data` | mount the <Term t="volume">volume</Term> `api-data` at `/data` (<L id="04.02" />) |
 | `--rm` | delete the container when it exits |
 | `-it` | interactive with a terminal; use it for shells, not servers |
 
@@ -80,7 +80,7 @@ Anything after the image name replaces the image's default command: `docker run 
 These three trip people up because they all sound like "make it go":
 
 - `docker run` creates a **new** container from an image and starts it.
-- `docker start` starts an **existing**, stopped container again, with the same writable layer.
+- `docker start` starts an **existing**, stopped container again, with the same writable <Term t="layer">layer</Term>.
 - `docker exec` runs an **extra** process inside a container that's already running.
 
 <Quiz
@@ -92,6 +92,10 @@ These three trip people up because they all sound like "make it go":
     { text: "Paused, waiting for you to reattach", why: "Paused is a separate state you only get with docker pause." },
   ]}
 />
+
+<Analogy>
+  **A car.** `docker run` buys a brand-new car and drives it off the lot. `docker start` turns the key in a car you already own, with everything you left inside still there. `docker exec` is climbing into the passenger seat of a car that's already being driven.
+</Analogy>
 
 ## Finding things out
 
@@ -105,7 +109,7 @@ exited 137
 $ docker inspect --format '{{.NetworkSettings.IPAddress}}' web
 `}</Terminal>
 
-An exit code of `137` means the container was killed (<L id="01.03" />).
+An <Term t="exit-code">exit code</Term> of `137` means the container was killed (<L id="01.03" />).
 
 ## Cleaning up
 
@@ -121,7 +125,7 @@ Build Cache     61        0         2.3GB     2.3GB
 $ docker system prune
 `}</Terminal>
 
-Example output. `docker system prune` removes stopped containers, unused networks, dangling images and build cache.
+Example output. `docker system prune` removes stopped containers, unused networks, dangling images and <Term t="build-cache">build cache</Term>.
 It **does not** remove volumes unless you add `--volumes`, and only removes images without a tag unless you add `-a`.
 Both of those flags can delete things you want, so read the prompt before saying yes.
 

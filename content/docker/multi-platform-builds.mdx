@@ -14,6 +14,10 @@ Images contain compiled code for one CPU architecture. Apple Silicon Macs and ma
 example) are `linux/arm64`; most other servers are `linux/amd64`. **docker buildx** can build for a platform other than
 your own, or for several at once, publishing them under one tag as an index so each machine pulls the right one.
 
+<Analogy>
+  **A book in two languages.** A CPU only understands programs written in its own instruction language, and amd64 and arm64 are two different languages. A multi-platform image is one title with both translations on the shelf. Emulation (QEMU) is a live interpreter: it works, but every sentence takes longer.
+</Analogy>
+
 ## Build for another platform
 
 On an arm64 Mac:
@@ -30,7 +34,7 @@ x64
 The amd64 build took 22 seconds here instead of a few, and the container still ran. Both are thanks to **QEMU
 emulation**: Docker Desktop translates amd64 instructions to arm64 on the fly. It works, but it's slow, so heavy builds
 (compiling native modules, big `npm ci`s) under emulation can take many times longer. On Linux, install emulation with
-the `tonistiigi/binfmt` image or `docker/setup-qemu-action` in CI.
+the `tonistiigi/binfmt` image or `docker/setup-qemu-action` in <Term t="ci">CI</Term>.
 
 ## Build for both at once
 
@@ -60,7 +64,7 @@ Multi-platform images usually go straight to a registry with `--push`. Loading t
 - **Build natively per platform** in CI (amd64 and arm64 runners) and merge the results; fastest for heavy builds.
 - **Cross-compile** in the build stage for languages that support it (Go, Rust): run the build stage on the native
   platform with `FROM --platform=$BUILDPLATFORM` and compile for `$TARGETPLATFORM`. No emulation at all.
-- For the notes API, emulation is fine: the only slow part is `npm ci`, and the cache (<L id="07.05" />) skips it most
+- For the notes <Term t="api">API</Term>, emulation is fine: the only slow part is `npm ci`, and the <Term t="cache">cache</Term> (<L id="07.05" />) skips it most
   of the time.
 
 <Quiz
