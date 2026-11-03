@@ -1,0 +1,854 @@
+// The Docker interview bank: the questions that come up most across widely read interview guides,
+// with our own model answers. "seenIn" lists the guides that ask each question (checked November 2026);
+// that count is the frequency shown on the page. "pick" marks questions few guides list but we think matter.
+
+export type SourceId =
+  | "interviewbit"
+  | "gfg"
+  | "simplilearn"
+  | "edureka"
+  | "datacamp"
+  | "dataquest"
+  | "kodekloud"
+  | "linuxhandbook"
+  | "guru99"
+  | "turing"
+  | "devops-exercises";
+
+export const sources: Record<SourceId, { name: string; url: string; count: number }> = {
+  interviewbit: { name: "InterviewBit", url: "https://www.interviewbit.com/docker-interview-questions/", count: 35 },
+  gfg: { name: "GeeksforGeeks", url: "https://www.geeksforgeeks.org/devops/docker-interview-questions/", count: 71 },
+  simplilearn: { name: "Simplilearn", url: "https://www.simplilearn.com/tutorials/docker-tutorial/docker-interview-questions", count: 35 },
+  edureka: { name: "Edureka", url: "https://www.edureka.co/blog/interview-questions/docker-interview-questions/", count: 50 },
+  datacamp: { name: "DataCamp", url: "https://www.datacamp.com/blog/docker-interview-questions", count: 26 },
+  dataquest: { name: "Dataquest", url: "https://www.dataquest.io/blog/docker-interview-questions-and-answers", count: 35 },
+  kodekloud: { name: "KodeKloud", url: "https://kodekloud.com/blog/docker-interview-questions/", count: 30 },
+  linuxhandbook: { name: "Linux Handbook", url: "https://linuxhandbook.com/docker-interview-questions/", count: 28 },
+  guru99: { name: "Guru99", url: "https://www.guru99.com/docker-interview-questions.html", count: 43 },
+  turing: { name: "Turing", url: "https://www.turing.com/interview-questions/docker", count: 110 },
+  "devops-exercises": { name: "devops-exercises (GitHub)", url: "https://github.com/bregman-arie/devops-exercises/blob/master/topics/containers/README.md", count: 143 },
+};
+
+export const SOURCE_COUNT = Object.keys(sources).length;
+
+export const topics = [
+  "Basics",
+  "Images & Dockerfile",
+  "Running containers",
+  "Data",
+  "Networking",
+  "Compose",
+  "Security",
+  "Production & CI",
+  "Troubleshooting",
+] as const;
+export type Topic = (typeof topics)[number];
+
+export type BankQuestion = {
+  id: string;
+  q: string;
+  topic: Topic;
+  level: "Junior" | "Mid" | "Senior";
+  importance: "Must-know" | "Good to know";
+  kind: "Concept" | "Scenario" | "Debugging" | "Design";
+  seenIn: SourceId[];
+  pick?: boolean;
+  /** Paragraphs; `backticks` render as code. */
+  answer: string[];
+  followUps?: string[];
+  lesson?: string;
+};
+
+const ALL: SourceId[] = Object.keys(sources) as SourceId[];
+
+export const bank: BankQuestion[] = [
+  // Basics
+  {
+    id: "what-is-docker",
+    q: "What is Docker, and why do teams use it?",
+    topic: "Basics",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["gfg", "simplilearn", "edureka", "dataquest", "linuxhandbook", "guru99", "devops-exercises"],
+    answer: [
+      "Docker is a platform for packaging an application together with everything it needs to run (runtime, libraries, config) into an image, and running that image as an isolated container on any machine with Docker.",
+      "Teams use it so the thing they test is exactly the thing they deploy: no more \"works on my machine\". It also makes environments quick to create and throw away, lets many apps share one server without conflicting, and turns deploys and rollbacks into swapping one image for another.",
+    ],
+    followUps: ["What problems does Docker not solve?", "How is this different from a virtual machine?"],
+    lesson: "01.01",
+  },
+  {
+    id: "container-vs-vm",
+    q: "What's the difference between a container and a virtual machine?",
+    topic: "Basics",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "simplilearn", "edureka", "dataquest", "kodekloud", "linuxhandbook", "guru99", "turing", "devops-exercises"],
+    answer: [
+      "A virtual machine emulates a whole computer: a hypervisor gives it virtual hardware, and it boots its own operating system and kernel. A container is an isolated process running on the host's kernel; Linux namespaces control what it can see and cgroups control what it can use.",
+      "So containers start in about the time the app takes to start, use megabytes rather than gigabytes, and pack densely onto a host. The trade-off is isolation: every container shares one kernel, so a kernel vulnerability affects them all, while a VM is separated by the much smaller hypervisor. That's why untrusted multi-tenant workloads often run containers inside lightweight VMs.",
+    ],
+    followUps: ["Can you run a Windows container on a Linux host?", "How does Docker Desktop run Linux containers on a Mac?"],
+    lesson: "01.02",
+  },
+  {
+    id: "image-vs-container",
+    q: "What's the difference between an image and a container?",
+    topic: "Basics",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ALL,
+    answer: [
+      "An image is a read-only template: a stack of filesystem layers plus metadata such as the default command, environment variables and exposed ports. A container is a running (or stopped) instance of an image: Docker adds a thin writable layer on top and starts a process with its own namespaces and resource limits.",
+      "One image can back many containers. Each container's changes go into its own writable layer and disappear when the container is removed, which is why persistent data belongs in volumes.",
+    ],
+    followUps: ["What happens to a file you create inside a container after `docker rm`?"],
+    lesson: "01.04",
+  },
+  {
+    id: "architecture",
+    q: "Explain Docker's architecture. How do the client and the daemon communicate?",
+    topic: "Basics",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "edureka", "datacamp", "dataquest", "linuxhandbook", "guru99", "turing", "devops-exercises"],
+    answer: [
+      "Docker is client-server. The `docker` CLI is the client: it turns your commands into REST API calls. The daemon, `dockerd`, does the work: building images, pulling and pushing them, and managing containers, networks and volumes. Registries such as Docker Hub store images.",
+      "By default the client talks to the daemon over a local Unix socket, `/var/run/docker.sock`; it can also use TCP (which should be protected with TLS) or SSH for a remote daemon. Under the daemon, containerd manages container lifecycles and runc actually creates each container.",
+    ],
+    followUps: ["Why is access to the Docker socket equivalent to root?"],
+    lesson: "01.05",
+  },
+  {
+    id: "docker-run-steps",
+    q: "Walk me through what happens when you run `docker run nginx`.",
+    topic: "Basics",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["kodekloud", "devops-exercises", "guru99"],
+    answer: [
+      "The CLI sends the request to the daemon. The daemon resolves `nginx` to `docker.io/library/nginx:latest` and checks its local image store; any missing layers are pulled from the registry. It then creates the container: a writable layer on top of the image, namespaces, cgroups and a network interface on the default bridge.",
+      "Finally containerd and runc start the image's default command as the container's main process, and the output streams back to your terminal (or, with `-d`, Docker prints the container ID and returns).",
+    ],
+    lesson: "01.05",
+  },
+  {
+    id: "registry",
+    q: "What is a Docker registry, and how do you push and pull images?",
+    topic: "Basics",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "simplilearn", "edureka", "datacamp", "dataquest", "guru99", "turing", "devops-exercises"],
+    answer: [
+      "A registry is a server that stores images, organised into repositories, each holding many tags. Docker Hub is the default public one; GitHub Container Registry, Amazon ECR and self-hosted registries are common alternatives.",
+      "To push, tag the image with the registry's address and push it: `docker tag app ghcr.io/me/app:1.0` then `docker push ghcr.io/me/app:1.0`, after `docker login` for private registries. `docker pull` downloads it. Only layers the other side doesn't already have are transferred.",
+    ],
+    followUps: ["What's the difference between a tag and a digest?"],
+    lesson: "02.06",
+  },
+  {
+    id: "isolation",
+    q: "How does Docker isolate containers? Explain namespaces and cgroups.",
+    topic: "Basics",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "simplilearn", "edureka", "kodekloud", "guru99", "turing", "devops-exercises"],
+    answer: [
+      "Containers are ordinary processes isolated by kernel features. Namespaces control what a process can see: its own process IDs (pid), network stack (net), mount points (mnt), hostname (uts), IPC and optionally user IDs. Cgroups control what it can use: CPU, memory, process count, I/O.",
+      "On top of that Docker drops most Linux capabilities and applies a seccomp profile to block risky system calls. All containers still share the host kernel, so this isolation is weaker than a VM's.",
+    ],
+    followUps: ["What happens when a container hits its memory limit?"],
+    lesson: "01.03",
+  },
+
+  // Images & Dockerfile
+  {
+    id: "dockerfile",
+    q: "What is a Dockerfile, and which instructions do you use most?",
+    topic: "Images & Dockerfile",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ALL,
+    answer: [
+      "A Dockerfile is a text file of instructions that `docker build` executes in order to produce an image. Each instruction that changes files adds a layer.",
+      "The everyday ones: `FROM` (base image), `WORKDIR` (working directory), `COPY` (files from the build context), `RUN` (commands at build time), `ENV` and `ARG` (variables), `EXPOSE` (documents a port), `USER` (who the process runs as), `HEALTHCHECK`, and `CMD` / `ENTRYPOINT` (what runs when a container starts).",
+    ],
+    lesson: "02.01",
+  },
+  {
+    id: "cmd-vs-entrypoint",
+    q: "What's the difference between RUN, CMD and ENTRYPOINT?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "dataquest", "kodekloud", "linuxhandbook", "turing", "devops-exercises"],
+    answer: [
+      "`RUN` executes during the build and saves the result as a layer: installing packages, compiling. `CMD` and `ENTRYPOINT` are stored in the image and used when a container starts.",
+      "`CMD` is the default command, replaced by anything you pass after the image name in `docker run`. `ENTRYPOINT` is the fixed executable; when both are set, `CMD` supplies its default arguments. Use `CMD` alone for apps, and `ENTRYPOINT` plus `CMD` when the image wraps one program, like a CLI tool. You can override the entrypoint with `docker run --entrypoint`.",
+    ],
+    followUps: ["Why does the exec form matter?"],
+    lesson: "02.01",
+  },
+  {
+    id: "copy-vs-add",
+    q: "What's the difference between COPY and ADD?",
+    topic: "Images & Dockerfile",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "dataquest", "kodekloud", "linuxhandbook", "guru99", "turing", "devops-exercises"],
+    answer: [
+      "Both copy files into the image. `COPY` does only that, from the build context. `ADD` can also download from a URL and automatically extracts local tar archives.",
+      "Prefer `COPY`: it's explicit and predictable. Use `ADD` only when you specifically want auto-extraction of a local archive; for downloads, `RUN curl ...` (or a dedicated build stage) gives you checksum control and lets you delete the download in the same layer.",
+    ],
+    lesson: "02.01",
+  },
+  {
+    id: "arg-vs-env",
+    q: "What's the difference between ARG and ENV?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["gfg", "linuxhandbook"],
+    answer: [
+      "`ARG` defines a build-time variable, set with `docker build --build-arg`; it exists only while the image is being built. `ENV` sets an environment variable that persists in the image and is visible to running containers (and can be overridden with `docker run -e`).",
+      "Neither is safe for secrets: `ARG` values used in a `RUN` step end up in the image history, and `ENV` is stored in the image config. Use BuildKit secret mounts instead.",
+    ],
+    lesson: "07.02",
+  },
+  {
+    id: "exec-vs-shell-form",
+    q: "What's the difference between the exec form and the shell form of CMD?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["gfg", "kodekloud", "devops-exercises"],
+    answer: [
+      "Exec form, `CMD [\"node\", \"server.js\"]`, runs the program directly, so it is PID 1 and receives signals. Shell form, `CMD node server.js`, runs `/bin/sh -c \"node server.js\"`, so the shell is PID 1.",
+      "The practical difference: with the shell form, `docker stop`'s SIGTERM goes to the shell, which often doesn't forward it, so the app is killed after the timeout instead of shutting down cleanly. Use the exec form unless you need shell features like variable expansion.",
+    ],
+    lesson: "02.01",
+  },
+  {
+    id: "layers-and-cache",
+    q: "How do image layers and the build cache work, and how does instruction order matter?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "dataquest", "kodekloud", "turing", "devops-exercises"],
+    answer: [
+      "Each instruction that changes files produces a read-only layer; an image is the stack of them, and identical layers are shared between images. On rebuild, BuildKit reuses a step's cached result if the previous step was reused and the step's inputs are unchanged: for `COPY` that means the file contents, for `RUN` only the command text.",
+      "Once one step misses, every step after it rebuilds. So order from least to most frequently changed: copy the dependency manifest and lockfile, install dependencies, then copy the source. A code change then only reruns the final steps.",
+    ],
+    followUps: ["Why does `RUN apt-get update` on its own line cause stale packages?"],
+    lesson: "02.02",
+  },
+  {
+    id: "build-context",
+    q: "What is the build context, and what is `.dockerignore` for?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["gfg", "dataquest", "devops-exercises"],
+    answer: [
+      "The build context is the set of files sent to the builder, usually the directory given to `docker build`. `COPY` and `ADD` can only read from it.",
+      "`.dockerignore` excludes files from the context: local `node_modules`, build output, `.git` and secrets like `.env`. That makes builds faster, keeps the cache from being invalidated by unrelated changes, keeps images smaller, and stops secrets from being copied into a layer by `COPY . .`.",
+    ],
+    lesson: "02.03",
+  },
+  {
+    id: "multi-stage",
+    q: "What are multi-stage builds, and why use them?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["gfg", "simplilearn", "dataquest", "kodekloud", "turing", "devops-exercises"],
+    answer: [
+      "A Dockerfile with several `FROM` stages. Earlier stages have the full toolchain (compilers, dev dependencies) and produce build artifacts; the final stage starts from a small base and copies in only those artifacts with `COPY --from=build`.",
+      "The shipped image is smaller, pulls faster, and has less attack surface because build tools and source code never reach it. `docker build --target` builds a single stage, which is handy for test or dev stages.",
+    ],
+    lesson: "02.04",
+  },
+  {
+    id: "reduce-size",
+    q: "How do you reduce the size of a Docker image?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Scenario",
+    seenIn: ["gfg", "datacamp", "dataquest", "kodekloud", "devops-exercises"],
+    answer: [
+      "First measure: `docker history` (or the dive tool) shows which layers are big. Then the biggest wins, in order: a smaller base image (`-slim`, alpine or distroless instead of the full image), a multi-stage build so build tools stay behind, and a `.dockerignore`.",
+      "Also clean up in the same `RUN` that created the mess, for example `apt-get install --no-install-recommends ... && rm -rf /var/lib/apt/lists/*`, because deleting files in a later step only hides them in the earlier layer. Install only production dependencies in the final stage.",
+    ],
+    followUps: ["What would you check before switching to alpine?"],
+    lesson: "02.05",
+  },
+  {
+    id: "latest-tag",
+    q: "Why is the `latest` tag considered risky? What should you use instead?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["kodekloud", "dataquest", "devops-exercises"],
+    answer: [
+      "`latest` is just the default tag name, not \"newest\", and like every tag it can be moved. Deploying it means you can't tell which version is running, two servers can run different code under the same name, and you can't roll back to \"the previous latest\".",
+      "Tag images with immutable versions (a release number and the git commit SHA) and deploy those; pin base images to a version, and by digest (`image@sha256:...`) where reproducibility matters.",
+    ],
+    lesson: "02.06",
+  },
+  {
+    id: "save-vs-export",
+    q: "How do you move an image to another machine without a registry? What's the difference between `save`/`load` and `export`/`import`?",
+    topic: "Images & Dockerfile",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "devops-exercises"],
+    answer: [
+      "`docker save image > image.tar` writes an image with all its layers, tags and metadata; `docker load < image.tar` restores it on the other machine. That's the right tool for moving images.",
+      "`docker export` dumps a container's flattened filesystem, without layers, history or metadata like `CMD`; `docker import` turns that tarball into a new single-layer image. It's mainly useful for inspecting a container's filesystem.",
+    ],
+  },
+  {
+    id: "multi-arch",
+    q: "Your Mac-built image fails on a server with `exec format error`. Why, and how do you build images for several CPU architectures?",
+    topic: "Images & Dockerfile",
+    level: "Senior",
+    importance: "Good to know",
+    kind: "Debugging",
+    seenIn: ["devops-exercises"],
+    pick: true,
+    answer: [
+      "The image was built for the Mac's architecture, linux/arm64, and the server is linux/amd64, so its binaries can't execute there.",
+      "Build for the target with `docker buildx build --platform linux/amd64`, or publish a multi-platform image with `--platform linux/amd64,linux/arm64 --push`. That creates an image index, and each machine pulls the variant matching its CPU. Non-native builds use QEMU emulation, which is slow, so heavy builds are better done on native runners or by cross-compiling.",
+    ],
+    lesson: "07.04",
+  },
+
+  // Running containers
+  {
+    id: "lifecycle",
+    q: "Describe the lifecycle of a Docker container.",
+    topic: "Running containers",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "edureka", "datacamp", "dataquest", "linuxhandbook", "guru99"],
+    answer: [
+      "Created (`docker create`: filesystem and config exist, no process) → Running (`docker start`; `docker run` is create plus start) → optionally Paused (`docker pause` freezes the processes) → Exited (the main process ended or was stopped; the writable layer is kept) → Removed (`docker rm` deletes it).",
+      "A container also shows as Restarting while a restart policy is bringing it back. The exit code tells you how it ended: 0 for success, 137 for SIGKILL, 143 for SIGTERM.",
+    ],
+    lesson: "03.01",
+  },
+  {
+    id: "stop-vs-kill",
+    q: "What's the difference between `docker stop` and `docker kill`?",
+    topic: "Running containers",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["gfg", "edureka", "kodekloud", "guru99"],
+    answer: [
+      "`docker stop` sends SIGTERM (or the image's STOPSIGNAL), waits for the stop timeout (10 seconds by default on Docker Engine), then sends SIGKILL. That gives the app a chance to finish requests and close connections. `docker kill` sends SIGKILL immediately.",
+      "Use `stop` normally; `kill` is for hung processes. If `stop` always takes the full timeout, the app isn't handling SIGTERM.",
+    ],
+    lesson: "03.01",
+  },
+  {
+    id: "run-vs-start",
+    q: "What's the difference between `docker run`, `docker start` and `docker exec`?",
+    topic: "Running containers",
+    level: "Junior",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["simplilearn", "interviewbit"],
+    answer: [
+      "`docker run` creates a new container from an image and starts it. `docker start` starts an existing, stopped container again, with its writable layer and settings intact. `docker exec` runs an extra process inside a container that's already running, typically a shell for debugging.",
+    ],
+    lesson: "01.06",
+  },
+  {
+    id: "restart-policies",
+    q: "Can a container restart itself? Explain the restart policies.",
+    topic: "Running containers",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "edureka", "datacamp", "dataquest", "linuxhandbook", "turing", "devops-exercises"],
+    answer: [
+      "Yes, with `--restart`: `no` (default), `on-failure[:max-retries]` restarts only after a non-zero exit, `always` restarts whenever it stops and when the daemon starts, and `unless-stopped` is like `always` but stays down if you stopped it manually, even across daemon restarts.",
+      "Restarts back off exponentially. Policies only react to the process exiting: an unhealthy but running container isn't restarted by plain Docker, and nothing moves containers if the whole host dies.",
+    ],
+    lesson: "03.05",
+  },
+  {
+    id: "resource-limits",
+    q: "How do you limit a container's CPU and memory, and what happens when it exceeds them?",
+    topic: "Running containers",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["gfg", "simplilearn", "linuxhandbook", "guru99", "turing"],
+    answer: [
+      "Use `--memory 512m` (with `--memory-swap` equal to it to disallow swap), `--cpus 1.5`, and `--pids-limit`; Compose has `deploy.resources.limits`. Cgroups enforce them.",
+      "They behave differently: CPU is a throttle, so an over-limit container just runs slower. Memory is a hard limit: when the container can't get more, the kernel's OOM killer ends a process, and if it's the main one the container exits with 137 and `OOMKilled: true`. Make sure the runtime inside (JVM heap, Node heap, worker counts) fits within the limit.",
+    ],
+    lesson: "03.06",
+  },
+  {
+    id: "exec-vs-attach",
+    q: "What's the difference between `docker exec` and `docker attach`?",
+    topic: "Running containers",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["gfg", "edureka", "dataquest", "turing", "devops-exercises"],
+    answer: [
+      "`docker exec` starts a new process inside a running container, for example `docker exec -it web sh`; exiting it doesn't affect the container. `docker attach` connects your terminal to the container's main process's stdin/stdout.",
+      "Be careful with attach: pressing Ctrl+C sends the signal to the main process and can stop the container. Detach with Ctrl+P, Ctrl+Q instead. For debugging, `exec` is almost always what you want.",
+    ],
+    lesson: "03.04",
+  },
+  {
+    id: "logging",
+    q: "How does logging work in Docker, and how would you handle logs in production?",
+    topic: "Running containers",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Design",
+    seenIn: ["interviewbit", "gfg", "dataquest", "guru99", "turing"],
+    answer: [
+      "Docker captures what the container's main process writes to stdout and stderr and hands it to a logging driver. The default, `json-file`, stores it on the host and doesn't rotate unless configured; `docker logs` reads it back. Apps should log to the console, not to files inside the container.",
+      "In production, set rotation (`--log-opt max-size=10m --log-opt max-file=3`, or daemon-wide in `daemon.json`) or use the `local` driver, and ship logs to a central system with a driver or an agent like Fluent Bit, so they survive the container and can be searched.",
+    ],
+    lesson: "03.04",
+  },
+  {
+    id: "healthchecks",
+    q: "Why do containers need health checks, and what does Docker do with them?",
+    topic: "Running containers",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["gfg", "datacamp", "dataquest", "turing"],
+    answer: [
+      "Docker knows a container's process is running, not whether the app inside works. A `HEALTHCHECK` is a command Docker runs inside the container on an interval; exit 0 is healthy, and enough consecutive failures mark it unhealthy. Options: `--interval`, `--timeout`, `--start-period`, `--retries`.",
+      "Standalone Docker only reports health; it doesn't restart unhealthy containers. Compose uses it for `depends_on: condition: service_healthy`, Swarm replaces unhealthy tasks, and deploy scripts can wait for healthy before switching traffic. Kubernetes ignores it and uses its own probes.",
+    ],
+    lesson: "03.07",
+  },
+  {
+    id: "environments",
+    q: "How do you run the same image in development, staging and production?",
+    topic: "Running containers",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Design",
+    seenIn: ["interviewbit", "gfg", "simplilearn", "kodekloud", "linuxhandbook", "turing"],
+    answer: [
+      "Build one image and configure it at run time: environment variables (`-e`, `--env-file`, Compose `environment:`), mounted config files, and secrets mounted as files. Never bake environment-specific values into the image, or you're no longer testing what you ship.",
+      "In Compose, keep a base file and per-environment overrides or `.env` files, and have the app validate its config at startup and exit non-zero if something is missing or invalid.",
+    ],
+    lesson: "03.03",
+  },
+
+  // Data
+  {
+    id: "data-persistence",
+    q: "Will you lose data when a container exits? How do you persist data?",
+    topic: "Data",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ALL,
+    answer: [
+      "Not when it exits: a stopped container keeps its writable layer, so `docker start` brings the files back. You lose it when the container is removed with `docker rm`, which is what every redeploy does.",
+      "Persist data outside the container: named volumes for application data like databases, bind mounts for files the host owns, or an external service such as a managed database or object storage.",
+    ],
+    lesson: "04.01",
+  },
+  {
+    id: "volumes-vs-bind-mounts",
+    q: "What's the difference between volumes, bind mounts and tmpfs mounts?",
+    topic: "Data",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["gfg", "datacamp", "dataquest", "guru99", "kodekloud", "devops-exercises"],
+    answer: [
+      "Volumes are managed by Docker (under `/var/lib/docker/volumes`), independent of the host's directory layout, easy to back up and share, and pre-populated from the image if empty. They're the default choice for persistent data.",
+      "Bind mounts map a specific host path into the container, live in both directions, which suits source code in development and host-managed config. They hide whatever the image had at that path. tmpfs mounts live in memory and vanish when the container stops: good for scratch space and for secrets that must never touch disk.",
+    ],
+    lesson: "04.03",
+  },
+  {
+    id: "share-data",
+    q: "How do you share data between containers?",
+    topic: "Data",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["simplilearn", "gfg", "turing", "devops-exercises"],
+    answer: [
+      "Mount the same named volume into each container (`-v shared:/data`), using `:ro` for the ones that only read. Docker doesn't coordinate writes, so the apps must agree on who writes what.",
+      "Often the better answer is not to share files at all: have services exchange data over the network through an API, a database or a queue. To copy files once, use `docker cp`.",
+    ],
+    lesson: "04.02",
+  },
+
+  // Networking
+  {
+    id: "network-types",
+    q: "What network types does Docker provide, and how do containers talk to each other?",
+    topic: "Networking",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "simplilearn", "datacamp", "dataquest", "kodekloud", "linuxhandbook", "guru99", "turing", "devops-exercises"],
+    answer: [
+      "`bridge` (the default): containers get private IPs on a virtual switch on the host, with NAT for outbound traffic and `-p` to publish ports. `host`: the container shares the host's network stack, no isolation, no port mapping. `none`: loopback only. `overlay`: spans several hosts, used by Swarm. `macvlan`: gives containers their own address on the physical network.",
+      "On a user-defined bridge, containers resolve each other by name through Docker's embedded DNS (127.0.0.11); the default bridge has no name resolution. Containers on different networks can't reach each other, which you can use to keep databases off the public side.",
+    ],
+    lesson: "05.02",
+  },
+  {
+    id: "cant-reach-by-name",
+    q: "Two containers can't reach each other by name. How do you debug it?",
+    topic: "Networking",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Debugging",
+    seenIn: ["kodekloud", "dataquest", "devops-exercises"],
+    answer: [
+      "Work through it in order. Same network? `docker network inspect` lists the attached containers, and the default bridge never resolves names. Does the name resolve from the caller? `dig` from a netshoot container on that network. Is anything listening? `ss -tlnp` inside the target. Does the port answer? `nc -zv`.",
+      "The usual culprits: the containers are on different networks, the app listens on 127.0.0.1 instead of 0.0.0.0, the caller uses the published host port instead of the container port, or the config points at `localhost`, which inside a container means that container.",
+    ],
+    lesson: "05.04",
+  },
+  {
+    id: "expose-vs-publish",
+    q: "What's the difference between `EXPOSE` and publishing a port with `-p`?",
+    topic: "Networking",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["kodekloud", "dataquest", "turing"],
+    answer: [
+      "`EXPOSE` is documentation in the image: it records which port the app listens on and makes nothing reachable. `-p 8080:3000` actually publishes: traffic to port 8080 on the host is forwarded to port 3000 in the container. `-P` publishes every exposed port to a random host port.",
+      "Containers on the same network don't need either to reach each other. On Linux, published ports bypass host firewalls like ufw, so bind sensitive ones to 127.0.0.1.",
+    ],
+    lesson: "03.02",
+  },
+  {
+    id: "reach-host",
+    q: "How does a container reach a service running on the host machine?",
+    topic: "Networking",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Scenario",
+    seenIn: ["interviewbit", "gfg", "turing", "devops-exercises"],
+    answer: [
+      "`localhost` inside the container is the container itself, so it doesn't work. On Docker Desktop, use the special name `host.docker.internal`. On Linux, add it yourself with `--add-host=host.docker.internal:host-gateway`, or use the bridge gateway IP, and make sure the host service listens on an interface the container can reach, not only 127.0.0.1.",
+      "`--network host` also works on Linux but gives up network isolation, so it's rarely the right fix.",
+    ],
+    lesson: "05.03",
+  },
+
+  // Compose
+  {
+    id: "compose",
+    q: "What is Docker Compose, and how is it different from a Dockerfile?",
+    topic: "Compose",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ALL,
+    answer: [
+      "A Dockerfile describes how to build one image. A Compose file (`compose.yaml`) describes how to run a whole application: its services (each from an image or a Dockerfile), their networks, volumes, environment, ports, healthchecks and dependencies.",
+      "`docker compose up` creates and starts everything in dependency order, `down` removes it, and re-running `up` applies only what changed. It's ideal for local development, CI test environments and simple single-host deployments.",
+    ],
+    lesson: "06.01",
+  },
+  {
+    id: "startup-order",
+    q: "With Compose, how do you make sure one container starts only after another is ready?",
+    topic: "Compose",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Scenario",
+    seenIn: ["interviewbit", "gfg", "edureka"],
+    answer: [
+      "Plain `depends_on` only orders container starts; it doesn't wait for the dependency to be ready. Give the dependency a healthcheck (for Postgres, `pg_isready`) and use `depends_on: { db: { condition: service_healthy } }`. For one-off jobs like migrations there's `condition: service_completed_successfully`.",
+      "It only affects startup, so the app should still retry connections and cope with the dependency restarting later.",
+    ],
+    lesson: "06.03",
+  },
+  {
+    id: "compose-json",
+    q: "Can you write a Compose file in JSON instead of YAML?",
+    topic: "Compose",
+    level: "Junior",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "edureka", "guru99"],
+    answer: [
+      "Yes. JSON is valid YAML, so `docker compose -f compose.json up` works. In practice almost everyone uses YAML because it allows comments and is easier to read; this question mostly checks that you know JSON is a subset of YAML.",
+    ],
+  },
+  {
+    id: "compose-production",
+    q: "Is Docker Compose suitable for production? What would you change in the file?",
+    topic: "Compose",
+    level: "Senior",
+    importance: "Good to know",
+    kind: "Design",
+    seenIn: ["edureka"],
+    pick: true,
+    answer: [
+      "For a single host, yes: many small production systems run on Compose. It doesn't schedule across machines, autoscale or replace containers on other hosts, which is where an orchestrator comes in.",
+      "Changes for production: use published, versioned images instead of `build:`; remove source bind mounts and dev targets; add restart policies, resource limits, healthchecks and log rotation; harden containers (non-root, read-only, dropped capabilities); move secrets to secret files; publish only the entry point's port; and keep the database on an internal network with a named volume and real backups.",
+    ],
+    lesson: "07.07",
+  },
+
+  // Security
+  {
+    id: "secure-containers",
+    q: "How do you secure Docker containers? Name the practices you'd apply.",
+    topic: "Security",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Design",
+    seenIn: ["gfg", "simplilearn", "datacamp", "dataquest", "kodekloud", "linuxhandbook", "turing", "devops-exercises"],
+    answer: [
+      "Image: small, pinned, regularly rebuilt base images; multi-stage builds; no secrets in layers; scan with Trivy, Grype or Docker Scout and gate CI on fixable HIGH/CRITICAL findings.",
+      "Runtime: run as a non-root user, `--cap-drop ALL` and add back only what's needed, `--security-opt no-new-privileges`, read-only root filesystem with tmpfs where needed, resource limits, no `--privileged` and never mount the Docker socket. Network: publish only what's needed and separate tiers onto different networks. Host: keep the kernel and Docker patched and restrict who can use the daemon.",
+    ],
+    followUps: ["Why shouldn't containers run as root?"],
+    lesson: "07.01",
+  },
+  {
+    id: "secrets",
+    q: "How do you manage secrets like passwords and API keys with Docker?",
+    topic: "Security",
+    level: "Senior",
+    importance: "Must-know",
+    kind: "Design",
+    seenIn: ["gfg", "simplilearn", "datacamp", "dataquest", "kodekloud", "linuxhandbook", "turing"],
+    answer: [
+      "Never in the image: `ENV`, `ARG` and copied `.env` files all end up in layers or history. For build-time secrets, use BuildKit secret mounts (`RUN --mount=type=secret,id=npmrc ...` with `docker build --secret`), which are available to one step and never stored.",
+      "At runtime, mount secrets as files (Compose or Swarm secrets at `/run/secrets/NAME`, Kubernetes Secrets, or a secrets manager's agent) and have the app read them, using `_FILE` variables where images support them. Plain environment variables work but leak through `docker inspect`, child processes and crash reports. If a secret ever reaches an image, rotate it.",
+    ],
+    lesson: "07.02",
+  },
+  {
+    id: "rootless",
+    q: "What is rootless Docker, and why would you use it?",
+    topic: "Security",
+    level: "Senior",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["dataquest", "devops-exercises"],
+    answer: [
+      "Rootless mode runs the Docker daemon and its containers as an unprivileged user, using user namespaces to map root inside a container to a normal user on the host. A container escape then lands as that unprivileged user instead of host root, and users no longer need to be in the root-equivalent `docker` group.",
+      "Trade-offs: some features are limited or slower (binding ports below 1024, certain storage and network setups, some resource controls), so it fits developer machines and shared hosts well and needs testing for production workloads. Podman offers the same model and runs rootless whenever a normal user starts it.",
+    ],
+    lesson: "07.01",
+  },
+
+  // Production & CI
+  {
+    id: "cleanup",
+    q: "How do you clean up unused images, containers and other Docker data? What's a dangling image?",
+    topic: "Production & CI",
+    level: "Junior",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["gfg", "edureka", "datacamp", "dataquest", "kodekloud", "linuxhandbook", "turing", "devops-exercises"],
+    answer: [
+      "A dangling image has no tag, usually the old version left behind when you rebuild under the same tag. `docker system df` shows where space goes; `docker system prune` removes stopped containers, unused networks, dangling images and build cache.",
+      "Be careful with flags: `-a` also removes every unused tagged image, `--volumes` adds unused volumes, and `docker volume prune -a` removes unused named volumes too, which can hold real data. Per-type commands (`docker image prune`, `docker builder prune`) with `--filter until=72h` are safer for scheduled cleanup on CI hosts.",
+    ],
+    lesson: "01.06",
+  },
+  {
+    id: "docker-vs-kubernetes",
+    q: "What's the difference between Docker and Kubernetes? Where does Docker Swarm fit?",
+    topic: "Production & CI",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Concept",
+    seenIn: ["gfg", "simplilearn", "edureka", "datacamp", "dataquest", "linuxhandbook", "guru99", "turing"],
+    answer: [
+      "They solve different layers. Docker builds images and runs containers on one machine. Kubernetes is an orchestrator: it runs containers across a cluster, schedules them onto nodes, restarts and reschedules them, scales them, rolls out updates and handles service discovery and load balancing. It runs standard OCI images built with Docker, through containerd rather than the Docker daemon.",
+      "Docker Swarm is Docker's built-in orchestrator: simpler to set up and close to the Compose format, but far less widely used today, so most teams choose Kubernetes or a managed container service.",
+    ],
+  },
+  {
+    id: "scaling",
+    q: "How do you scale containers, and what limits how many can run on one host?",
+    topic: "Production & CI",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Concept",
+    seenIn: ["interviewbit", "gfg", "edureka", "datacamp", "guru99", "turing"],
+    answer: [
+      "On one host, run more replicas of a stateless service (for example `docker compose up --scale api=3`) behind a load balancer or reverse proxy; services mustn't publish fixed host ports for that to work. Across hosts, an orchestrator such as Kubernetes or Swarm schedules replicas and can autoscale.",
+      "There's no fixed container limit: it's set by the host's CPU, memory, disk and network, plus per-container overhead and the app's own needs. Measure real usage under load and set limits accordingly.",
+    ],
+  },
+  {
+    id: "ci-cd",
+    q: "How would you use Docker in a CI/CD pipeline?",
+    topic: "Production & CI",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Design",
+    seenIn: ["gfg", "simplilearn", "datacamp", "dataquest", "guru99"],
+    answer: [
+      "On every change: build the image with a cache exported from previous runs (`--cache-to/--cache-from type=gha,mode=max` on GitHub Actions, or a registry cache), run tests inside it, and scan it, failing on fixable HIGH/CRITICAL vulnerabilities.",
+      "On the main branch: push to a registry with immutable tags (the commit SHA, plus a version), multi-platform if needed, using a short-lived token. Deploy by referencing the exact tag, wait for health checks, and roll back by redeploying the previous tag. Pull requests build and test but never publish.",
+    ],
+    lesson: "07.06",
+  },
+  {
+    id: "monitoring",
+    q: "How would you monitor Docker containers in production?",
+    topic: "Production & CI",
+    level: "Senior",
+    importance: "Good to know",
+    kind: "Design",
+    seenIn: ["gfg", "edureka", "guru99", "turing"],
+    answer: [
+      "Quick checks: `docker stats` for live CPU and memory, `docker ps` for health status, `docker events` for restarts and OOM kills, `docker logs` for output.",
+      "For real monitoring: collect metrics with cAdvisor or the Docker daemon's metrics endpoint into Prometheus and graph or alert in Grafana (restart counts, OOM kills, memory near the limit, health status); ship logs centrally; and instrument the app itself for latency and error rates, since container metrics alone don't tell you users are happy.",
+    ],
+  },
+  {
+    id: "stateful",
+    q: "Should you run databases and other stateful apps in Docker?",
+    topic: "Production & CI",
+    level: "Senior",
+    importance: "Good to know",
+    kind: "Design",
+    seenIn: ["gfg", "edureka"],
+    answer: [
+      "For development and CI, absolutely: a containerised database is fast to create, seed and throw away. In production it can work well too, if you treat the data carefully: named volumes on reliable storage, the image's documented data path, pinned major versions, resource limits, and scheduled, tested backups with the database's own tools.",
+      "Many teams still choose a managed database for production because backups, failover, replication and major upgrades are done for them; containerising stateless services and buying the stateful part is a common, defensible split.",
+    ],
+    lesson: "04.05",
+  },
+  {
+    id: "migrate-data",
+    q: "How do you update a container to a new image version, or move it to a new server, without losing data?",
+    topic: "Production & CI",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Scenario",
+    seenIn: ["datacamp", "gfg", "turing"],
+    answer: [
+      "Keep the data in a named volume, not the container. To update, pull the new image and recreate the container with the same volume (`docker compose pull && docker compose up -d` does exactly this); the old container goes, the volume stays.",
+      "To move servers, back the data up in a form you can restore: the database's dump tool for databases, or a `tar` of the volume from a throwaway container for plain files. Copy it over, restore it into a fresh volume on the new host, start the same image version there, verify, and only then switch traffic.",
+    ],
+    lesson: "04.02",
+  },
+
+  // Troubleshooting
+  {
+    id: "exits-immediately",
+    q: "A container exits immediately after starting, or keeps restarting. How do you debug it?",
+    topic: "Troubleshooting",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Debugging",
+    seenIn: ["gfg", "dataquest", "kodekloud", "linuxhandbook", "turing", "devops-exercises"],
+    answer: [
+      "Start with `docker ps -a` for the exit code and `docker logs` for the last output: most causes show up there (bad config, missing environment variable, a dependency that's down). `docker inspect` gives the full state, including `OOMKilled` and `RestartCount`.",
+      "Remember a container lives only as long as its main process: a command that finishes, or a server that daemonises into the background, makes the container exit. To experiment, stop the restart loop with `docker update --restart no`, then run the same image with a shell (`docker run -it --entrypoint sh image`) and start the command by hand.",
+    ],
+    lesson: "03.01",
+  },
+  {
+    id: "exit-137",
+    q: "A container keeps exiting with code 137. What does that mean, and how do you find the cause?",
+    topic: "Troubleshooting",
+    level: "Mid",
+    importance: "Must-know",
+    kind: "Debugging",
+    seenIn: ["kodekloud"],
+    pick: true,
+    answer: [
+      "137 is 128 + 9: the process was killed with SIGKILL. Check `docker inspect -f '{{.State.OOMKilled}}'`. If true, it hit its memory limit, so look at real usage, the limit, and whether the runtime's heap is sized for the container.",
+      "If false, something else sent SIGKILL: a manual `docker kill`, an orchestrator, or `docker stop` reaching its timeout because the app ignored SIGTERM. `docker events` shows what happened and when.",
+    ],
+    lesson: "03.06",
+  },
+  {
+    id: "stop-slow",
+    q: "Why does `docker stop` take ten seconds for some containers, and how do you fix it?",
+    topic: "Troubleshooting",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Debugging",
+    seenIn: ["kodekloud"],
+    pick: true,
+    answer: [
+      "`docker stop` sends SIGTERM, then SIGKILL after the timeout (10 seconds by default on Docker Engine). The app runs as PID 1, and the kernel doesn't apply default signal behaviour to PID 1, so if the app never installed a SIGTERM handler, the signal is ignored and the container is killed at the timeout.",
+      "Handle SIGTERM in the app and shut down cleanly, use the exec form of `CMD` so the app (not a shell) is PID 1, or run with `--init` so a tiny init process forwards signals.",
+    ],
+    lesson: "01.03",
+  },
+  {
+    id: "changes-not-showing",
+    q: "You rebuilt the image, but your code changes still aren't showing up. Why?",
+    topic: "Troubleshooting",
+    level: "Mid",
+    importance: "Good to know",
+    kind: "Debugging",
+    seenIn: ["kodekloud"],
+    answer: [
+      "Common causes: you restarted the old container instead of creating a new one from the new image (`docker start` reuses the old container; recreate it, or `docker compose up --build`); the container runs a different tag than the one you built; a bind mount or volume is hiding the image's files at that path; the build context or `.dockerignore` excluded your change; or a `RUN` step that fetches code was served from cache because its command text didn't change.",
+      "Check with `docker inspect` (which image ID the container uses) and `docker run --rm image ls` (what's actually in the image).",
+    ],
+    lesson: "02.02",
+  },
+  {
+    id: "works-locally",
+    q: "It works locally but fails in production. Where do you look?",
+    topic: "Troubleshooting",
+    level: "Senior",
+    importance: "Must-know",
+    kind: "Scenario",
+    seenIn: ["kodekloud"],
+    pick: true,
+    answer: [
+      "First confirm it's the same image: compare digests, since a different tag, rebuild or architecture (arm64 laptop vs amd64 server) breaks the \"same artifact\" promise. Then compare everything that isn't in the image: environment variables and secrets, mounted files, network access to dependencies (DNS names, firewalls, internal networks), resource limits (OOM kills, CPU throttling), user and file permissions (production may run as non-root with a read-only filesystem), and data in volumes.",
+      "Logs, `docker inspect` and the exit code usually point at one of these. The fix is often to make local closer to production, for example by running the production Compose file locally.",
+    ],
+    lesson: "07.07",
+  },
+];
+
+export const levelOrder = { Junior: 0, Mid: 1, Senior: 2 } as const;
+
+/** 1–4 dots: how many of the guides include the question. */
+export function frequencyDots(q: BankQuestion) {
+  const n = q.seenIn.length;
+  return n >= 8 ? 4 : n >= 5 ? 3 : n >= 3 ? 2 : 1;
+}

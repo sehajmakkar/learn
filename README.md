@@ -22,6 +22,7 @@ Open http://localhost:3000.
 | `content/<topic>/<slug>.mdx` | One lesson. Exports `meta` (summary, related lessons) next to its content. |
 | `lib/docker.ts` | Course outline: modules, lessons, project steps, sample interview questions. A lesson goes live when it has a slug. |
 | `components/lesson/` | Lesson building blocks: code and terminal blocks, quiz, checkpoint, callouts, analogies, hover terms, diagrams. |
+| `lib/interview-bank.ts` | The interview bank: questions, which guides ask each one (its frequency), and model answers. |
 | `lib/glossary.json` | Plain-language definitions shown when you hover or tap a dotted-underlined term. |
 | `components/creation-hero.tsx` | The brand mark: the hands drawn as dots, with the topic logo between the fingers. |
 | `scripts/build-hands.mjs` | Turns `assets/hands-source.png` into `public/hands.bin`, the dot map the hero draws. |
