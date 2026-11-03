@@ -1,7 +1,7 @@
 // Static diagrams for lessons, drawn with the same hairlines as the rest of the site.
 import Link from "next/link";
 import type { ReactNode } from "react";
-import { lessonById } from "@/lib/docker";
+import { getCourse, lessonById } from "@/lib/courses";
 
 function Frame({ title, children, caption }: { title: string; children: ReactNode; caption?: ReactNode }) {
   return (
@@ -104,10 +104,11 @@ export function Anatomy({ title, parts, caption }: { title: string; parts: { tex
   );
 }
 
-/** Link to another lesson by id. Lessons not written yet render as plain text. */
-export function L({ id, children }: { id: string; children?: ReactNode }) {
-  const target = lessonById(id);
+/** Link to another lesson by id. Lessons not written yet render as plain text. `course` comes from the lesson page. */
+export function L({ id, course = "docker", children }: { id: string; course?: string; children?: ReactNode }) {
+  const owner = getCourse(course);
+  const target = owner ? lessonById(owner, id) : undefined;
   const label = children ?? (target ? `${id} ${target.title}` : id);
-  if (target?.live) return <Link href={`/docker/${target.slug}`}>{label}</Link>;
+  if (target?.live) return <Link href={`/${course}/${target.slug}`}>{label}</Link>;
   return <span title="Being written">{label}</span>;
 }

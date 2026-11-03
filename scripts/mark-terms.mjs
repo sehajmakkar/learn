@@ -1,16 +1,17 @@
 // Wraps the first plain-prose use of glossary terms in each lesson with <Term t="...">.
 // Rerunnable: terms already marked in a lesson are left alone.
-// Run: node scripts/mark-terms.mjs [--dry]
+// Run: node scripts/mark-terms.mjs <course> [--dry]   (course defaults to docker)
 import fs from "node:fs";
 import path from "node:path";
 
 const MAX_PER_LESSON = 6;
 const dry = process.argv.includes("--dry");
-const glossary = JSON.parse(fs.readFileSync("lib/glossary.json", "utf8"));
+const course = process.argv.slice(2).find((a) => !a.startsWith("--")) ?? "docker";
+const glossary = JSON.parse(fs.readFileSync(`lib/glossary/${course}.json`, "utf8"));
 
-// Lesson order and ids come from the outline in lib/docker.ts.
-const outline = fs.readFileSync("lib/docker.ts", "utf8");
-const lessons = [...outline.matchAll(/l\("(\d\d\.\d\d)", "[^"]*", \d+, "\w+", "([a-z0-9-]+)"\)/g)].map((m) => ({
+// Lesson order and ids come from the outline in lib/courses/<course>.ts.
+const outline = fs.readFileSync(`lib/courses/${course}.ts`, "utf8");
+const lessons = [...outline.matchAll(/l\("(\d\d\.\d\d)", "[^"]*", \d+, (?:"\w+"|undefined), "([a-z0-9-]+)"\)/g)].map((m) => ({
   id: m[1],
   slug: m[2],
 }));
@@ -88,7 +89,7 @@ function proseLines(lines) {
 
 const report = [];
 for (const { id: lessonId, slug } of lessons) {
-  const file = path.join("content/docker", `${slug}.mdx`);
+  const file = path.join(`content/${course}`, `${slug}.mdx`);
   const lines = fs.readFileSync(file, "utf8").split("\n");
   const prose = proseLines(lines);
   const here = order.get(lessonId);

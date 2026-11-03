@@ -1,26 +1,8 @@
-// Docker course outline. Only lessons with `live: true` have a page yet.
+// Docker course outline. Only lessons with a slug have a page yet.
+import { siDocker } from "simple-icons";
+import { l, type Course, type Module, type ProjectStep } from "@/lib/courses/types";
 
-export type Lesson = {
-  id: string; // "02.03"
-  title: string;
-  minutes: number;
-  tag?: "CODE" | "BUILD" | "CONCEPT";
-  slug?: string;
-  live?: boolean;
-};
-
-export type Module = { n: string; title: string; blurb: string; lessons: Lesson[] };
-
-const l = (id: string, title: string, minutes: number, tag?: Lesson["tag"], slug?: string): Lesson => ({
-  id,
-  title,
-  minutes,
-  tag,
-  slug,
-  live: Boolean(slug),
-});
-
-export const modules: Module[] = [
+const modules: Module[] = [
   {
     n: "01",
     title: "Foundations",
@@ -116,17 +98,7 @@ export const modules: Module[] = [
   },
 ];
 
-export const allLessons = modules.flatMap((m) => m.lessons.map((lesson) => ({ ...lesson, module: m })));
-
-export const lessonById = (id: string) => allLessons.find((x) => x.id === id);
-
-export const stats = {
-  modules: modules.length,
-  lessons: allLessons.length,
-  hours: Math.round(allLessons.reduce((sum, x) => sum + x.minutes, 0) / 60),
-};
-
-export const projectSteps = [
+const projectSteps: ProjectStep[] = [
   { tag: "docker-step-01", title: "Containerise the API", after: "02", detail: "A multi-stage Dockerfile for the notes API, built and pushed to a registry." },
   { tag: "docker-step-02", title: "Configure and health-check it", after: "03", detail: "Env-based config, a healthcheck and sensible limits." },
   { tag: "docker-step-03", title: "Persist Postgres", after: "04", detail: "Notes move to Postgres 18 on a named volume, with a tested dump and restore." },
@@ -136,11 +108,31 @@ export const projectSteps = [
   { tag: "docker-step-07", title: "Deploy to a VPS", after: "07", detail: "A hardened production compose file, secrets from files, deploys and rollbacks by tag." },
 ];
 
-export type InterviewQ = {
-  q: string;
-  level: "Junior" | "Mid" | "Senior";
-  frequency: 1 | 2 | 3 | 4;
-  importance: "Must-know" | "Good to know";
-  kind: "Concept" | "Scenario" | "Debugging" | "Design";
-  lesson?: string;
+export const docker: Course = {
+  id: "docker",
+  title: "Docker",
+  status: "live",
+  logo: { title: siDocker.title, hex: siDocker.hex, path: siDocker.path },
+  heroLabel: "docker",
+  kicker: "Course 01 · Docker · v1",
+  headline: ["Docker, from ", "first principles", "."],
+  description:
+    "Start with what a container really is. Finish by shipping a four-service app to a real server. Every lesson has commands to run, a quiz to check yourself, and the interview questions it prepares you for.",
+  penNote: "free, no login",
+  prerequisites: [
+    ["You should know", "Basic terminal use: cd, ls, running a command. Some idea of what a web server is."],
+    ["You'll need", "A laptop that can run Docker Desktop or Docker Engine, and about 10 GB of free disk."],
+    ["You'll leave with", "A production-ready image, a Compose stack, a CI pipeline and a deployed app on your GitHub."],
+  ],
+  modules,
+  project: {
+    intro:
+      "One app, built a step at a time as you learn. A Node API with Postgres, Redis and Nginx. Every step is a git tag in the companion repo, so you can check out any point and compare.",
+    steps: projectSteps,
+  },
+  meta: {
+    title: "Docker, from first principles",
+    description:
+      "Learn Docker from what a container is to shipping one to production, with quizzes, a project and an interview bank.",
+  },
 };

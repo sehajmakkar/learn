@@ -2,18 +2,29 @@ import Link from "next/link";
 import { siDocker, siGit, siKubernetes, siLinux, siPostgresql, siRedis } from "simple-icons";
 import { CreationHero } from "@/components/creation-hero";
 import { HatchBand, PenNote, SectionLabel } from "@/components/blueprint";
-import { stats } from "@/lib/docker";
+import { publishedCourses, statsOf } from "@/lib/courses";
 
 const icons = [siDocker, siKubernetes, siRedis, siPostgresql, siGit, siLinux];
 const logos = icons.map((i) => ({ title: i.title, hex: i.hex, path: i.path }));
 
-const topics = [
-  { icon: siDocker, href: "/docker", status: "Live", meta: `${stats.modules} modules · ${stats.lessons} lessons` },
-  { icon: siKubernetes, status: "Next", meta: "Planned" },
-  { icon: siRedis, status: "Planned", meta: "Planned" },
-  { icon: siPostgresql, status: "Planned", meta: "Planned" },
-  { icon: siGit, status: "Planned", meta: "Planned" },
-  { icon: siLinux, status: "Planned", meta: "Planned" },
+type Topic = { icon: { title: string; hex: string; path: string }; href?: string; status: string; meta: string };
+
+const topics: Topic[] = [
+  ...publishedCourses.map((c) => {
+    const s = statsOf(c);
+    return {
+      icon: { ...c.logo, title: c.title },
+      href: `/${c.id}`,
+      status: c.status === "live" ? "Live" : "Writing",
+      meta:
+        c.status === "live" ? `${s.modules} modules · ${s.lessons} lessons` : `${s.modules} modules · ${s.live} live`,
+    };
+  }),
+  ...[siKubernetes, siRedis, siPostgresql, siGit, siLinux].map((icon, i) => ({
+    icon,
+    status: i === 0 ? "Next" : "Planned",
+    meta: "Planned",
+  })),
 ];
 
 export default function Home() {
@@ -46,8 +57,8 @@ export default function Home() {
                   <svg viewBox="0 0 24 24" width="22" height="22" fill={href ? `#${icon.hex}` : "currentColor"} className={href ? "" : "text-muted opacity-60"} aria-hidden>
                     <path d={icon.path} />
                   </svg>
-                  <span className={`font-mono text-[0.62rem] tracking-[0.1em] uppercase ${status === "Live" ? "text-accent-ink" : "text-muted"}`}>
-                    {status === "Live" && <span className="mr-1.5 inline-block size-1.5 rounded-full bg-accent" />}
+                  <span className={`font-mono text-[0.62rem] tracking-[0.1em] uppercase ${status === "Live" || status === "Writing" ? "text-accent-ink" : "text-muted"}`}>
+                    {(status === "Live" || status === "Writing") && <span className="mr-1.5 inline-block size-1.5 rounded-full bg-accent" />}
                     {status}
                   </span>
                 </div>

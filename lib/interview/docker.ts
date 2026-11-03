@@ -1,8 +1,9 @@
 // The Docker interview bank: the questions that come up most across widely read interview guides,
 // with our own model answers. "seenIn" lists the guides that ask each question (checked November 2026);
 // that count is the frequency shown on the page. "pick" marks questions few guides list but we think matter.
+import type { Bank, BankQuestion, Source } from "@/lib/interview/types";
 
-export type SourceId =
+type SourceId =
   | "interviewbit"
   | "gfg"
   | "simplilearn"
@@ -15,7 +16,7 @@ export type SourceId =
   | "turing"
   | "devops-exercises";
 
-export const sources: Record<SourceId, { name: string; url: string; count: number }> = {
+const sources: Record<SourceId, Source> = {
   interviewbit: { name: "InterviewBit", url: "https://www.interviewbit.com/docker-interview-questions/", count: 35 },
   gfg: { name: "GeeksforGeeks", url: "https://www.geeksforgeeks.org/devops/docker-interview-questions/", count: 71 },
   simplilearn: { name: "Simplilearn", url: "https://www.simplilearn.com/tutorials/docker-tutorial/docker-interview-questions", count: 35 },
@@ -29,9 +30,7 @@ export const sources: Record<SourceId, { name: string; url: string; count: numbe
   "devops-exercises": { name: "devops-exercises (GitHub)", url: "https://github.com/bregman-arie/devops-exercises/blob/master/topics/containers/README.md", count: 143 },
 };
 
-export const SOURCE_COUNT = Object.keys(sources).length;
-
-export const topics = [
+const topics = [
   "Basics",
   "Images & Dockerfile",
   "Running containers",
@@ -42,26 +41,13 @@ export const topics = [
   "Production & CI",
   "Troubleshooting",
 ] as const;
-export type Topic = (typeof topics)[number];
+type Topic = (typeof topics)[number];
 
-export type BankQuestion = {
-  id: string;
-  q: string;
-  topic: Topic;
-  level: "Junior" | "Mid" | "Senior";
-  importance: "Must-know" | "Good to know";
-  kind: "Concept" | "Scenario" | "Debugging" | "Design";
-  seenIn: SourceId[];
-  pick?: boolean;
-  /** Paragraphs; `backticks` render as code. */
-  answer: string[];
-  followUps?: string[];
-  lesson?: string;
-};
+type DockerQuestion = Omit<BankQuestion, "topic" | "seenIn"> & { topic: Topic; seenIn: SourceId[] };
 
 const ALL: SourceId[] = Object.keys(sources) as SourceId[];
 
-export const bank: BankQuestion[] = [
+const questions: DockerQuestion[] = [
   // Basics
   {
     id: "what-is-docker",
@@ -845,10 +831,4 @@ export const bank: BankQuestion[] = [
   },
 ];
 
-export const levelOrder = { Junior: 0, Mid: 1, Senior: 2 } as const;
-
-/** 1–4 dots: how many of the guides include the question. */
-export function frequencyDots(q: BankQuestion) {
-  const n = q.seenIn.length;
-  return n >= 8 ? 4 : n >= 5 ? 3 : n >= 3 ? 2 : 1;
-}
+export const dockerBank: Bank = { checked: "November 2026", sources, topics, questions };

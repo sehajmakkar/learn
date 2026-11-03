@@ -1,59 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { Fragment, useMemo, useState, useSyncExternalStore } from "react";
+import { Fragment, useState } from "react";
 import { QuestionMeta } from "@/components/interview";
-import { lessonById } from "@/lib/docker";
-import {
-  bank,
-  frequencyDots,
-  levelOrder,
-  SOURCE_COUNT,
-  sources,
-  topics,
-  type BankQuestion,
-  type Topic,
-} from "@/lib/interview-bank";
-
-// Which questions this browser has marked as practised. No account needed.
-const KEY = "learn:interview-practised";
-const listeners = new Set<() => void>();
-let cacheRaw: string | null | undefined;
-let cache: string[] = [];
-function snapshot() {
-  let raw: string | null = null;
-  try {
-    raw = localStorage.getItem(KEY);
-  } catch {}
-  if (raw !== cacheRaw) {
-    cacheRaw = raw;
-    try {
-      cache = raw ? JSON.parse(raw) : [];
-    } catch {
-      cache = [];
-    }
-  }
-  return cache;
-}
-const empty: string[] = [];
-function usePractised() {
-  const done = useSyncExternalStore(
-    (cb) => {
-      listeners.add(cb);
-      return () => listeners.delete(cb);
-    },
-    snapshot,
-    () => empty,
-  );
-  const toggle = (id: string) => {
-    const next = done.includes(id) ? done.filter((x) => x !== id) : [...done, id];
-    try {
-      localStorage.setItem(KEY, JSON.stringify(next));
-    } catch {}
-    listeners.forEach((l) => l());
-  };
-  return { done, toggle };
-}
+import { storageKey, useStoredList } from "@/components/lesson/progress";
+import { getCourse, lessonById } from "@/lib/courses";
+import { getBank } from "@/lib/interview";
+import { frequencyDots, levelOrder, type Bank, type BankQuestion } from "@/lib/interview/types";
 
 /** Renders `backticks` as inline code. */
 function Rich({ text }: { text: string }) {
@@ -72,17 +25,21 @@ function Rich({ text }: { text: string }) {
   );
 }
 
-function seenLabel(q: BankQuestion) {
-  return q.pick ? `${q.seenIn.length}/${SOURCE_COUNT} guides · our pick` : `${q.seenIn.length}/${SOURCE_COUNT} guides`;
+function seenLabel(q: BankQuestion, total: number) {
+  return q.pick ? `${q.seenIn.length}/${total} guides · our pick` : `${q.seenIn.length}/${total} guides`;
 }
 
 function QuestionCard({
+  course,
+  bank,
   q,
   n,
   practised,
   onPractised,
   defaultOpen,
 }: {
+  course: string;
+  bank: Bank;
   q: BankQuestion;
   n: number;
   practised: boolean;
@@ -90,8 +47,10 @@ function QuestionCard({
   defaultOpen?: boolean;
 }) {
   const [open, setOpen] = useState(Boolean(defaultOpen));
-  const lesson = q.lesson ? lessonById(q.lesson) : undefined;
-  const meta = { ...q, frequency: frequencyDots(q) as 1 | 2 | 3 | 4 };
+  const owner = getCourse(course);
+  const lesson = q.lesson && owner ? lessonById(owner, q.lesson) : undefined;
+  const total = Object.keys(bank.sources).length;
+  const meta = { ...q, frequency: frequencyDots(q, total) };
   return (
     <li id={q.id} className={`border bg-paper-2 ${practised ? "border-accent/50" : "border-line"} scroll-mt-20 sm:scroll-mt-56`}>
       <div className="flex gap-4 p-5">
@@ -99,8 +58,8 @@ function QuestionCard({
         <div className="flex-1">
           <QuestionMeta
             q={meta}
-            freq={seenLabel(q)}
-            freqTitle={`Included in ${q.seenIn.map((s) => sources[s].name).join(", ")}`}
+            freq={seenLabel(q, total)}
+            freqTitle={`Included in ${q.seenIn.map((s) => bank.sources[s]?.name ?? s).join(", ")}`}
           />
           <p className="mt-2.5 text-[1.05rem] leading-snug text-ink">
             <Rich text={q.q} />
@@ -137,7 +96,7 @@ function QuestionCard({
               I can answer this
             </label>
             {lesson?.live && (
-              <Link href={`/docker/${lesson.slug}`} className="font-mono text-[0.72rem] text-muted underline decoration-line underline-offset-4 hover:text-ink">
+              <Link href={`/${course}/${lesson.slug}`} className="font-mono text-[0.72rem] text-muted underline decoration-line underline-offset-4 hover:text-ink">
                 Learn it: {lesson.id} {lesson.title} →
               </Link>
             )}
@@ -159,37 +118,40 @@ function QuestionCard({
 
 type Sort = "asked" | "course";
 
-export function InterviewBank() {
-  const { done, toggle } = usePractised();
+const randomItem = <T,>(items: T[]) => items[Math.floor(Math.random() * items.length)];
+
+export function InterviewBank({ course }: { course: string }) {
+  const bank = getBank(course)!;
+  const questions = bank.questions;
+  const { items: done, toggle } = useStoredList(storageKey("interview-practised", course));
   const [query, setQuery] = useState("");
   const [level, setLevel] = useState<BankQuestion["level"] | "All">("All");
-  const [topic, setTopic] = useState<Topic | "All">("All");
+  const [topic, setTopic] = useState<string>("All");
   const [mustOnly, setMustOnly] = useState(false);
   const [hidePractised, setHidePractised] = useState(false);
   const [sort, setSort] = useState<Sort>("asked");
   const [random, setRandom] = useState<string | null>(null);
 
-  const list = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    const filtered = bank.filter(
+  const needle = query.trim().toLowerCase();
+  const courseIndex = (q: BankQuestion) => (q.lesson ? q.lesson : "99");
+  const list = questions
+    .filter(
       (q) =>
         (level === "All" || q.level === level) &&
         (topic === "All" || q.topic === topic) &&
         (!mustOnly || q.importance === "Must-know") &&
         (!hidePractised || !done.includes(q.id)) &&
         (!needle || `${q.q} ${q.answer.join(" ")} ${q.topic}`.toLowerCase().includes(needle)),
-    );
-    const courseIndex = (q: BankQuestion) => (q.lesson ? q.lesson : "99");
-    return [...filtered].sort((a, b) =>
+    )
+    .sort((a, b) =>
       sort === "asked"
         ? b.seenIn.length - a.seenIn.length || levelOrder[a.level] - levelOrder[b.level]
         : courseIndex(a).localeCompare(courseIndex(b)),
     );
-  }, [query, level, topic, mustOnly, hidePractised, done, sort]);
 
   const pickRandom = () => {
-    const pool = list.length ? list : bank;
-    const q = pool[Math.floor(Math.random() * pool.length)];
+    const pool = list.length ? list : questions;
+    const q = randomItem(pool);
     setRandom(q.id);
     requestAnimationFrame(() => document.getElementById(q.id)?.scrollIntoView({ behavior: "smooth", block: "start" }));
   };
@@ -213,7 +175,7 @@ export function InterviewBank() {
             Random question
           </button>
           <span className="ml-auto font-mono text-[0.7rem] text-muted">
-            {done.length}/{bank.length} PRACTISED
+            {done.length}/{questions.length} PRACTISED
           </span>
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-1.5">
@@ -225,12 +187,12 @@ export function InterviewBank() {
           <span className="mx-1 h-5 w-px bg-line" />
           <select
             value={topic}
-            onChange={(e) => setTopic(e.target.value as Topic | "All")}
+            onChange={(e) => setTopic(e.target.value)}
             className="h-8 border border-line bg-paper-2 px-2 text-[0.82rem] text-ink"
             aria-label="Topic"
           >
             <option value="All">All topics</option>
-            {topics.map((t) => (
+            {bank.topics.map((t) => (
               <option key={t} value={t}>
                 {t}
               </option>
@@ -257,7 +219,7 @@ export function InterviewBank() {
       </div>
 
       <p className="mt-5 font-mono text-[0.7rem] text-muted">
-        {list.length} OF {bank.length} QUESTIONS
+        {list.length} OF {questions.length} QUESTIONS
       </p>
       {list.length === 0 ? (
         <p className="mt-6 text-[0.95rem] text-muted">No questions match. Try clearing a filter.</p>
@@ -266,6 +228,8 @@ export function InterviewBank() {
           {list.map((q, i) => (
             <QuestionCard
               key={`${q.id}-${random === q.id ? "r" : ""}`}
+              course={course}
+              bank={bank}
               q={q}
               n={i + 1}
               practised={done.includes(q.id)}

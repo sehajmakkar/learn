@@ -20,10 +20,10 @@ Open http://localhost:3000.
 | Path | What's there |
 | --- | --- |
 | `content/<topic>/<slug>.mdx` | One lesson. Exports `meta` (summary, related lessons) next to its content. |
-| `lib/docker.ts` | Course outline: modules, lessons, project steps, sample interview questions. A lesson goes live when it has a slug. |
+| `lib/courses/<topic>.ts` | A course: landing copy, logo, parts, modules, lessons, project steps. A lesson goes live when it has a slug. Register new courses in `lib/courses/index.ts`. |
 | `components/lesson/` | Lesson building blocks: code and terminal blocks, quiz, checkpoint, callouts, analogies, hover terms, diagrams. |
-| `lib/interview-bank.ts` | The interview bank: questions, which guides ask each one (its frequency), and model answers. |
-| `lib/glossary.json` | Plain-language definitions shown when you hover or tap a dotted-underlined term. |
+| `lib/interview/<topic>.ts` | A course's interview bank: questions, which guides ask each one (its frequency), and model answers. |
+| `lib/glossary/<topic>.json` | Plain-language definitions shown when you hover or tap a dotted-underlined term. |
 | `components/creation-hero.tsx` | The brand mark: the hands drawn as dots, with the topic logo between the fingers. |
 | `scripts/build-hands.mjs` | Turns `assets/hands-source.png` into `public/hands.bin`, the dot map the hero draws. |
 
@@ -31,9 +31,9 @@ Lesson components are available in every MDX file without importing them (see `m
 
 ## Adding a lesson
 
-1. Write `content/docker/<slug>.mdx`, starting with `export const meta = { summary, uses, usedIn }`.
-2. Add the slug to its entry in `lib/docker.ts`.
+1. Write `content/<topic>/<slug>.mdx`, starting with `export const meta = { summary, uses, usedIn }`.
+2. Add the slug to its entry in `lib/courses/<topic>.ts`.
 3. Give each hard-to-picture idea an `<Analogy>` box, in plain language.
-4. Run `node scripts/mark-terms.mjs` to add hover definitions to the first uses of glossary terms
-   (`lib/glossary.json`). Check its output: a word can match with the wrong meaning.
+4. Run `node scripts/mark-terms.mjs <topic>` to add hover definitions to the first uses of glossary terms
+   (`lib/glossary/<topic>.json`). Check its output: a word can match with the wrong meaning.
 5. Run every command in it yourself before publishing.

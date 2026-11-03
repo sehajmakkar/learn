@@ -4,14 +4,14 @@
 import Link from "next/link";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import glossary from "@/lib/glossary.json";
-import { lessonById } from "@/lib/docker";
+import { getCourse, lessonById } from "@/lib/courses";
+import { glossaryEntry } from "@/lib/glossary";
 
-type Entry = { term: string; def: string; lesson?: string };
 type Place = { top: number; left: number; width: number; above: boolean };
 
-export function Term({ t, children }: { t: string; children?: ReactNode }) {
-  const entry = (glossary as Record<string, Entry>)[t];
+/** `course` is filled in by the lesson page, so lessons only write <Term t="kernel">. */
+export function Term({ t, course = "docker", children }: { t: string; course?: string; children?: ReactNode }) {
+  const entry = glossaryEntry(course, t);
   const anchor = useRef<HTMLSpanElement>(null);
   const card = useRef<HTMLSpanElement>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -48,7 +48,8 @@ export function Term({ t, children }: { t: string; children?: ReactNode }) {
   }, [place]);
 
   if (!entry) return <>{children}</>;
-  const lesson = entry.lesson ? lessonById(entry.lesson) : undefined;
+  const owner = getCourse(course);
+  const lesson = entry.lesson && owner ? lessonById(owner, entry.lesson) : undefined;
 
   return (
     <>
@@ -90,7 +91,7 @@ export function Term({ t, children }: { t: string; children?: ReactNode }) {
             <span className="mt-1.5 block text-[0.9rem] leading-snug text-ink-2">{entry.def}</span>
             {lesson?.live && (
               <Link
-                href={`/docker/${lesson.slug}`}
+                href={`/${course}/${lesson.slug}`}
                 className="mt-2.5 block font-mono text-[0.68rem] text-muted underline decoration-line underline-offset-4 hover:text-ink"
               >
                 Learn it properly: {lesson.id} {lesson.title} →

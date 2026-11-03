@@ -2,8 +2,8 @@
 
 import { useProgress } from "@/components/lesson/progress";
 
-export function MarkComplete({ id }: { id: string }) {
-  const { done, toggle } = useProgress();
+export function MarkComplete({ course, id }: { course: string; id: string }) {
+  const { done, toggle } = useProgress(course);
   const isDone = done.includes(id);
   return (
     <button

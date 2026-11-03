@@ -2,49 +2,50 @@
 
 import { useSyncExternalStore } from "react";
 
-// Lesson progress lives in this browser only. No account needed.
-const KEY = "learn:progress";
+// Lists of ids saved in this browser only (completed lessons, practised questions). No account needed.
 const listeners = new Set<() => void>();
-
-function read(): string[] {
-  try {
-    return JSON.parse(localStorage.getItem(KEY) ?? "[]");
-  } catch {
-    return [];
-  }
-}
-
-let cache: string[] | null = null;
-let cacheRaw: string | null = null;
-function snapshot() {
-  let raw: string | null = null;
-  try {
-    raw = localStorage.getItem(KEY);
-  } catch {}
-  if (cache === null || raw !== cacheRaw) {
-    cacheRaw = raw;
-    cache = read();
-  }
-  return cache;
-}
-
+const cache = new Map<string, { raw: string | null; value: string[] }>();
 const empty: string[] = [];
 
-export function useProgress() {
-  const done = useSyncExternalStore(
+function snapshot(key: string) {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(key);
+  } catch {}
+  const hit = cache.get(key);
+  if (hit && hit.raw === raw) return hit.value;
+  let value: string[] = [];
+  try {
+    value = raw ? JSON.parse(raw) : [];
+  } catch {}
+  cache.set(key, { raw, value });
+  return value;
+}
+
+export function useStoredList(key: string) {
+  const items = useSyncExternalStore(
     (cb) => {
       listeners.add(cb);
       return () => listeners.delete(cb);
     },
-    snapshot,
+    () => snapshot(key),
     () => empty,
   );
   const toggle = (id: string) => {
-    const next = done.includes(id) ? done.filter((x) => x !== id) : [...done, id];
+    const next = items.includes(id) ? items.filter((x) => x !== id) : [...items, id];
     try {
-      localStorage.setItem(KEY, JSON.stringify(next));
+      localStorage.setItem(key, JSON.stringify(next));
     } catch {}
     listeners.forEach((l) => l());
   };
-  return { done, toggle };
+  return { items, toggle };
+}
+
+/** Docker keeps its original keys so nobody's saved progress resets. */
+export const storageKey = (kind: "progress" | "interview-practised", course: string) =>
+  course === "docker" ? `learn:${kind}` : `learn:${kind}:${course}`;
+
+export function useProgress(course: string) {
+  const { items, toggle } = useStoredList(storageKey("progress", course));
+  return { done: items, toggle };
 }

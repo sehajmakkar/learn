@@ -1,12 +1,9 @@
 import Link from "next/link";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { publishedCourses } from "@/lib/courses";
 import { repo } from "@/lib/site";
 
-const nav = [
-  { href: "/", label: "Library" },
-  { href: "/docker", label: "Docker" },
-  { href: "/docker/interview", label: "Interview" },
-];
+const nav = [{ href: "/", label: "Library" }, ...publishedCourses.map((c) => ({ href: `/${c.id}`, label: c.title }))];
 
 export function SiteHeader() {
   return (

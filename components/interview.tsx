@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type ReactNode } from "react";
-import type { InterviewQ } from "@/lib/docker";
+import type { InterviewQ } from "@/lib/courses/types";
 
 export function FrequencyMeter({ value, title }: { value: number; title?: string }) {
   return (
