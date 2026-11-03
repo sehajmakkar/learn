@@ -21,7 +21,8 @@ Open http://localhost:3000.
 | --- | --- |
 | `content/<topic>/<slug>.mdx` | One lesson. Exports `meta` (summary, related lessons) next to its content. |
 | `lib/docker.ts` | Course outline: modules, lessons, project steps, sample interview questions. A lesson goes live when it has a slug. |
-| `components/lesson/` | Lesson building blocks: code and terminal blocks, quiz, checkpoint, callouts, diagrams. |
+| `components/lesson/` | Lesson building blocks: code and terminal blocks, quiz, checkpoint, callouts, analogies, hover terms, diagrams. |
+| `lib/glossary.json` | Plain-language definitions shown when you hover or tap a dotted-underlined term. |
 | `components/creation-hero.tsx` | The brand mark: the hands drawn as dots, with the topic logo between the fingers. |
 | `scripts/build-hands.mjs` | Turns `assets/hands-source.png` into `public/hands.bin`, the dot map the hero draws. |
 
@@ -31,4 +32,7 @@ Lesson components are available in every MDX file without importing them (see `m
 
 1. Write `content/docker/<slug>.mdx`, starting with `export const meta = { summary, uses, usedIn }`.
 2. Add the slug to its entry in `lib/docker.ts`.
-3. Run every command in it yourself before publishing.
+3. Give each hard-to-picture idea an `<Analogy>` box, in plain language.
+4. Run `node scripts/mark-terms.mjs` to add hover definitions to the first uses of glossary terms
+   (`lib/glossary.json`). Check its output: a word can match with the wrong meaning.
+5. Run every command in it yourself before publishing.

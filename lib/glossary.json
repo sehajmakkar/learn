@@ -1,0 +1,645 @@
+{
+  "kernel": {
+    "term": "Kernel",
+    "def": "The core of the operating system. It runs every program, hands out memory and CPU time, and talks to the hardware. All containers on a machine share its kernel.",
+    "lesson": "01.02",
+    "match": [
+      "\\bkernels?\\b"
+    ]
+  },
+  "operating-system": {
+    "term": "Operating system",
+    "def": "The software that runs a computer, like Ubuntu, Windows or macOS: the kernel plus the basic tools and libraries around it.",
+    "match": [
+      "\\boperating systems?\\b"
+    ]
+  },
+  "virtual-machine": {
+    "term": "Virtual machine (VM)",
+    "def": "A whole pretend computer running inside a real one, with its own operating system and kernel.",
+    "lesson": "01.02",
+    "match": [
+      "\\bvirtual machines?\\b"
+    ]
+  },
+  "hypervisor": {
+    "term": "Hypervisor",
+    "def": "The software that creates and runs virtual machines, sharing the real hardware between them.",
+    "lesson": "01.02",
+    "match": [
+      "\\bhypervisors?\\b"
+    ]
+  },
+  "container": {
+    "term": "Container",
+    "def": "A normal program running on your machine, walled off so it gets its own files, network and process list. It's started from an image.",
+    "lesson": "01.01",
+    "match": [
+      "\\bcontainers?\\b"
+    ]
+  },
+  "image": {
+    "term": "Image",
+    "def": "A read-only package holding an app and everything it needs to run: files, libraries and settings. Containers are started from images.",
+    "lesson": "01.04",
+    "match": [
+      "\\bimages?\\b"
+    ]
+  },
+  "layer": {
+    "term": "Layer",
+    "def": "One slice of an image: the files a single Dockerfile step added or changed. An image is a stack of layers.",
+    "lesson": "02.02",
+    "match": [
+      "\\blayers?\\b"
+    ]
+  },
+  "registry": {
+    "term": "Registry",
+    "def": "A server that stores images so you can upload (push) and download (pull) them, like Docker Hub or GitHub's GHCR.",
+    "lesson": "01.04",
+    "match": [
+      "\\bregistr(?:y|ies)\\b"
+    ]
+  },
+  "tag": {
+    "term": "Tag",
+    "def": "A readable name for one version of an image, like 1.2.0 or latest. Tags can be moved to point at a different image later.",
+    "lesson": "02.06",
+    "match": [
+      "(?<!git )\\btags?\\b"
+    ]
+  },
+  "digest": {
+    "term": "Digest",
+    "def": "A fingerprint (SHA-256 hash) of an image's exact contents. Unlike a tag, it can never point at anything else.",
+    "lesson": "02.06",
+    "match": [
+      "\\bdigests?\\b"
+    ]
+  },
+  "dockerfile": {
+    "term": "Dockerfile",
+    "def": "A text file with step-by-step instructions for building an image.",
+    "lesson": "02.01",
+    "match": [
+      "\\bDockerfiles?\\b"
+    ]
+  },
+  "daemon": {
+    "term": "Daemon",
+    "def": "A program that runs in the background. The Docker daemon (dockerd) does the real work; the docker command only sends it requests.",
+    "lesson": "01.05",
+    "match": [
+      "\\bdaemons?\\b"
+    ]
+  },
+  "cli": {
+    "term": "CLI",
+    "def": "Command-line interface: a program you use by typing commands in a terminal, like docker.",
+    "match": [
+      "\\bCLI\\b"
+    ]
+  },
+  "namespace": {
+    "term": "Namespace",
+    "def": "A Linux feature that gives a process its own private view of something: its own process list, network, hostname or files.",
+    "lesson": "01.03",
+    "match": [
+      "\\bnamespaces?\\b"
+    ]
+  },
+  "cgroup": {
+    "term": "Cgroup",
+    "def": "Control group: a Linux feature that limits and measures how much CPU, memory and other resources a group of processes can use.",
+    "lesson": "01.03",
+    "match": [
+      "\\bcgroups?\\b"
+    ]
+  },
+  "process": {
+    "term": "Process",
+    "def": "A running program. The operating system gives each one an ID number (its PID) and its own memory.",
+    "match": [
+      "\\bprocess(?:es)?\\b"
+    ],
+    "lesson": "01.03"
+  },
+  "pid-1": {
+    "term": "PID 1",
+    "def": "The first process in a container, which is your app. It has a special job: it must handle shutdown signals itself, or they're ignored.",
+    "lesson": "01.03",
+    "match": [
+      "\\bPID 1\\b"
+    ]
+  },
+  "signal": {
+    "term": "Signal",
+    "def": "A short message the operating system sends to a process, like 'please stop' (SIGTERM) or 'stop now' (SIGKILL).",
+    "lesson": "03.01",
+    "match": [
+      "\\bsignals?\\b"
+    ]
+  },
+  "sigterm": {
+    "term": "SIGTERM",
+    "def": "The polite 'please shut down' signal. A program can catch it, finish its work and exit cleanly. docker stop sends it first.",
+    "lesson": "03.01",
+    "match": [
+      "\\bSIGTERM\\b"
+    ]
+  },
+  "sigkill": {
+    "term": "SIGKILL",
+    "def": "The 'stop right now' signal. It can't be caught or ignored: the process just ends, mid-task if need be.",
+    "lesson": "03.01",
+    "match": [
+      "\\bSIGKILL\\b"
+    ]
+  },
+  "exit-code": {
+    "term": "Exit code",
+    "def": "A number a program returns when it ends. 0 means success; anything else means something went wrong.",
+    "lesson": "03.01",
+    "match": [
+      "\\bexit codes?\\b"
+    ]
+  },
+  "oom-killer": {
+    "term": "OOM killer",
+    "def": "Out-of-memory killer: the part of the kernel that ends a process when memory runs out or a memory limit is reached.",
+    "lesson": "03.06",
+    "match": [
+      "\\bOOM killer\\b",
+      "\\bOOM-killed\\b"
+    ]
+  },
+  "userland": {
+    "term": "Userland",
+    "def": "Everything in an operating system except the kernel: the shell, tools, libraries and config files. An image carries a userland, never a kernel.",
+    "lesson": "01.02",
+    "match": [
+      "\\buserland\\b"
+    ]
+  },
+  "c-library": {
+    "term": "C library (glibc, musl)",
+    "def": "The low-level library nearly every program uses to talk to the kernel. Debian and Ubuntu use glibc; Alpine uses the smaller musl, which some software isn't built for.",
+    "lesson": "02.07",
+    "match": [
+      "\\bC library\\b",
+      "\\bglibc\\b",
+      "\\bmusl\\b"
+    ]
+  },
+  "build-context": {
+    "term": "Build context",
+    "def": "The folder docker build sends to the builder. COPY can only see files inside it.",
+    "lesson": "02.03",
+    "match": [
+      "\\bbuild context\\b"
+    ]
+  },
+  "buildkit": {
+    "term": "BuildKit",
+    "def": "Docker's build engine. It runs your Dockerfile's steps, caches their results, and runs independent steps in parallel.",
+    "lesson": "02.02",
+    "match": [
+      "\\bBuildKit\\b"
+    ]
+  },
+  "build-cache": {
+    "term": "Build cache",
+    "def": "Saved results of earlier build steps. If a step's inputs haven't changed, Docker reuses the saved result instead of running it again.",
+    "lesson": "02.02",
+    "match": [
+      "\\bbuild cache\\b"
+    ]
+  },
+  "port": {
+    "term": "Port",
+    "def": "A numbered door on a machine where network traffic arrives. A web server might listen on port 80 or 3000.",
+    "lesson": "03.02",
+    "match": [
+      "\\bports?\\b"
+    ]
+  },
+  "localhost": {
+    "term": "localhost (127.0.0.1)",
+    "def": "A special address that always means 'this same machine'. Inside a container, it means that container, not your computer.",
+    "lesson": "03.02",
+    "match": [
+      "\\blocalhost\\b"
+    ]
+  },
+  "ip-address": {
+    "term": "IP address",
+    "def": "The numeric address of a machine or container on a network, like 172.17.0.2.",
+    "lesson": "05.01",
+    "match": [
+      "\\bIP address(?:es)?\\b",
+      "\\bIPs?\\b"
+    ]
+  },
+  "dns": {
+    "term": "DNS",
+    "def": "The network's phone book: it turns names like db or example.com into IP addresses.",
+    "lesson": "05.02",
+    "match": [
+      "\\bDNS\\b"
+    ]
+  },
+  "bridge": {
+    "term": "Bridge network",
+    "def": "A virtual network switch inside the host that containers plug into, so they can talk to each other and reach the outside.",
+    "lesson": "05.01",
+    "match": [
+      "\\bbridges?\\b"
+    ]
+  },
+  "nat": {
+    "term": "NAT",
+    "def": "Network address translation: rewriting addresses on network traffic, so containers can share the host's address to reach the internet, and so a host port can lead to a container.",
+    "lesson": "05.01",
+    "match": [
+      "\\bNAT\\b"
+    ]
+  },
+  "env-var": {
+    "term": "Environment variable",
+    "def": "A named setting, like PORT=3000, that a program reads when it starts. It's how containers receive their configuration.",
+    "lesson": "03.03",
+    "match": [
+      "\\benvironment variables?\\b",
+      "\\benv vars?\\b"
+    ]
+  },
+  "volume": {
+    "term": "Volume",
+    "def": "Storage that Docker manages outside any container, so data survives when containers are deleted and replaced.",
+    "lesson": "04.02",
+    "match": [
+      "\\bvolumes?\\b"
+    ]
+  },
+  "bind-mount": {
+    "term": "Bind mount",
+    "def": "A folder from your own machine shown inside a container. It's not a copy: both sides see the same files.",
+    "lesson": "04.03",
+    "match": [
+      "\\bbind mounts?\\b",
+      "\\bbind-mount(?:ed|ing)?\\b"
+    ]
+  },
+  "tmpfs": {
+    "term": "tmpfs",
+    "def": "A folder that lives only in memory. It's fast, never touches the disk, and is wiped when the container stops.",
+    "lesson": "04.04",
+    "match": [
+      "\\btmpfs\\b"
+    ]
+  },
+  "healthcheck": {
+    "term": "Healthcheck",
+    "def": "A command Docker runs regularly inside a container to check the app actually works, not just that it's running.",
+    "lesson": "03.07",
+    "match": [
+      "\\bhealthchecks?\\b"
+    ]
+  },
+  "restart-policy": {
+    "term": "Restart policy",
+    "def": "A rule telling Docker whether to start a container again when its process stops, and in which cases.",
+    "lesson": "03.05",
+    "match": [
+      "\\brestart polic(?:y|ies)\\b"
+    ]
+  },
+  "compose": {
+    "term": "Docker Compose",
+    "def": "A tool that starts a whole multi-container app, with its networks and volumes, from one YAML file.",
+    "lesson": "06.01",
+    "match": [
+      "\\bCompose\\b"
+    ],
+    "caseSensitive": true
+  },
+  "yaml": {
+    "term": "YAML",
+    "def": "A simple text format for settings that uses indentation to show structure. Compose files are written in it.",
+    "match": [
+      "\\bYAML\\b"
+    ],
+    "everyday": true
+  },
+  "reverse-proxy": {
+    "term": "Reverse proxy",
+    "def": "A server that sits in front of your app, receives every request first, and forwards it on. Nginx is a popular one.",
+    "lesson": "05.05",
+    "match": [
+      "\\breverse prox(?:y|ies)\\b"
+    ]
+  },
+  "nginx": {
+    "term": "Nginx",
+    "def": "A fast, widely used web server, often placed in front of apps as a reverse proxy.",
+    "match": [
+      "\\bNginx\\b"
+    ],
+    "everyday": true
+  },
+  "postgres": {
+    "term": "PostgreSQL",
+    "def": "A popular open-source SQL database, often called Postgres.",
+    "match": [
+      "\\bPostgres(?:QL)?\\b"
+    ],
+    "everyday": true
+  },
+  "redis": {
+    "term": "Redis",
+    "def": "A very fast in-memory data store, often used as a cache.",
+    "match": [
+      "\\bRedis\\b"
+    ],
+    "everyday": true
+  },
+  "cache": {
+    "term": "Cache",
+    "def": "A quick-to-reach copy of data that's slow to fetch, kept so the next request can skip the slow trip.",
+    "match": [
+      "\\bcache\\b"
+    ],
+    "everyday": true
+  },
+  "cve": {
+    "term": "CVE",
+    "def": "A public ID for a known security bug, like CVE-2024-1234. Scanners match the packages in an image against lists of CVEs.",
+    "lesson": "07.03",
+    "match": [
+      "\\bCVEs?\\b"
+    ]
+  },
+  "scanner": {
+    "term": "Vulnerability scanner",
+    "def": "A tool that lists every package in an image and checks each one against databases of known security bugs.",
+    "lesson": "07.03",
+    "match": [
+      "\\bscanners?\\b"
+    ]
+  },
+  "capability": {
+    "term": "Capability",
+    "def": "One specific slice of root's power in Linux, like changing file owners. Containers can be given or denied each one separately.",
+    "lesson": "07.01",
+    "match": [
+      "\\bcapabilit(?:y|ies)\\b"
+    ]
+  },
+  "root": {
+    "term": "Root",
+    "def": "The all-powerful administrator account on Linux, with user ID 0.",
+    "lesson": "07.01",
+    "match": [
+      "\\broot\\b(?! (?:filesystem|of|directory|layout))(?!-)"
+    ]
+  },
+  "uid": {
+    "term": "UID",
+    "def": "User ID: the number Linux uses to identify a user. Root is 0; names like node are just labels for numbers.",
+    "match": [
+      "\\bUIDs?\\b",
+      "\\buser IDs?\\b"
+    ]
+  },
+  "secret": {
+    "term": "Secret",
+    "def": "Anything that grants access: a password, an API token, a private key.",
+    "lesson": "07.02",
+    "match": [
+      "\\bsecrets?\\b"
+    ]
+  },
+  "ci": {
+    "term": "CI",
+    "def": "Continuous integration: a server automatically builds and checks your code every time it changes, for example with GitHub Actions.",
+    "lesson": "07.06",
+    "match": [
+      "\\bCI\\b"
+    ]
+  },
+  "github-actions": {
+    "term": "GitHub Actions",
+    "def": "GitHub's built-in CI service. It runs the steps you describe in a YAML workflow file whenever your code changes.",
+    "lesson": "07.06",
+    "match": [
+      "\\bGitHub Actions\\b"
+    ]
+  },
+  "architecture": {
+    "term": "CPU architecture (amd64, arm64)",
+    "def": "The instruction set a CPU understands. amd64 is most Intel and AMD machines; arm64 is Apple Silicon Macs and many newer servers. Programs are built for one of them.",
+    "lesson": "07.04",
+    "match": [
+      "\\bamd64\\b",
+      "\\barm64\\b"
+    ]
+  },
+  "emulation": {
+    "term": "Emulation (QEMU)",
+    "def": "Running a program built for one CPU type on another by translating its instructions on the fly. It works, but slowly.",
+    "lesson": "07.04",
+    "match": [
+      "\\bQEMU\\b",
+      "\\bemulation\\b"
+    ]
+  },
+  "vps": {
+    "term": "VPS",
+    "def": "Virtual private server: a small virtual machine you rent from a cloud provider and control completely.",
+    "lesson": "07.07",
+    "match": [
+      "\\bVPS\\b"
+    ]
+  },
+  "ssh": {
+    "term": "SSH",
+    "def": "A secure way to log in to another machine and run commands on it over the network.",
+    "match": [
+      "\\bSSH\\b"
+    ]
+  },
+  "firewall": {
+    "term": "Firewall",
+    "def": "Rules that decide which network traffic may enter or leave a machine.",
+    "match": [
+      "\\bfirewalls?\\b"
+    ]
+  },
+  "tls": {
+    "term": "HTTPS / TLS",
+    "def": "Encryption for web traffic. HTTPS is HTTP sent over TLS: the padlock in your browser's address bar.",
+    "match": [
+      "\\bHTTPS\\b",
+      "\\bTLS\\b"
+    ]
+  },
+  "lockfile": {
+    "term": "Lockfile",
+    "def": "A file that records the exact version of every dependency, so every install gets the same ones. For npm it's package-lock.json.",
+    "match": [
+      "\\blockfiles?\\b"
+    ]
+  },
+  "dependency": {
+    "term": "Dependency",
+    "def": "A package of someone else's code that your app uses, like Express or pg.",
+    "match": [
+      "\\bdependenc(?:y|ies)\\b"
+    ],
+    "everyday": true
+  },
+  "hash": {
+    "term": "Hash (SHA-256)",
+    "def": "A fingerprint calculated from content. Change a single byte and the hash comes out completely different.",
+    "match": [
+      "\\bSHA-256\\b",
+      "\\bhash\\b"
+    ],
+    "everyday": true
+  },
+  "oci": {
+    "term": "OCI",
+    "def": "Open Container Initiative: the shared standard for image and container formats, so images work with Docker, Podman and Kubernetes alike.",
+    "match": [
+      "\\bOCI\\b"
+    ]
+  },
+  "kubernetes": {
+    "term": "Kubernetes",
+    "def": "A system that runs containers across many machines, restarting and moving them automatically as needed.",
+    "match": [
+      "\\bKubernetes\\b"
+    ]
+  },
+  "orchestrator": {
+    "term": "Orchestrator",
+    "def": "A system that runs and manages containers across many machines for you. Kubernetes is the best known.",
+    "match": [
+      "\\borchestrat(?:or|ors|ion)\\b"
+    ]
+  },
+  "seccomp": {
+    "term": "seccomp",
+    "def": "A Linux feature that blocks a program from making certain risky requests to the kernel.",
+    "match": [
+      "\\bseccomp\\b"
+    ]
+  },
+  "copy-on-write": {
+    "term": "Copy-on-write",
+    "def": "A trick where a file is shared until someone changes it; only then is a private copy made for them.",
+    "match": [
+      "\\bcopy-on-write\\b"
+    ]
+  },
+  "stdout": {
+    "term": "stdout / stderr",
+    "def": "A program's two standard output streams: normal output (stdout) and errors (stderr). Docker records both as the container's logs.",
+    "lesson": "03.04",
+    "match": [
+      "\\bstdout\\b",
+      "\\bstderr\\b"
+    ]
+  },
+  "api": {
+    "term": "API",
+    "def": "A program other programs talk to over the network. The notes API answers HTTP requests with JSON.",
+    "match": [
+      "\\bAPI\\b"
+    ],
+    "everyday": true
+  },
+  "typescript": {
+    "term": "TypeScript",
+    "def": "JavaScript with type annotations. It's compiled (or has its types stripped) into plain JavaScript before Node runs it.",
+    "match": [
+      "\\bTypeScript\\b"
+    ],
+    "everyday": true
+  },
+  "image-index": {
+    "term": "Image index",
+    "def": "A list that points to one image per CPU type under a single tag, so each machine pulls the one it can run.",
+    "lesson": "02.06",
+    "match": [
+      "\\bmanifest lists?\\b",
+      "\\bimage index\\b"
+    ]
+  },
+  "attestation": {
+    "term": "Attestation",
+    "def": "Extra metadata attached to an image describing how and from what it was built.",
+    "lesson": "07.04",
+    "match": [
+      "\\battestations?\\b"
+    ]
+  },
+  "ghcr": {
+    "term": "GHCR",
+    "def": "GitHub Container Registry (ghcr.io): GitHub's registry for container images.",
+    "lesson": "02.06",
+    "match": [
+      "\\bGHCR\\b"
+    ]
+  },
+  "docker-hub": {
+    "term": "Docker Hub",
+    "def": "Docker's public registry, home of official images like nginx, node and postgres.",
+    "match": [
+      "\\bDocker Hub\\b"
+    ],
+    "everyday": true
+  },
+  "alpine": {
+    "term": "Alpine Linux",
+    "def": "A very small Linux distribution, popular as a base image because it's only a few megabytes.",
+    "lesson": "02.07",
+    "match": [
+      "\\bAlpine\\b"
+    ],
+    "caseSensitive": true
+  },
+  "debian": {
+    "term": "Debian",
+    "def": "A long-standing Linux distribution. Most official images, including node and postgres, are built on it.",
+    "match": [
+      "\\bDebian\\b"
+    ],
+    "everyday": true
+  },
+  "distroless": {
+    "term": "Distroless",
+    "def": "Images containing only your app's runtime and its libraries: no shell and no package manager.",
+    "lesson": "02.07",
+    "match": [
+      "\\bdistroless\\b"
+    ]
+  },
+  "multi-stage": {
+    "term": "Multi-stage build",
+    "def": "A Dockerfile with several FROM stages: you build in one and copy only the results into a small final one.",
+    "lesson": "02.04",
+    "match": [
+      "\\bmulti-stage(?: builds?)?\\b"
+    ]
+  },
+  "trivy": {
+    "term": "Trivy",
+    "def": "A free, open-source vulnerability scanner for images.",
+    "lesson": "07.03",
+    "match": [
+      "\\bTrivy\\b"
+    ]
+  }
+}

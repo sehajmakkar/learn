@@ -36,6 +36,18 @@ export function Aside({ title = "Going further", children }: { title?: string; c
   );
 }
 
+/** An everyday comparison for a concept that's hard to picture on first read. */
+export function Analogy({ children }: { children: ReactNode }) {
+  return (
+    <aside className="not-prose my-8 border-l-2 border-dashed border-accent py-1 pl-5">
+      <p className="font-pen text-[1.5rem] leading-none text-accent-ink">think of it like…</p>
+      <div className="mt-2 space-y-2 text-[1rem] leading-relaxed text-ink-2 [&_code]:font-mono [&_code]:text-[0.85em] [&_code]:text-ink [&_strong]:text-ink">
+        {children}
+      </div>
+    </aside>
+  );
+}
+
 /** Written by Sehaj after doing the lesson: what actually went wrong. */
 export function Tripped({ children }: { children: ReactNode }) {
   return (
