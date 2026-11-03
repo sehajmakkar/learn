@@ -85,3 +85,99 @@ more participants. With `walk`, readers step through one message at a time and s
     { from: "api", to: "c", label: "201 (saved reply)", reply: true, explain: "…and returns the first answer instead of charging twice." },
   ]}
 />
+
+## Real systems: `<SeenInProduction>` and `<Seen>`
+
+Two to four cards per concept lesson. Every card links to the company's own write-up, paper or postmortem, and
+ends with our one-line takeaway.
+
+<SeenInProduction>
+  <Seen
+    company="Discord"
+    system="Message storage"
+    year={2023}
+    href="https://discord.com/blog/how-discord-stores-trillions-of-messages"
+    source="How Discord stores trillions of messages"
+    found="Hot partitions, not total size, were what hurt; they fixed them by coalescing duplicate reads in front of the database."
+  >
+    Moved message storage from Cassandra to ScyllaDB and put a Rust data service in front that merges identical
+    requests for the same channel into one database query.
+  </Seen>
+  <Seen
+    company="Stripe"
+    system="Payments API"
+    year={2017}
+    href="https://stripe.com/blog/idempotency"
+    source="Designing robust and predictable APIs with idempotency"
+    found="Retries are only safe when the server can recognise a request it has already handled."
+  >
+    Clients send an `Idempotency-Key` header with each charge. The server stores the key with the result, so a retry
+    after a timeout returns the first result instead of charging twice.
+  </Seen>
+</SeenInProduction>
+
+## Design exercise: `<DesignIt>`
+
+Opens every design lesson. The notes and rubric ticks are saved in the reader's browser, keyed by `id`.
+
+<DesignIt
+  id="styleguide-snip"
+  minutes={30}
+  levels={["junior", "mid"]}
+  patterns={["caching", "ID generation", "read-heavy"]}
+  rubric={[
+    "State that reads outnumber writes by about 100 to 1, and design for reads",
+    "Pick how short codes are made (counter + base62, hash, or random) and say what each costs",
+    "Put a cache in front of the database for redirects",
+    "Choose 301 or 302 and explain what it does to click counting",
+    "Record clicks without slowing the redirect down",
+  ]}
+>
+  Design a URL shortener. Users paste a long URL and get a short one like `snip.link/x7Kp`; anyone opening the
+  short URL is redirected. Assume 10 million new links a month.
+
+  - Short links never expire unless the owner deletes them
+  - Owners can see how many times each link was opened
+</DesignIt>
+
+## Expectations: `<Levels>`
+
+<Levels
+  junior={["A working design: API, one database, a cache", "Can explain how a redirect is served"]}
+  mid={["Estimates that drive choices (reads per second, storage)", "Compares ways to generate short codes"]}
+  senior={["Leads the conversation and picks the deep dives", "Hot links, abuse, multi-region and what fails first"]}
+/>
+
+## Reference numbers: `<NumbersToKnow>`
+
+Give every row an `ns` duration to get log-scale bars and the "human time" toggle.
+
+<NumbersToKnow
+  title="Latency"
+  rows={[
+    { label: "Read from L1 cache", value: "~1 ns", ns: 1 },
+    { label: "Read from main memory", value: "~100 ns", ns: 100 },
+    { label: "Random read from an SSD", value: "~16 µs", ns: 16000 },
+    { label: "Read 1 MB sequentially from an SSD", value: "~50 µs", ns: 50000 },
+    { label: "Round trip inside one datacenter", value: "~500 µs", ns: 500000 },
+    { label: "Spinning disk seek", value: "~2–10 ms", ns: 5000000 },
+    { label: "Round trip California ↔ Netherlands", value: "~150 ms", ns: 150000000 },
+  ]}
+  source="Rough orders of magnitude; exact values depend on hardware."
+/>
+
+## Labs: `<Lab>`
+
+The frame every lab sits in. Reset remounts the simulator; the "try this" ticks are saved.
+
+<Lab
+  id="styleguide-estimate"
+  title="Back-of-the-envelope estimation"
+  tasks={[
+    "Set 1M daily users making 0.3 links each: about 10M links a month. How many writes per second is that?",
+    "Raise reads per write from 100 to 1,000. Which number changed, and which didn't?",
+    "How much storage do 5 years of links take at 500 bytes each?",
+  ]}
+>
+  <EstimateLab />
+</Lab>

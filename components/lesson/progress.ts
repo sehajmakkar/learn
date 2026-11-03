@@ -49,3 +49,32 @@ export function useProgress(course: string) {
   const { items, toggle } = useStoredList(storageKey("progress", course));
   return { done: items, toggle };
 }
+
+const textCache = new Map<string, string>();
+
+/** A piece of text saved in this browser, such as notes written during a design exercise. */
+export function useStoredText(key: string) {
+  const value = useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => {
+      try {
+        return localStorage.getItem(key) ?? "";
+      } catch {
+        return textCache.get(key) ?? "";
+      }
+    },
+    () => "",
+  );
+  const set = (next: string) => {
+    textCache.set(key, next);
+    try {
+      if (next) localStorage.setItem(key, next);
+      else localStorage.removeItem(key);
+    } catch {}
+    listeners.forEach((l) => l());
+  };
+  return [value, set] as const;
+}

@@ -9,6 +9,11 @@ import { InterviewCard } from "@/components/interview";
 import { Anatomy, Flow, L, Stacks } from "@/components/lesson/diagrams";
 import { Arch, Evolve } from "@/components/lesson/arch";
 import { Sequence } from "@/components/lesson/sequence";
+import { Levels, Seen, SeenInProduction } from "@/components/lesson/design";
+import { DesignIt } from "@/components/lesson/design-it";
+import { NumbersToKnow } from "@/components/lesson/numbers";
+import { Lab } from "@/components/lesson/lab";
+import { EstimateLab } from "@/components/labs/estimate";
 
 // Everything a lesson can use without importing it.
 const components: MDXComponents = {
@@ -31,6 +36,13 @@ const components: MDXComponents = {
   Arch,
   Evolve,
   Sequence,
+  SeenInProduction,
+  Seen,
+  DesignIt,
+  Levels,
+  NumbersToKnow,
+  Lab,
+  EstimateLab,
 };
 
 export function useMDXComponents(): MDXComponents {
