@@ -1,0 +1,157 @@
+export const meta = {
+  summary: "Building a home feed of posts from everyone a user follows: push each post into followers' feeds, pull at read time, or decide per author. Tested hybrid code, what to store in a feed, and ranking.",
+  uses: ["07.09", "12.04", "04.12", "06.01"],
+  usedIn: ["12.08", "15.08"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.09" />, which introduced fan-out on write and on read. Feeds read from the <Term t="social-graph">social graph</Term>
+  (<L id="12.04" />) and are a <Term t="denormalisation">denormalised</Term> copy (<L id="04.12" />) kept in a cache
+  (<L id="06.01" />).
+</BeforeYouStart>
+
+## The problem: "new links from creators you follow"
+
+Snip Bio's app opens on a feed: the latest links posted by creators you follow, newest first. Most users follow 20 to
+300 creators. Most creators have a few hundred followers; a handful have millions. People open the app far more often
+than creators post. The feed must load in under 200 ms.
+
+## Push: build feeds on write
+
+When a creator posts, a worker appends the post's ID to the stored feed of **every follower**: a list per user, newest
+first, capped at a few hundred entries (older posts are rarely scrolled to, and can be fetched the slow way). Opening
+the app is then one cheap read of a precomputed list.
+
+The cost is on write: one post from a creator with 2 million followers is 2 million feed writes, and it takes time
+for the last follower's feed to get it.
+
+## Pull: build feeds on read
+
+Store each creator's posts once. When a user opens the app, fetch the recent posts of everyone they follow and merge
+them. Posting is one write. Reading is a fan-out to hundreds of creators and a merge, on every open, which is slow and
+expensive when reads vastly outnumber posts.
+
+## Hybrid: decide per author
+
+Yahoo's "Feeding Frenzy" paper made this precise: the minimum total cost comes from deciding push or pull separately
+for each pair of producer and consumer, based on how often the producer posts compared with how often the consumer
+reads. In practice it usually reduces to a simple rule: **push for ordinary creators, pull for creators with huge
+followings**, and merge the two at read time.
+
+```ts
+type Post = { id: number; author: string; at: number };
+
+export class Feeds {
+  private posts = new Map<string, Post[]>(); // author -> their posts, newest last
+  private inbox = new Map<string, Post[]>(); // follower -> pushed posts, newest last
+
+  constructor(
+    private readonly followers: Map<string, string[]>, // author -> followers
+    private readonly following: Map<string, string[]>, // user -> authors they follow
+    readonly celebrityThreshold = 1000,
+    readonly keep = 800,
+  ) {}
+
+  private isCelebrity(author: string) {
+    return (this.followers.get(author)?.length ?? 0) >= this.celebrityThreshold;
+  }
+
+  publish(p: Post) {
+    this.posts.set(p.author, [...(this.posts.get(p.author) ?? []), p]);
+    if (this.isCelebrity(p.author)) return; // too many followers: they'll pull it at read time
+    for (const f of this.followers.get(p.author) ?? []) {
+      const box = this.inbox.get(f) ?? [];
+      box.push(p);
+      if (box.length > this.keep) box.shift(); // keep only the newest posts per feed
+      this.inbox.set(f, box);
+    }
+  }
+
+  read(user: string, limit = 20): Post[] {
+    const pushed = this.inbox.get(user) ?? [];
+    const pulled = (this.following.get(user) ?? [])
+      .filter((a) => this.isCelebrity(a))
+      .flatMap((a) => (this.posts.get(a) ?? []).slice(-limit));
+    return [...pushed, ...pulled].sort((a, b) => b.at - a.at || b.id - a.id).slice(0, limit);
+  }
+}
+```
+
+Tested with 3,000 users, each following up to 20 accounts with a skewed popularity (so a few accounts had thousands of
+followers), and 5,000 posts: with a celebrity threshold of 500 followers, only 5 accounts were pulled, yet pushing
+fell from 426,487 feed writes to 187,176, and for 300 users checked against a brute-force feed, every one matched.
+
+## What a feed stores
+
+- **IDs, not posts.** A feed entry is a post ID and a timestamp (maybe the author). Post content is fetched in a batch
+  from a cache when the feed is read, so edits and deletions show up immediately and feeds stay small.
+- **Capped length.** A few hundred entries per user. Scrolling past that falls back to the pull path.
+- **Only for active users.** Building feeds for people who haven't opened the app in a month is wasted work. Skip
+  them on write and build their feed by pulling when they return.
+
+## Ranking
+
+Newest first is the simplest order. Many feeds instead **rank**: a model scores the candidate posts from push and pull
+by predicted interest (relationship with the author, engagement so far, freshness), then sorts. The architecture
+stays the same: fan-out gathers **candidates**; ranking orders them at read time.
+
+<Analogy>
+  **Newspapers versus a library.** Delivering a paper to every subscriber's door each morning (push) makes reading instant but costs a delivery per subscriber. Going to the library to read every paper you like (pull) costs nothing to publish but takes time each morning. Most households get their local paper delivered, and read the big national ones at the library.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Yahoo! Research"
+    system="Feeding Frenzy"
+    year={2010}
+    href="http://jeffterrace.com/docs/feeding-frenzy-sigmod10-web.pdf"
+    source="Feeding Frenzy: Selectively Materializing Users' Event Feeds (Silberstein, Terrace, Cooper and Ramakrishnan, SIGMOD 2010)"
+    found="Decide push or pull for each producer-consumer pair from their relative event and query rates; the hybrid gives the lowest load."
+  >
+    The paper defines push as writing events into materialized per-consumer feeds, and pull as fetching from
+    per-producer event stores at query time. It notes that fan-out multiplies load (one celebrity's update then reached
+    over 4.6 million followers) and that fan-outs and update rates are highly skewed. Its analysis shows the global
+    cost is minimised by making a local decision for each producer-consumer pair based on the ratio of the producer's
+    update rate to the consumer's query rate, and experiments on Yahoo's PNUTS showed this hybrid gave the lowest
+    system load.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip pushes every post to every follower. A creator with 3 million followers posts, and followers see it up to 10 minutes late, while the feed workers' queue backs up for everyone. What's the fix?"
+  options={[
+    { text: "Add more feed workers", why: "It helps the backlog but every mega-post still costs millions of writes, and the next one does it again." },
+    { text: "Don't push for accounts above a follower threshold; merge their recent posts into feeds at read time", correct: true, why: "Pulling for the few huge accounts removes most of the write load, and their posts appear for followers immediately." },
+    { text: "Push only to followers who are online right now", why: "Better, but a celebrity's online followers can still number hundreds of thousands, and offline followers would miss the post." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Pushing for everyone.** Mega-accounts turn one post into millions of writes. Pull for them.</li>
+    <li>**Storing whole posts in feeds.** Store IDs; hydrate from a cache at read time.</li>
+    <li>**Unbounded feeds.** Cap them; old entries can come from the pull path.</li>
+    <li>**Building feeds for inactive users.** Skip them and rebuild on return.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Push builds each follower's feed on write: cheap reads, expensive posts from big accounts.</li>
+    <li>Pull merges followed accounts' posts on read: cheap posts, expensive reads.</li>
+    <li>Hybrid pushes for most authors and pulls for the few with huge followings, merging at read time.</li>
+    <li>Feeds hold capped lists of IDs, only for active users; ranking orders the candidates at read time.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design the home timeline for a social network like Twitter.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle accounts with tens of millions of followers?", "What exactly is stored in each user's timeline?"]}
+>
+  <p>Reads vastly outnumber posts, so the default is fan-out on write: when someone posts, workers append the post ID to each follower's precomputed timeline, a capped list in an in-memory store, and reading is a single fetch followed by hydrating post content from a cache. Posts go through a queue so writing is asynchronous.</p>
+  <p>For accounts with huge followings, fan-out on write is too expensive and slow, so I'd skip it and instead merge their recent posts at read time, a hybrid. Timelines store only IDs and are maintained only for recently active users; inactive users get theirs rebuilt by pulling when they return. A ranking stage can score and reorder the candidates before returning them.</p>
+</InterviewCard>

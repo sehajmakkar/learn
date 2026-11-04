@@ -1,0 +1,141 @@
+export const meta = {
+  summary: "Holding millions of long-lived connections: what limits one server, how to route messages to whichever server holds a user, heartbeats through proxies, resuming after a disconnect, and deploying without a reconnect storm.",
+  uses: ["03.05", "07.09", "03.09", "03.06"],
+  usedIn: ["12.02", "12.08", "15.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.05" /> for SSE and WebSockets, and <L id="07.09" /> for fanning updates out to connections. This
+  lesson is about running that at millions of connections.
+</BeforeYouStart>
+
+## The problem: three million phones, always connected
+
+Snip launches **Snip Bio**: public profile pages where creators list their links, and a mobile app where people follow
+creators and get live updates: new links, live click counters, "who's viewing your page right now". At peak, three
+million app users are online, each holding one WebSocket. A request-response <Term t="api">API</Term> scales by requests per second;
+this scales by **connections held at once**, and connections are stateful.
+
+## What one server can hold
+
+An idle WebSocket costs little CPU, but each one holds a socket (a file descriptor) and some memory for buffers and
+per-connection state. The first limits people hit are configuration, not hardware: the operating system's default
+limit of open files per process is often 1,024. Phoenix's team, benchmarking WebSockets in 2015, stopped at exactly
+1,000 connections until they raised it, and eventually held 2 million idle connections on one 40-core, 128 GB server.
+
+Real traffic is heavier than idle connections: messages to encode, TLS, <Term t="heartbeat">heartbeats</Term>. Snip plans for **100,000
+connections per gateway server**, so three million users need about 30 servers plus headroom for a server or a zone
+to fail.
+
+## Two kinds of server
+
+Split the job, as Slack and Discord do (<L id="07.09" />):
+
+- **Gateway servers** hold the connections: authenticate on connect, keep the socket alive, write messages out. They
+  know nothing about business logic.
+- **Back-end services** decide what to send to whom, and publish it.
+
+The hard part is routing: an update for user 4821 must reach whichever gateway holds 4821's connection. Two common
+designs:
+
+- **Subscribe by topic.** Each gateway subscribes, on a pub/sub system, to the topics its connected users need
+  (`user:4821`, `link:x7Kp`). Publishers don't need to know where anyone is.
+- **A connection registry.** When a user connects, record `user 4821 → gateway 17` in a fast store with a TTL; senders
+  look it up and send directly. Fewer subscriptions, but one more thing to keep accurate.
+
+Snip uses topic subscriptions for shared topics (a link's live counter) and the registry for per-user messages.
+
+## Keeping connections healthy
+
+- **Heartbeats.** Load balancers and mobile networks silently drop connections that look idle. Send a small ping
+  every 20–30 seconds in each direction, and treat a missed reply as a dead connection, on both sides.
+- **Resume, don't restart.** A phone going through a tunnel disconnects for ten seconds. If the server numbers each
+  message to a user, the client reconnects with "last seen #1,842" and gets only what it missed, rather than
+  reloading everything.
+- **Per-connection buffers.** A slow client must never block the others. Give each connection a bounded outgoing
+  buffer; if it fills, drop old updates that have been superseded (a counter), or disconnect the client so it resumes
+  later (<L id="07.09" />).
+
+## Deploys without a reconnect storm
+
+Restarting a gateway closes 100,000 connections, and all of them reconnect within a second. Multiplied across a
+rolling deploy, that's a self-inflicted surge. Defences:
+
+- **Drain slowly.** Tell the load balancer to stop sending new connections to the old server, then close existing
+  ones gradually over minutes, not all at once.
+- **Jittered reconnects.** Clients wait a random delay before reconnecting, growing on repeated failures
+  (<L id="03.09" />).
+- **Resume tokens**, so reconnecting is cheap for the back end, not a full reload.
+
+<Analogy>
+  **A hotel switchboard.** The operators (gateways) just hold the lines open; they don't know what guests want. When a message arrives for room 412, the front desk looks up which operator has room 412's line (the registry) and passes it to them. If an operator's shift ends, they hand their lines over gradually, not by hanging up on everyone at once.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Phoenix"
+    system="2 million WebSocket connections"
+    year={2015}
+    href="https://phoenixframework.org/blog/the-road-to-2-million-websocket-connections"
+    source="The Road to 2 Million Websocket Connections in Phoenix (Gary Rennie)"
+    found="The first limit was the default open-file limit of 1,024; after raising it, one large server held 2 million idle connections."
+  >
+    The team's first runs topped out at about 1,000 connections, which they traced to `ulimit -n` returning 1024. After
+    raising file-descriptor and network limits, a 40-core server with 128 GB of RAM held 2 million clients, limited
+    again by ulimit. The post is candid that these were idle connections joined to one room, which isn't a typical use
+    case.
+  </Seen>
+  <Seen
+    company="Discord"
+    system="Elixir sessions and guilds"
+    year={2017}
+    href="https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users"
+    source="How Discord Scaled Elixir to 5,000,000 Concurrent Users (Stanislav Vishnevskiy)"
+    found="A process per connected session and per guild; fanning out to the biggest guilds was the bottleneck."
+  >
+    Each user connects to a WebSocket that starts a session process, which talks to guild processes on other nodes.
+    Anything published in a guild is fanned out to every connected session in it, and when a user comes online the
+    guild publishes their <Term t="presence">presence</Term> to everyone else. With guilds of up to 30,000 concurrent users, publishing an event
+    took from 900 ms to 2.1 s at peak, which Discord fixed by spreading the sending work across nodes.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip deploys its 30 gateway servers one at a time, restarting each immediately. During deploys, the auth service is overwhelmed. Why, and what's the fix?"
+  options={[
+    { text: "The new version has a bug in authentication", why: "The surge happens with any version: it's caused by how the restart is done." },
+    { text: "Each restart makes 100,000 clients reconnect and re-authenticate at once; drain connections gradually and make clients reconnect with jitter and resume tokens", correct: true, why: "Gradual draining spreads reconnects over minutes, jitter spreads them further, and resume tokens make each reconnect cheap." },
+    { text: "There are too few gateway servers", why: "More servers mean smaller surges per restart, but the same total, still compressed into seconds." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Default OS limits.** Raise open-file and related limits before load testing.</li>
+    <li>**Business logic in gateways.** Keep them thin; they should only hold connections and write messages.</li>
+    <li>**No heartbeats.** Idle connections are dropped silently by proxies and mobile networks.</li>
+    <li>**Full reload on every reconnect.** Number messages and let clients resume from the last one they saw.</li>
+    <li>**Restarting everything at once.** Drain gradually and jitter reconnects.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Long-lived connections scale by connections held, not requests; size gateways for connections plus headroom.</li>
+    <li>Separate thin gateways from back-end logic, and route by topic subscriptions or a connection registry.</li>
+    <li>Heartbeat through proxies, resume with message numbers, and give each connection a bounded buffer.</li>
+    <li>Deploy by draining gradually, with jittered reconnects and cheap resumes.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you scale a WebSocket service to millions of concurrent users?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How does a back-end service send a message to a specific user?", "What happens during a deploy?"]}
+>
+  <p>Use a fleet of stateless-logic gateway servers that only terminate connections, authenticate, heartbeat and write messages, sized for connections per server with raised file-descriptor limits and headroom for failures. Back-end services publish messages; gateways subscribe to topics for their connected users, or a registry maps each user to their gateway with a TTL so senders can route directly.</p>
+  <p>For reliability, heartbeats detect dead connections through proxies; messages carry per-user sequence numbers so reconnecting clients resume from the last one; each connection has a bounded buffer so slow clients can't block others. Deploys drain servers gradually, and clients reconnect with exponential backoff and jitter to avoid a reconnect storm.</p>
+</InterviewCard>

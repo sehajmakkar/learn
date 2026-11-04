@@ -1,0 +1,138 @@
+export const meta = {
+  summary: "Follows, friends and likes as edges between objects. Storing them as two-way indexed rows, counting followers without scanning, sharding when one account has millions of edges, and why most social graphs live in a relational database behind a big cache, not a graph database.",
+  uses: ["04.02", "04.12", "05.01", "06.01", "05.02"],
+  usedIn: ["12.03", "15.08"],
+};
+
+<BeforeYouStart>
+  You'll use composite indexes (<L id="04.02" />), denormalised counters (<L id="04.12" />), sharding
+  (<L id="05.01" />) and caching (<L id="06.01" />). A celebrity's edges are a hot key (<L id="05.02" />).
+</BeforeYouStart>
+
+## The problem: who follows whom
+
+Snip Bio lets people follow creators. The feed (<L id="12.03" />) needs "who does Ana follow?", notifications need "who
+follows this creator?", profiles show follower counts, and the app suggests "creators followed by people you follow".
+Soon there are hundreds of millions of follow edges, and one creator has 9 million followers.
+
+## Edges as rows, indexed both ways
+
+A follow is an edge with a direction. The plainest storage is a table of edges, indexed for both questions:
+
+```sql
+CREATE TABLE follows (
+  follower_id bigint      NOT NULL,
+  followee_id bigint      NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (follower_id, followee_id)                              -- "who does X follow?", no duplicates
+);
+CREATE INDEX follows_by_followee ON follows (followee_id, follower_id); -- "who follows X?"
+```
+
+Each question is now an index range scan. Tested on 395,000 random edges in Postgres: listing a user's followers ran
+as an index-only scan, and "people you may know" (accounts followed by the people you follow, excluding ones you
+already follow) ran in about a quarter of a millisecond:
+
+```sql
+SELECT f2.followee_id AS suggestion, count(*) AS via
+  FROM follows f1
+  JOIN follows f2 ON f2.follower_id = f1.followee_id
+ WHERE f1.follower_id = $1
+   AND f2.followee_id <> $1
+   AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.follower_id = $1 AND x.followee_id = f2.followee_id)
+ GROUP BY f2.followee_id
+ ORDER BY via DESC
+ LIMIT 10;
+```
+
+Two hops is where this stays fast: it touches the edges of the people you follow. Three hops multiplies again, which is
+why "friends of friends of friends" queries are computed offline, not per request.
+
+## Counts are stored, not counted
+
+"9.2M followers" on a profile can't be `count(*)` over 9 million rows on every view. Keep a counter per account,
+updated when edges are added or removed, through the same batching as any hot counter (<L id="11.01" />): a viral
+creator gains thousands of followers a minute, and one counter row would be a hot spot (<L id="05.02" />).
+
+## Sharding the graph
+
+At hundreds of millions of edges, the table is sharded (<L id="05.01" />). By follower ID, "who do I follow?" is on one
+shard but "who follows X?" is spread over all of them. The usual answer is to **store each edge twice**: once on the
+follower's shard (outgoing) and once on the followee's shard (incoming), written together through the outbox
+(<L id="07.06" />). Each direction is then a single-shard query.
+
+The celebrity with 9 million followers still puts 9 million incoming edges on one shard. Paging through them is fine;
+loading them all at once isn't, and the feed avoids needing to (<L id="12.03" />).
+
+## Objects and associations: Facebook's TAO
+
+Facebook stores its social graph in TAO, which models everything as **objects** (users, posts, comments) and
+**associations** (typed, directed edges: follows, likes, authored, commented on). Underneath, TAO is MySQL, sharded,
+with a large two-tier cache in front of it: read-dominated work is served from cache, and the cache understands
+association lists, so "the 50 most recent comments on this post" is a cache read. Its <Term t="api">API</Term> is deliberately small: get
+an object, get associations of a type from an object (newest first), count them.
+
+That's the general lesson. **Most social graphs are mostly one- or two-hop lookups** (followers, following, likes on a
+post), which a relational store with the right indexes and a cache handles well. Graph databases shine for deep,
+arbitrary traversals (fraud rings, recommendations across many hops), which are usually run offline.
+
+<Analogy>
+  **A guest book with two indexes.** Every "A knows B" entry is written once, but the book has an index by the first name and another by the second, so you can look up "who does Ana know?" and "who knows Ana?" equally fast. Nobody counts the entries for the most popular person each time: a tally on their page is kept up to date.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Facebook"
+    system="TAO"
+    year={2013}
+    href="https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf"
+    source="TAO: Facebook's Distributed Data Store for the Social Graph (USENIX ATC 2013)"
+    found="Objects and associations on sharded MySQL behind a graph-aware cache; 99.8% of requests are reads."
+  >
+    TAO serves the social graph with a simple data model of objects and associations, implemented over sharded MySQL
+    with a geographically distributed, graph-aware cache. The paper reports that TAO processes a billion reads and
+    millions of writes each second, and that in a sample of requests 99.8% were reads. Facebook's
+    [engineering blog](https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/) adds that TAO
+    keeps MySQL for persistent storage, uses followers and leaders as two cache tiers, and chose eventual consistency
+    as its default.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip shards the follows table by follower_id. The notification service needs every follower of a creator. What happens, and what's the usual fix?"
+  options={[
+    { text: "It's fast: the creator's ID is indexed", why: "The index is on each shard, but the creator's followers are spread across every shard, so every shard must be queried." },
+    { text: "It scatter-gathers across every shard; store each edge twice, once sharded by follower and once by followee", correct: true, why: "Duplicating edges by direction makes both 'who do I follow' and 'who follows me' single-shard queries, kept in sync through the outbox." },
+    { text: "Use a graph database instead", why: "It wouldn't change the fact that a sharded store needs data placed by the key you query by." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Indexing edges in one direction only.** Followers and following are both common queries; index both.</li>
+    <li>**Counting followers on every read.** Store counters, updated in batches.</li>
+    <li>**Deep traversals per request.** Keep online queries to one or two hops; compute deeper ones offline.</li>
+    <li>**Reaching for a graph database by default.** Most social features are simple adjacency lookups.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A social graph is edges between objects; store follows as rows with indexes in both directions.</li>
+    <li>Keep follower counts as maintained counters, batched like any hot counter.</li>
+    <li>When sharding, store each edge on both the follower's and followee's shard.</li>
+    <li>Most graph queries are one or two hops: a relational store plus a cache (like TAO) handles them; deep traversals run offline.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you store a social graph with billions of follow relationships?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How do you get follower counts?", "When would you use a graph database?"]}
+>
+  <p>As edges in a sharded key-value or relational store, with each edge written twice: once keyed by the follower for "who do I follow" and once by the followee for "who follows me", so both are single-partition range scans, sorted by time for paging. A cache in front serves the hot adjacency lists and counts, like Facebook's TAO over MySQL. Follower counts are stored as counters, updated asynchronously in batches to avoid hot rows.</p>
+  <p>Online queries stay at one or two hops, such as mutual follows or "followed by people you follow"; deeper traversals for recommendations run offline in batch or a graph-processing system. I'd use a dedicated graph database only if the product needs arbitrary multi-hop queries interactively.</p>
+</InterviewCard>

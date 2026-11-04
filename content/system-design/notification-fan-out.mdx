@@ -1,0 +1,126 @@
+export const meta = {
+  summary: "One event, a million phones: expanding recipients in batches, applying each user's preferences and limits, routing to push, in-app and email, respecting providers' rules, collapsing updates that replace each other, and never sending the same notification twice.",
+  uses: ["07.09", "12.03", "12.01", "07.03", "07.05"],
+  usedIn: ["15.07"],
+};
+
+<BeforeYouStart>
+  This lesson combines fan-out (<L id="07.09" />), the follower lists of <L id="12.04" />, live connections
+  (<L id="12.01" />), and consumers that are safe to repeat (<L id="07.03" />).
+</BeforeYouStart>
+
+## The problem: a creator with a million followers posts
+
+A creator on Snip Bio posts a new link. Their 1.2 million followers who have notifications on should hear about it:
+a push notification on their phone, an update in the app if it's open, maybe a line in tomorrow's email digest. It
+should arrive within a minute or two, respect each person's settings and time zone, and never arrive twice.
+
+Doing this inside the "publish link" request is impossible. It's a pipeline.
+
+## The pipeline
+
+<Flow
+  title="From one post to a million phones"
+  steps={[
+    { label: "Event", detail: "link.published is written to the outbox and published (07.06)." },
+    { label: "Expand", detail: "A worker pages through the creator's followers, 1,000 at a time, emitting one job per batch." },
+    { label: "Decide", detail: "For each recipient: preferences, quiet hours, rate limits, deduplication. Most are filtered or deferred here." },
+    { label: "Route", detail: "Per channel: in-app via the user's connection, push via the providers, email into tomorrow's digest." },
+    { label: "Deliver", detail: "Channel workers send to Apple and Google push services within their limits, retrying and recording results." },
+  ]}
+/>
+
+**Expand in batches.** A million recipients is a million small jobs. Paging through followers in batches of 1,000
+creates 1,200 jobs, which spread across workers and can't overwhelm anything at once.
+
+**Decide per recipient.** The most important step is often deciding **not** to send:
+
+- **Preferences**: has this person muted this creator, or turned off "new link" notifications?
+- **Quiet hours**: it's 03:00 where they are; hold it until morning, or move it to the digest.
+- **<Term t="rate-limit">Rate limits</Term>**: they follow 400 creators; ten posts in an hour should become one "10 new links from creators you
+  follow", not ten buzzes.
+- **Deduplication**: a key per (user, event), so a retried batch never notifies anyone twice (<L id="07.03" />).
+
+## The channels
+
+- **In-app**: if the user's app is connected (<L id="12.01" />), push the update over their connection. Cheap and
+  instant, and it can replace a phone notification entirely.
+- **Mobile push**: the app's servers send to Apple's and Google's push services, which deliver to the device. They
+  have their own rules and limits, so a channel worker paces sends, retries with backoff, and removes device tokens the
+  service reports as invalid.
+- **Email**: batch into digests; individual emails for each event are rarely welcome.
+
+## Collapse what replaces itself
+
+Some notifications supersede earlier ones: "your link has 1,000 clicks", then "2,000 clicks". The push services
+support this directly. With Google's Firebase Cloud Messaging, a **collapsible** message carries a collapse key, and a
+newer message with the same key replaces one not yet delivered: a phone that was offline gets only the latest count.
+FCM stores up to four different collapse keys per device at a time. Non-collapsible messages are each delivered
+individually.
+
+## Spread the spike
+
+A million notifications released at once also means a million people opening the app at once. Stagger delivery over a
+couple of minutes, send to recently active users first (they're the likeliest to open it), and give the
+"notification opened" traffic path enough headroom.
+
+<Analogy>
+  **A school sending a newsletter home.** The office doesn't phone every parent. It hands bundles to each class teacher (batches), who checks which parents want paper, which email, and which have opted out (preferences); nobody gets two copies if the bundle is handed over twice (deduplication); and a correction replaces the earlier note rather than adding another (collapsing).
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="Firebase Cloud Messaging"
+    year="Docs"
+    href="https://firebase.google.com/docs/cloud-messaging/customize-messages/collapsible-message-types"
+    source="Collapsible and non-collapsible messages (Firebase documentation)"
+    found="Messages that supersede each other share a collapse key, so an offline device receives only the newest."
+  >
+    A collapsible message may be replaced by a newer message if it hasn't been delivered yet, while each non-collapsible
+    message is delivered individually. FCM can store four different collapsible messages per device, each with a
+    different collapse key, and allows at most four collapse keys per registration token at a time. By default the
+    collapse key is the app's package name, notification messages are always collapsible, delivery order isn't
+    guaranteed, and the maximum payload is 4,096 bytes.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A batch job sending 1,000 push notifications crashes after sending 600, and the batch is retried. What prevents 600 people getting the notification twice?"
+  options={[
+    { text: "The push service drops duplicates automatically", why: "Push services deliver what they're sent; most duplicates must be prevented by the sender." },
+    { text: "Recording a (user, event) key before or as each send happens, and skipping keys already recorded on retry", correct: true, why: "A deduplication record per recipient and event makes the retried batch safe to repeat." },
+    { text: "Sending notifications one at a time instead of in batches", why: "That limits how many repeat, but a crash and retry can still resend the last one. Deduplication is the fix." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Sending inside the triggering request.** Use a pipeline of batched jobs.</li>
+    <li>**Notifying everyone, always.** Preferences, quiet hours and rate limits make notifications people keep turned on.</li>
+    <li>**No deduplication.** Retries double-notify; key every send by user and event.</li>
+    <li>**Ignoring invalid device tokens.** Remove them when the push service says so, or you waste sends.</li>
+    <li>**Releasing a million at once.** Stagger delivery and prepare for the wave of opens.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Notifications are a pipeline: event, expand recipients in batches, decide per recipient, route by channel, deliver.</li>
+    <li>Most of the value is in deciding not to send: preferences, quiet hours, rate limits and digests.</li>
+    <li>Deduplicate by user and event; collapse updates that replace each other.</li>
+    <li>Respect push services' limits, clean invalid tokens, and stagger large sends.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a notification system that can notify millions of followers when someone posts.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you avoid sending duplicates?", "How do you respect user preferences and avoid spamming?"]}
+>
+  <p>The post emits an event through an outbox. A fan-out service pages through the author's followers in batches and enqueues a job per batch. Per-recipient workers load preferences, apply mute settings, quiet hours in the user's time zone, per-user rate limits and aggregation into summaries, and check a deduplication key of user plus event. Surviving notifications are routed to channel queues: in-app delivery over an open connection, mobile push through APNs and FCM, and email digests.</p>
+  <p>Channel workers respect provider rate limits, retry with backoff, use collapse keys for notifications that supersede each other, and remove invalid device tokens. For very large audiences I'd stagger delivery over a few minutes and prioritise active users, and make sure the systems behind the notification's landing page can absorb the resulting traffic.</p>
+</InterviewCard>

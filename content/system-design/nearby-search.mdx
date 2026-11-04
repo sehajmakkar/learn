@@ -1,0 +1,163 @@
+export const meta = {
+  summary: "Turning a geospatial index into a product: radius queries and nearest-k in PostGIS and Redis, combining distance with filters like 'open now', choosing a radius that adapts to density, caching by cell, and what changes when the points themselves move.",
+  uses: ["12.05", "06.01", "10.02", "10.04"],
+  usedIn: ["12.07", "16.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="12.05" />. Ranking by more than distance borrows from <L id="10.02" />, and caching by cell from
+  <L id="06.01" />.
+</BeforeYouStart>
+
+## The problem: "stores near me, open now"
+
+Snip's store-locator links grow up: besides redirecting to the single nearest store, the link can open a small page
+listing the three nearest stores that are **open now** and **stock the campaign's product**, each with its distance.
+Some visitors are in central London with 40 stores within a kilometre; others are in the Highlands with the nearest
+store 80 km away.
+
+## Two kinds of question
+
+- **Radius**: everything within 5 km. Good when "near" has a natural limit (delivery areas, "within walking distance").
+- **Nearest k**: the 3 closest, however far. Good when there must always be an answer.
+
+Both are supported directly by the common stores, using the cell indexes of <L id="12.05" /> underneath.
+
+**PostGIS** (Postgres with geospatial types): store locations as `geography` so distances are in metres on the Earth's
+surface, index them with GiST, and use `ST_DWithin` for radius (it uses the index) and the `<->` operator to order by
+distance with the index:
+
+```sql
+CREATE INDEX stores_location ON stores USING gist (location);  -- location geography(Point)
+
+-- The 3 nearest open stores within 25 km of the visitor
+SELECT id, name, ST_Distance(location, $1::geography) AS metres
+  FROM stores
+ WHERE chain_id = $2
+   AND open_now
+   AND ST_DWithin(location, $1::geography, 25000)
+ ORDER BY location <-> $1::geography
+ LIMIT 3;
+```
+
+**Redis** keeps geospatial members in a sorted set whose scores are 52-bit geohashes, so a search scans the cells
+around the point:
+
+```
+GEOADD stores:acme -0.1419 51.5152 store:oxford-st
+GEOSEARCH stores:acme FROMLONLAT -0.1278 51.5074 BYRADIUS 5 km ASC COUNT 3 WITHDIST
+```
+
+The PostGIS version answers the whole question in one query; Redis is faster for pure "nearest" lookups in memory but
+leaves filters like "open now" to the application.
+
+## Filters change the plan
+
+"Open now" and "stocks this product" can remove most candidates. With a nearest-k index search, filtering afterwards
+can come up short, the same problem as filtered vector search (<L id="10.05" />). Options:
+
+- **Filter inside the index query** where the database supports it (PostGIS combines the spatial index with other
+  conditions in one plan).
+- **Over-fetch and filter**: ask for the nearest 30, filter to 3.
+- **Separate indexes per filter value** when there are few: one Redis set per chain, or per product category.
+
+## Radius that adapts to density
+
+A fixed 5 km radius returns 300 stores in central London and none in the Highlands. Instead, **grow the search**: try
+the nearby cells; if fewer than k candidates survive the filters, widen to the next ring of cells or a larger radius;
+stop at a maximum distance and say so ("no stores within 100 km"). Most queries, in dense areas, finish on the first
+step.
+
+## Ranking by more than distance
+
+For "best nearby" rather than "nearest", score candidates on distance **and** other signals, like ratings, opening
+hours, stock, or the chain's preference, the same blend as search ranking (<L id="10.02" />). Distance usually enters
+as a decay: a store 300 m away and one 500 m away are about equally good; one 20 km away isn't.
+
+## Cache by cell
+
+Many visitors arrive from the same few areas. Cache results by **cell**, not by exact coordinates (no two visitors share
+exact coordinates): "nearest open stores for geohash `gcpvj` at 14:00" serves everyone in that 5 km cell for a few
+minutes. Store data changes rarely, so the cache can live long, invalidated when a store's details change
+(<L id="06.04" />).
+
+## When the points move
+
+Stores don't move. Drivers, couriers and scooters do, every few seconds. A disk-based index that's rewritten on every
+position update struggles, so moving objects usually live **in memory**: each update moves an ID from one cell's set to
+another, and searches read the sets for nearby cells. Updates far outnumber queries, positions are slightly stale by
+design, and the index can be rebuilt from the latest positions after a restart. Matching those moving supplies to
+demand is <L id="12.07" />.
+
+<Analogy>
+  **Asking for the nearest pharmacy.** In a city you look on your street and the next few, and you'll have several to choose from; in the countryside you widen the search until you find one, however far. And the best answer may not be the very closest one if it's shut.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Redis"
+    system="GEOSEARCH"
+    year="Docs"
+    href="https://redis.io/docs/latest/commands/geosearch/"
+    source="GEOSEARCH (Redis documentation)"
+    found="Geospatial members live in a sorted set scored by 52-bit geohashes; searches scan the grid-aligned box around the shape."
+  >
+    GEOSEARCH queries a geospatial index stored as a sorted set, from a member or a longitude and latitude, by radius
+    or by box, sorted nearest first with ASC and limited with COUNT; the ANY option returns as soon as enough matches
+    are found, faster but unsorted. Each item's score is a 52-bit <Term t="geohash">geohash</Term>, and the cost is O(N + log(M)), where N is
+    the number of elements in the grid-aligned bounding box around the shape.
+  </Seen>
+  <Seen
+    company="PostGIS"
+    system="ST_DWithin and KNN"
+    year="Docs"
+    href="https://postgis.net/docs/ST_DWithin.html"
+    source="ST_DWithin (PostGIS documentation)"
+    found="Radius queries in metres that use spatial indexes, and an order-by-distance operator that uses them for nearest-k."
+  >
+    For geography, ST_DWithin takes distances in metres, measured on the spheroid by default, and includes a bounding
+    box comparison that uses any available indexes, such as a GiST index. PostGIS's
+    [nearest-neighbour guide](https://postgis.net/workshops/postgis-intro/knn.html) explains the `<->` "order by
+    distance" operator, which makes the database use an index for nearest-k queries, with the limitation that one side
+    must be a single geometry literal.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's locator searches the nearest 3 stores, then filters to those open now. At 22:00, most results come back empty or with one store, though open stores exist 4 km away. What's the fix?"
+  options={[
+    { text: "Raise the cache TTL", why: "Caching doesn't change what the query finds." },
+    { text: "Apply the 'open now' filter inside the query (or over-fetch and filter), and widen the search until enough open stores are found", correct: true, why: "Filtering after a top-3 search throws away the answers. Filter in the index query, fetch more candidates, or expand the radius until k results survive." },
+    { text: "Use H3 instead of geohash", why: "The cell scheme doesn't matter; the problem is filtering after limiting." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Filtering after a nearest-k limit.** Results come back short; filter in the query or over-fetch.</li>
+    <li>**A fixed radius everywhere.** Too many results in cities, none in the country; expand rings until enough.</li>
+    <li>**Caching by exact coordinates.** Nobody shares them; cache by cell.</li>
+    <li>**Disk indexes for things that move every few seconds.** Keep moving objects in memory.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Radius and nearest-k queries come built into PostGIS (ST_DWithin, the `<->` operator) and Redis (GEOSEARCH).</li>
+    <li>Apply filters inside the search or over-fetch, so results aren't cut short.</li>
+    <li>Grow the search ring until enough results are found; rank by a blend of distance and other signals.</li>
+    <li>Cache by cell; keep frequently moving objects in an in-memory cell index.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a 'find nearby restaurants' feature.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle very dense and very sparse areas?", "How would you rank results?"]}
+>
+  <p>Store restaurants with their coordinates in a geospatially indexed store, such as PostGIS with a GiST index on a geography column or a search engine with geo queries, keyed by a cell scheme like geohash or S2. A query takes the user's location, searches the cells around it with a radius or nearest-k query, applies filters like open now and cuisine inside the query, and measures real distances.</p>
+  <p>To handle density I'd expand the search ring until enough results survive, with a maximum radius. Ranking combines distance as a decaying factor with rating, popularity and personalization. Restaurant data changes rarely, so I'd cache results per cell and filter set for a few minutes, invalidating on updates, and serve reads from replicas. If the points moved constantly, like couriers, I'd keep them in an in-memory cell index instead.</p>
+</InterviewCard>

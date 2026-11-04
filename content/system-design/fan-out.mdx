@@ -124,7 +124,7 @@ machines and networks that fail in partial, confusing ways (<L id="08.01" />).
   >
     Slack's channel servers each own a subset of channels, assigned by consistent hashing. Clients connect to gateway
     servers, which hold their WebSocket subscriptions. When a channel server receives a message, it sends it to every
-    gateway server across the world that is subscribed to that channel, and each gateway sends it to every connected
+    <Term t="gateway-server">gateway server</Term> across the world that is subscribed to that channel, and each gateway sends it to every connected
     client subscribed to that channel. Slack says the system serves tens of millions of connected clients and delivers
     messages across the world in 500 ms.
   </Seen>

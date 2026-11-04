@@ -1,0 +1,186 @@
+export const meta = {
+  summary: "Why a B-tree on latitude and longitude can't find what's near you, and the four ideas that can: geohash strings, quadtrees, S2 cells on a sphere, and H3 hexagons. A lab for geohash nearest search, and tested encoding code.",
+  uses: ["04.02", "10.01", "05.03"],
+  usedIn: ["12.06", "12.07", "16.03", "16.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.02" />: the trick in this lesson is turning two dimensions into one so an ordinary sorted index works.
+</BeforeYouStart>
+
+## The problem: the nearest store
+
+Snip adds **store-locator links**: a retail chain uploads its 4,000 store locations, and one short link sends each
+visitor to the page of the store nearest them (using the location from their IP address or their phone). Every
+redirect becomes a <Term t="nearest-neighbour">nearest-neighbour</Term> query: given a point, find the closest of thousands of points, in about a
+millisecond.
+
+## Why two indexes don't help
+
+An index on latitude finds every store in a horizontal band; one on longitude, every store in a vertical band. "Near
+me" is the small square where they cross, but the database has to fetch a whole band from one index and filter it, or
+intersect two large sets. A B-tree sorts one dimension; location has two.
+
+All the main geospatial indexes do the same thing in different ways: **divide the map into cells**, give each cell an ID
+such that **nearby cells usually share a prefix or a parent**, and index the cell IDs.
+
+## Geohash: cells as strings
+
+**Geohash** splits the world in half by longitude, then by latitude, then longitude again, writing one bit per split,
+and encodes every 5 bits as a character. Each extra character divides a cell into 32 smaller ones. Points in the same
+cell share the whole string; nearby points usually share a long prefix.
+
+| Characters | Cell size around London (tall × wide) |
+| --- | --- |
+| 4 | about 20 × 24 km |
+| 5 | about 4.9 × 3.0 km |
+| 6 | about 0.6 × 0.8 km |
+
+Central London at precision 6 is `gcpvj0`. Because geohashes are strings, a plain B-tree index on them supports
+`LIKE 'gcpvj%'`: every store in that cell, from one index range.
+
+```ts
+const BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+
+export function geohash(lat: number, lon: number, precision = 6): string {
+  let latLo = -90, latHi = 90, lonLo = -180, lonHi = 180;
+  let hash = "", bits = 0, ch = 0, even = true;
+  while (hash.length < precision) {
+    if (even) {
+      const mid = (lonLo + lonHi) / 2; // even bits split longitude
+      if (lon >= mid) { ch = (ch << 1) | 1; lonLo = mid; } else { ch <<= 1; lonHi = mid; }
+    } else {
+      const mid = (latLo + latHi) / 2; // odd bits split latitude
+      if (lat >= mid) { ch = (ch << 1) | 1; latLo = mid; } else { ch <<= 1; latHi = mid; }
+    }
+    even = !even;
+    if (++bits === 5) { hash += BASE32[ch]; bits = 0; ch = 0; }
+  }
+  return hash;
+}
+```
+
+Tested against the standard reference point (57.64911, 10.40744), which encodes to `u4pruydqqvj`, and London's
+`gcpvj0`.
+
+**The edge problem.** Two points a few metres apart on either side of a cell boundary can have completely different
+geohashes. So a nearby search never checks just one cell: it checks the cell and its **eight neighbours**, then
+measures real distances to the candidates.
+
+## Try it
+
+<Lab
+  id="sd-12-05-geohash"
+  title="Nearest store with a geohash grid"
+  tasks={[
+    "At 5 characters, click near the centre. How many of the 600 stores were checked instead of all 600?",
+    "Switch to 6 characters and click on the outskirts. What happens when the nine cells are empty?",
+    "Switch to 4 characters. How many stores are checked now, and why is that worse?",
+    "Click right next to a cell boundary. Does checking the neighbours matter?",
+  ]}
+>
+  <GeohashLab />
+</Lab>
+
+Tested the same way on 4,000 stores across London with 500 random queries: searching the nine 5-character cells around
+each point checked about 213 stores on average instead of 4,000 and found the true nearest every time. Two caveats the
+lab shows: if the nine cells are empty, search a wider ring (or shorter geohash); and the nine cells only guarantee the
+true nearest if it's within one cell's width, so a found store farther than that needs one more ring checked.
+
+## Quadtrees: cells that adapt
+
+A **quadtree** splits a square into four whenever it holds too many points, so dense city centres get small cells and
+empty countryside stays one big cell. It adapts to data density, which fixed grids don't, at the cost of being a tree
+structure to maintain rather than a string you can index anywhere.
+
+## S2: cells on a sphere
+
+Flat grids distort near the poles and across the date line. Google's **S2** library projects the sphere onto the six
+faces of a cube and orders each face's cells along a **Hilbert curve**, a path that keeps nearby cells close in the
+ordering. Cells nest over 31 levels and each has a 64-bit ID, so "cells near X" become a few numeric ranges in an
+ordinary index.
+
+## H3: hexagons
+
+Uber's **H3** tiles the world with hexagons at 16 resolutions, each about a seventh the area of the one above. Squares
+have neighbours at two distances (side and corner); a hexagon's neighbours are all the same distance away, which makes
+"the ring of cells around this one" uniform. At resolution 9 a hexagon averages about 0.1 km²; at resolution 7, about
+5 km². Uber uses them to measure supply and demand per hexagon for surge pricing (<L id="12.07" />).
+
+| | Shape | Strength | Typical use |
+| --- | --- | --- | --- |
+| **Geohash** | Rectangles | A string; prefix queries in any database | Simple proximity in Redis, Elasticsearch |
+| **Quadtree** | Adaptive squares | Matches data density | In-memory spatial indexes |
+| **S2** | Quads on a sphere | No pole or date-line distortion; 64-bit IDs | Global indexing, coverings of regions |
+| **H3** | Hexagons | Uniform neighbours | Aggregating and comparing areas |
+
+<Analogy>
+  **Postcodes.** Nobody searches the whole country for a street near you; they look at your postcode district and the districts around it. Postcodes that share their first letters are usually near each other, though two houses across a district boundary can have quite different codes, which is why you check the neighbours too.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Uber"
+    system="H3"
+    year={2018}
+    href="https://www.uber.com/blog/h3/"
+    source="H3: Uber's Hexagonal Hierarchical Spatial Index (Isaac Brodsky)"
+    found="Hexagons have one distance to every neighbour, which makes analysing movement through a city cleaner; Uber prices surge per hexagon."
+  >
+    Uber explains that hexagons have only one distance between a cell's centre and its neighbours', against two for
+    squares and three for triangles, and that hexagons minimise the quantisation error as users move through a city.
+    H3 supports sixteen resolutions, each finer one with a seventh of the area, and Uber calculates surge pricing by
+    measuring supply and demand in hexagons in each city. Uber open-sourced H3 in 2018.
+  </Seen>
+  <Seen
+    company="Google"
+    system="S2 Geometry"
+    year="Docs"
+    href="http://s2geometry.io/devguide/s2cell_hierarchy"
+    source="S2 Cells (S2 Geometry documentation)"
+    found="The sphere split into a hierarchy of cells, ordered along Hilbert curves, each with a 64-bit ID."
+  >
+    S2 represents all data on a three-dimensional sphere and decomposes it into a hierarchy of cells. The cells are
+    ordered along six Hilbert curves linked into one continuous loop over the sphere, there are 31 levels of
+    subdivision (0 to 30), and each cell is uniquely identified by a 64-bit S2CellId.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A store sits 20 metres from a user, but just across a geohash cell boundary. The search looks only in the user's own cell. What happens?"
+  options={[
+    { text: "It finds the store: 20 metres is very close", why: "The search only looks inside the user's cell, and the store's geohash is in a different one." },
+    { text: "It misses that store, possibly returning one much farther away; searches must include the neighbouring cells", correct: true, why: "Cell boundaries split nearby points. Searching the eight neighbours and comparing real distances fixes it." },
+    { text: "The geohash prefix will match because the points are close", why: "Points close together can differ even in their first characters if a major boundary lies between them." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Separate indexes on latitude and longitude.** They can't answer "near" efficiently; index cells.</li>
+    <li>**Checking only the query's own cell.** Include the neighbours, then measure real distances.</li>
+    <li>**One precision for every density.** Cells that are tiny in the countryside are empty; huge in a city, they're crowded.</li>
+    <li>**Euclidean distance on degrees.** A degree of longitude shrinks towards the poles; use great-circle distance.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Location has two dimensions; geospatial indexes map it to cells with sortable IDs.</li>
+    <li>Geohash: strings whose prefixes are cells; search the cell and its eight neighbours, then filter by real distance.</li>
+    <li>Quadtrees adapt to density; S2 covers the sphere with Hilbert-ordered cells and 64-bit IDs; H3 uses uniform hexagons.</li>
+    <li>Pick the cell size from the data's density and the search radius.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you index locations to find nearby points efficiently?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What's the boundary problem with geohashes?", "Geohash, quadtree, S2 or H3: how do you choose?"]}
+>
+  <p>Map two-dimensional coordinates to one-dimensional cell IDs so a normal sorted index can be used. With geohash, each point is encoded as a string by alternately bisecting longitude and latitude; points sharing a prefix are in the same cell, and a B-tree prefix query returns everything in a cell. To find nearby points I'd compute the query's cell at a precision matching the search radius, query that cell and its eight neighbours, and filter candidates by great-circle distance.</p>
+  <p>The boundary problem is that close points can have different prefixes across a cell edge, hence the neighbours. Quadtrees adapt cell size to density and suit in-memory indexes; S2 avoids projection distortion with Hilbert-ordered cells on a sphere and 64-bit IDs; H3 hexagons have equidistant neighbours, which suits aggregating demand by area. In practice I'd use what the store provides: PostGIS, Redis GEO, or Elasticsearch geo queries.</p>
+</InterviewCard>

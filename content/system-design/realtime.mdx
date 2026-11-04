@@ -87,7 +87,7 @@ Every SSE or WebSocket client is a connection that stays open for minutes or hou
   through a pub/sub system, and the code that counts clicks publishes to the topic.
 - **Memory per connection** adds up. Each open connection costs some memory and a file descriptor; a server can
   hold many thousands, but you size for connections, not just requests per second.
-- **Deploys and failures cause reconnect storms.** Restart a server holding 50,000 connections and 50,000 clients
+- **Deploys and failures cause <Term t="reconnect-storm">reconnect storms</Term>.** Restart a server holding 50,000 connections and 50,000 clients
   reconnect at once. Clients should wait a random short delay before reconnecting (<L id="03.09" />).
 
 <Arch

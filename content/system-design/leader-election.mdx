@@ -37,7 +37,7 @@ Because etcd runs <Term t="raft">Raft</Term> (<L id="08.06" />), only one client
 
 Kubernetes works the same way. Its control-plane components, such as the controller manager and the scheduler, run
 several copies for high availability, but only one should be active; they coordinate through Lease objects, which are
-also how each node's kubelet sends its heartbeat.
+also how each node's kubelet sends its <Term t="heartbeat">heartbeat</Term>.
 
 <Sequence
   title="The leader dies; its lease expires; another takes over"

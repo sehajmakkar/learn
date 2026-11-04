@@ -1,0 +1,149 @@
+export const meta = {
+  summary: "Showing who's online sounds like one boolean per user. It's a constant stream of heartbeats, a timeout that decides when silence means offline, fan-out to everyone who might care, and a lot of updates nobody needs.",
+  uses: ["12.01", "08.01", "07.09", "06.03"],
+  usedIn: ["15.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="12.01" />: presence rides on the long-lived connections. Deciding a user is offline is failure detection
+  (<L id="08.01" />), and telling everyone is fan-out (<L id="07.09" />).
+</BeforeYouStart>
+
+## The problem: "Ana is viewing this page"
+
+Snip's team plan adds a small row of avatars on a shared campaign: who else is looking at it right now, so two people
+don't edit the same links at once. Creators' profiles show a green dot when they're online. Simple to describe; at three
+million connected users, it's one of the noisiest features a system can have.
+
+## Online means "heard from recently"
+
+A user is online if their app has a live connection. But connections die without saying goodbye: a phone goes into a
+tunnel, a laptop lid closes, a train enters a station. So presence can't rely on a "disconnected" event. It relies on
+**heartbeats**: the client (or its gateway) reports "still here" every 20 seconds or so, and a user whose last
+heartbeat is older than a **timeout** (say, 30 seconds) is offline.
+
+```ts
+export class Presence {
+  private lastSeen = new Map<string, number>(); // user -> last heartbeat time
+
+  constructor(readonly ttlMs = 30_000, private readonly now: () => number = Date.now) {}
+
+  heartbeat(user: string) {
+    this.lastSeen.set(user, this.now());
+  }
+
+  leave(user: string) {
+    this.lastSeen.delete(user); // a clean goodbye: offline at once
+  }
+
+  isOnline(user: string) {
+    const t = this.lastSeen.get(user);
+    return t !== undefined && this.now() - t < this.ttlMs; // silence longer than the TTL means offline
+  }
+}
+```
+
+Tested with a 30-second timeout: Ana heartbeated at 0 and 20 seconds, Ben only at 0; at 35 seconds Ana was online and
+Ben wasn't, and after Ana's explicit leave, nobody was. In production the same idea is one key per user in Redis set with
+`SET presence:4821 1 EX 30` on each heartbeat: the key expiring is the user going offline.
+
+The timeout is the same trade-off as any failure detector (<L id="08.01" />): too short and people flicker offline
+whenever a phone sleeps for a moment; too long and the dot stays green for a minute after they've gone.
+
+## Telling the people who care
+
+Detecting presence is cheap. **Broadcasting** it is what costs:
+
+- Every status change goes to everyone who can see that user: followers, teammates, people on the same page.
+- A creator with 200,000 followers who reconnects every few minutes on a flaky network generates hundreds of
+  thousands of messages for a dot that barely changed.
+
+So presence is shaped to avoid most of those messages:
+
+- **Only send to people looking.** Subscribe to a creator's presence only while their profile is on screen, not for
+  every follower all the time. Presence of off-screen users is fetched when needed.
+- **Debounce changes.** Wait a few seconds before announcing "offline", so a reconnect within that time sends nothing.
+- **Coarser states for large audiences.** For huge accounts, "active in the last hour" refreshed every few minutes is
+  as useful as a live dot, and far cheaper.
+- **Keep the payload tiny.** Presence messages should be an ID and a state, not a profile.
+
+## Presence across many servers
+
+Users connect to different gateways, and people watching them are on others. Either a central store holds every user's
+last heartbeat (simple; one more busy system), or each gateway tracks its own users and they replicate changes to each
+other. Phoenix's presence system takes the second route: its tracker shards use a heartbeat protocol and a CRDT, a data
+type whose copies can be merged in any order, to replicate presence across a cluster without a single source of truth.
+Either way, presence is **eventually consistent** (<L id="08.02" />): two people may briefly see different dots, which
+for a green dot is perfectly fine.
+
+<Analogy>
+  **An office in/out board.** People slide their marker to "in" when they arrive, but nobody remembers to slide it out, so the receptionist treats anyone not seen for a while as out. And when someone pops out for two minutes, nobody announces it over the speakers: you only check the board when you're looking for them.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Phoenix"
+    system="Phoenix.Tracker"
+    year="Docs"
+    href="https://hexdocs.pm/phoenix_pubsub/Phoenix.Tracker.html"
+    source="Phoenix.Tracker (Phoenix.PubSub documentation)"
+    found="Presence replicated with heartbeats and a CRDT: no single source of truth, eventually consistent, conflict-free."
+  >
+    Phoenix.Tracker provides distributed presence tracking. Its shards use a heartbeat protocol and a CRDT to replicate
+    presence information across a cluster in an eventually consistent, conflict-free way, with no single source of
+    truth or global process: each node runs trackers, and node-local changes are replicated and handled locally as
+    diffs of joins and leaves. Phoenix's [Presence](https://hexdocs.pm/phoenix/Phoenix.Presence.html) builds on it and
+    advises keeping presence metadata small and ephemeral, such as an "online" or "away" status.
+  </Seen>
+  <Seen
+    company="Discord"
+    system="Presence in guilds"
+    year={2017}
+    href="https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users"
+    source="How Discord Scaled Elixir to 5,000,000 Concurrent Users"
+    found="Presence is fan-out: when a user comes online, the guild publishes it to every other connected session."
+  >
+    When a user comes online and connects to a guild, the guild publishes their presence to all other connected
+    sessions. With large guilds of tens of thousands of concurrent users, this kind of fan-out was where Discord's
+    processes struggled to keep up during peak hours.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A creator's app reconnects every 2 minutes on a weak connection, and each reconnect broadcasts 'offline' then 'online' to 200,000 followers. What's the most effective fix?"
+  options={[
+    { text: "Lower the heartbeat interval to 1 second", why: "That detects changes faster, producing even more broadcasts." },
+    { text: "Delay 'offline' announcements for a grace period, and only send presence to followers who are currently viewing the creator", correct: true, why: "Debouncing removes the flicker, and subscribing only viewers cuts the audience from 200,000 to the handful actually looking." },
+    { text: "Store presence in the database instead of memory", why: "Where it's stored doesn't change how many messages are broadcast." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Relying on disconnect events.** Connections die silently; use heartbeats and a timeout.</li>
+    <li>**Broadcasting every change to every follower.** Send presence only to people looking, and debounce.</li>
+    <li>**Presence as strongly consistent data.** It's a hint; eventual consistency is fine and much cheaper.</li>
+    <li>**Fat presence messages.** Send an ID and a state, nothing more.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Online means a heartbeat within a timeout; the timeout trades flicker against staleness.</li>
+    <li>A key with a TTL per user (refreshed on each heartbeat) is the simplest implementation.</li>
+    <li>Broadcasting is the cost: only notify viewers, debounce offline, and use coarser states for huge audiences.</li>
+    <li>Across servers, presence is eventually consistent, via a shared store or replication like a CRDT.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you implement online presence for a chat app with millions of users?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you detect that a user went offline?", "How do you avoid flooding friends with status changes?"]}
+>
+  <p>Clients connected through gateways send heartbeats every 20 to 30 seconds; each heartbeat refreshes a per-user key with a TTL in a store like Redis, or in a replicated presence tracker on the gateways. A user is online while the key exists; if heartbeats stop, the TTL expires and they go offline, so unclean disconnects are handled. A clean logout deletes the key immediately.</p>
+  <p>Distribution is the expensive part. I'd push presence changes only to users currently viewing that person, such as an open chat or a visible friends list, rather than to all contacts; debounce offline transitions so brief reconnects don't broadcast; batch updates; and for very large audiences show coarser "recently active" states. Presence is a hint, so eventual consistency is acceptable.</p>
+</InterviewCard>

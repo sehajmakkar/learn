@@ -11,13 +11,13 @@ export const meta = {
 
 ## The problem: who's alive?
 
-Snip's live click counts (<L id="07.09" />) run on 400 gateway servers across two regions. Each needs to know which
+Snip's live click counts (<L id="07.09" />) run on 400 <Term t="gateway-server">gateway servers</Term> across two regions. Each needs to know which
 of the others are alive, to route subscriptions and spread load. Servers come and go all day with deploys and
 autoscaling, and some fail without saying goodbye.
 
 Two obvious designs struggle:
 
-- **A central registry** that everyone heartbeats to. Simple, and fine for many systems (it's what etcd or Consul's
+- **A central registry** that everyone <Term t="heartbeat">heartbeats</Term> to. Simple, and fine for many systems (it's what etcd or Consul's
   servers can do), but it's another critical service, and a partition from it makes healthy servers look dead.
 - **Everyone heartbeats everyone.** 400 servers each pinging 399 others every second is about 160,000 messages a
   second, growing with the square of the cluster size. The SWIM paper opens with exactly this problem: traditional

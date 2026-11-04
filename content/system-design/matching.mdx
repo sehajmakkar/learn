@@ -1,0 +1,123 @@
+export const meta = {
+  summary: "Pairing riders with drivers, orders with couriers: keeping moving positions in memory, matching greedily or in batches, never giving one driver two jobs, and using supply and demand per area to steer both. Tested comparison of greedy and batched matching.",
+  uses: ["12.06", "12.05", "08.08", "08.07", "05.01"],
+  usedIn: ["16.03"],
+};
+
+<BeforeYouStart>
+  Read <L id="12.06" /> for searching moving points, and <L id="08.08" /> for making sure one resource is never
+  claimed twice.
+</BeforeYouStart>
+
+## A different system: ride-hailing
+
+Snip doesn't match anything to anything, so this lesson uses the classic example, a ride-hailing app, because the
+same shape appears in food delivery, freelance marketplaces and ad auctions. In one city at rush hour: 40,000 drivers
+sending their position every 4 seconds, and 2,000 ride requests a minute. Each request should get a nearby driver
+within a few seconds, and no driver should ever be sent to two riders.
+
+## Positions live in memory
+
+10,000 position updates a second per city, each superseding the last, is a poor fit for a disk-based database. The
+dispatch service keeps a **cell index in memory** (<L id="12.06" />): each update moves a driver from one cell's set to
+another, along with their status (free, en route, on a trip). A lost position is replaced 4 seconds later, so this
+state can be rebuilt after a crash rather than made durable.
+
+Cities are independent, so the natural shard is **the city or region** (<L id="05.01" />): each region's dispatch runs
+on its own servers with its own in-memory index.
+
+## Greedy or batched?
+
+**Greedy**: when a request arrives, give it the nearest free driver, now. Simple and immediate, but each decision
+ignores the next. Two riders on the same street can end up with one getting a car 1 minute away and the other a car 9
+minutes away, when swapping would have made it 3 and 4.
+
+**Batched**: collect requests for a few seconds, then choose the assignment of drivers to riders that minimises total
+pickup time (a classic assignment problem with efficient algorithms). Each rider waits a few seconds longer to be
+matched, and overall pickups get shorter.
+
+Tested on 200 random batches of 6 riders and 6 drivers: greedy assignment gave a total pickup distance of 4,284, the
+best assignment 3,720, **13% less**, for the cost of collecting requests for a moment.
+
+Two refinements real systems use:
+
+- **ETA, not straight-line distance.** A driver 300 m away across a river may be 10 minutes away. Candidates are found
+  by distance, then ranked by estimated time from a routing service.
+- **Look ahead**: a driver finishing a trip nearby in 1 minute may be a better match than a free driver 6 minutes
+  away.
+
+## Never two jobs for one driver
+
+The race: two dispatch decisions, made a moment apart, both pick driver 812. The fix is the same as any exclusive
+claim (<L id="08.08" />): **claim the driver atomically** before telling anyone.
+
+- Change the driver's status from `free` to `offered:ride-5521` only if it's still `free` (a compare-and-set in the
+  dispatch store). The loser of the race picks another driver.
+- The offer is a **lease** (<L id="08.07" />): if the driver doesn't accept within 15 seconds, the claim expires, the
+  driver is free again, and the ride is re-matched.
+- Keep a region's dispatch decisions on one owner (a leader per region), so most races never happen at all.
+
+## Steering supply and demand
+
+Matching handles the next few minutes. Over longer periods, the system nudges supply and demand towards each other:
+measure requests and free drivers **per area**, often per <Term t="h3">H3</Term> hexagon (<L id="12.05" />). Where demand outstrips supply,
+prices rise (encouraging drivers to move there and some riders to wait), and drivers are shown where demand is high.
+Uber describes calculating surge pricing exactly this way: by measuring supply and demand in hexagons across each city.
+
+<Analogy>
+  **A taxi rank dispatcher with a radio.** Sending the first free car to each call as it comes in is fast, but listening to the next few calls before deciding often gives everyone a shorter wait. And once the dispatcher says "car 812, take the station job", no one else can give 812 a job until it's done or turned down.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Uber"
+    system="H3 and surge pricing"
+    year={2018}
+    href="https://www.uber.com/blog/h3/"
+    source="H3: Uber's Hexagonal Hierarchical Spatial Index (Isaac Brodsky)"
+    found="Supply and demand are measured per hexagon in each city, and surge prices follow them."
+  >
+    Uber built H3 for optimising ride pricing and dispatch and for analysing data across cities. It calculates surge
+    pricing by measuring supply and demand in hexagons in each city, and uses hexagons because their neighbours are all
+    the same distance away, which reduces error as users move through a city.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Two dispatch servers in the same city each assign the same free driver to different riders within 50 ms. What's the right protection?"
+  options={[
+    { text: "Have the driver's app reject the second ride", why: "The second rider was already told a driver is coming. The double claim has to be prevented before anyone is told." },
+    { text: "Claim the driver with an atomic compare-and-set from free to offered, as a lease that expires if not accepted, before notifying the rider", correct: true, why: "Only one claim can succeed; the other server picks another driver. The lease frees drivers who don't respond." },
+    { text: "Use a longer position update interval", why: "Update frequency doesn't affect two decisions racing for the same driver." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Storing every position update durably.** They're superseded in seconds; keep them in memory.</li>
+    <li>**Matching by straight-line distance alone.** Rank candidates by estimated travel time.</li>
+    <li>**Greedy matching at high load.** Batching for a few seconds often shortens total waits noticeably.</li>
+    <li>**Assigning without an atomic claim.** Two decisions can pick the same driver; claim, then notify.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Moving supply lives in an in-memory cell index, sharded by region, rebuilt from fresh updates after a crash.</li>
+    <li>Greedy matching is immediate; batching for a few seconds minimises total pickup time (13% in the test).</li>
+    <li>Claim a driver atomically, as an expiring lease, before telling the rider.</li>
+    <li>Measure supply and demand per area to price and reposition, not just to match.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you design the driver-matching service for a ride-hailing app?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you stop a driver getting two rides?", "Greedy nearest driver or something better?"]}
+>
+  <p>Drivers send positions every few seconds to a location service that keeps an in-memory geospatial index per city, such as drivers per geohash or H3 cell with their status, sharded by region and rebuilt from fresh updates after a failure. A ride request queries nearby cells for free drivers, ranks candidates by ETA from a routing service, and either assigns greedily or collects requests for a few seconds and solves an assignment problem to minimise total pickup time.</p>
+  <p>To avoid double assignment, the matcher atomically changes the chosen driver from free to offered with a short expiry, and only then notifies the rider and driver; if the driver declines or doesn't respond, the lease expires and the ride is re-matched. Per-area supply and demand metrics feed surge pricing and driver repositioning.</p>
+</InterviewCard>

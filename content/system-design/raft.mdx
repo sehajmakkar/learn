@@ -42,7 +42,7 @@ Raft divides time into **terms**, numbered 1, 2, 3 … Each term has at most one
 request and tells the others what to do; followers just follow. This makes Raft much simpler to reason about than
 designs where anyone can propose.
 
-**<Term t="leader-election">Leader election</Term>.** Followers expect regular heartbeats from the leader. If one hears nothing for its **election
+**<Term t="leader-election">Leader election</Term>.** Followers expect regular <Term t="heartbeat">heartbeats</Term> from the leader. If one hears nothing for its **election
 timeout**, chosen at random from a range such as 150–300 ms, it becomes a candidate: it starts a new term, votes for
 itself and asks the others for votes. A server grants at most one vote per term, and wins with a majority. The
 randomness makes it likely that one server times out first and wins before others start competing.
