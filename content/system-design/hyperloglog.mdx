@@ -1,0 +1,198 @@
+export const meta = {
+  summary: "Counting unique visitors without remembering them: the coin-flip idea behind HyperLogLog, why a few kilobytes estimate millions within 1%, merging sketches across days and servers, and a tested implementation with a lab to watch it.",
+  uses: ["11.01", "05.03", "05.08"],
+  usedIn: ["11.06", "16.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="11.01" />. Like the Bloom filter (<L id="05.08" />), HyperLogLog trades a small, known error for a huge
+  saving in memory, and it relies on good hashing (<L id="05.03" />).
+</BeforeYouStart>
+
+## The problem: unique visitors, per link, per day
+
+Owners want "unique visitors" for each link: not clicks, but distinct people (by a hashed visitor ID). The exact way
+keeps a set of IDs per link per day. A popular link with 2 million visitors needs 2 million IDs, around 32 MB at 16
+bytes each, and Snip has millions of links and wants weekly and monthly uniques too. Uniques also don't add up: Monday's
+visitors plus Tuesday's double-count everyone who came both days, so each period needs its own set.
+
+## The idea: rare events tell you how many tries there were
+
+Flip a coin until it comes up heads. If someone tells you the longest run of tails they saw was 10, they probably flipped
+around 2¹⁰ times: a run that long is rare, so it took many attempts to see one.
+
+HyperLogLog applies this to hashes. Hash each visitor ID to a random-looking number and look at the leading zero bits.
+About half of hashes start with a 1, a quarter with `01`, an eighth with `001`. Seeing a hash that starts with 20 zeros
+suggests about 2²⁰ distinct items, and crucially, **seeing the same visitor again gives the same hash**, so duplicates
+change nothing.
+
+One maximum is noisy, so HyperLogLog splits the hashes into **m buckets** (registers) using the first few bits,
+records the longest run of zeros per bucket, and combines them with a harmonic mean, which isn't thrown off by one
+lucky bucket. The error falls as buckets are added: the standard error is about **1.04 / √m**.
+
+## Try it
+
+<Lab
+  id="sd-11-03-hll"
+  title="Estimate unique visitors"
+  tasks={[
+    "Add 1,000,000 visitors at precision 10. How close is the estimate, and how big is the sketch compared with the exact set?",
+    "Press 'Same visitors again'. Why doesn't anything change?",
+    "Lower the precision to 4, then raise it to 16. How do the error and the size change?",
+    "Turn on 'Merge with yesterday'. Is the merged estimate close to the true union, even though half the visitors overlap?",
+  ]}
+>
+  <HyperLogLogLab />
+</Lab>
+
+From the lab: at precision 10 (1,024 registers, **768 bytes**), a million visitors are estimated within about 3%,
+against about 15 MB for the exact set. At precision 14 (16,384 registers, 12 KB) the error is a fraction of a percent. At
+precision 4 (16 registers) it's off by about 20%. The memory doesn't grow with the number of visitors at all.
+
+## Merging: the property that makes it useful
+
+The union of two HyperLogLogs is the **register-by-register maximum**, with no loss of accuracy. So Snip keeps one
+<Term t="sketch">sketch</Term> per link per hour, and:
+
+- Daily uniques = merge 24 hourly sketches. Weekly = merge 7 daily ones. No raw IDs needed.
+- Each app server can keep its own sketch, and a central job merges them.
+- Overlapping visitors are handled correctly: the lab's merge, with half the visitors in both days, estimates the
+  union, not the sum.
+
+What you **can't** do is subtract or intersect reliably: "visitors on Monday who didn't come back on Tuesday" needs
+other techniques.
+
+## A small implementation
+
+```ts
+export class HyperLogLog {
+  readonly m: number;
+  readonly registers: Uint8Array;
+
+  constructor(readonly p = 14) {
+    this.m = 1 << p; // 2^p registers
+    this.registers = new Uint8Array(this.m);
+  }
+
+  add(item: string) {
+    const h = hash32(item); // any well-mixed 32-bit hash
+    const idx = h >>> (32 - this.p); // first p bits pick a register
+    const rest = (h << this.p) >>> 0; // remaining bits
+    const rank = rest === 0 ? 32 - this.p + 1 : Math.clz32(rest) + 1; // position of the first 1-bit
+    if (rank > this.registers[idx]) this.registers[idx] = rank;
+  }
+
+  count(): number {
+    let sum = 0;
+    let zeros = 0;
+    for (const r of this.registers) {
+      sum += 2 ** -r;
+      if (r === 0) zeros++;
+    }
+    const alpha = 0.7213 / (1 + 1.079 / this.m);
+    const estimate = (alpha * this.m * this.m) / sum;
+    // Small counts: many registers still empty, so count those instead (linear counting).
+    if (estimate <= 2.5 * this.m && zeros > 0) return this.m * Math.log(this.m / zeros);
+    return estimate;
+  }
+
+  /** The union of two sketches is the register-by-register maximum. */
+  merge(other: HyperLogLog) {
+    for (let i = 0; i < this.m; i++) this.registers[i] = Math.max(this.registers[i], other.registers[i]);
+  }
+}
+```
+
+Tested at precision 14: counts from 100 to a million, each added twice, came within 0.7%; over 20 runs of 100,000
+the root-mean-square error was 0.70%, against the theoretical 0.81%; merging two sketches of 60,000 visitors with
+30,000 in common estimated 90,640 for a true 90,000. Production versions use a 64-bit hash, so very large counts
+don't suffer hash collisions, and Google's HyperLogLog++ adds a sparse mode for small counts and bias correction.
+
+## Use the one you have
+
+Redis has it built in: `PFADD visitors:x7Kp:2026-11-04 <visitor-id>`, `PFCOUNT`, `PFMERGE`. Each uses at most 12 KB
+with a 0.81% standard error. Most analytics databases offer an approximate distinct count based on HyperLogLog too.
+
+<Analogy>
+  **Guessing a crowd from the rarest birthday coincidence.** You can't count everyone in a stadium, but if you split the crowd into sections and in each one note the rarest thing anyone has (say, the longest run of identical digits in their ticket number), the rarer those records are, the bigger the crowd must be. Someone who walks in twice doesn't change any record.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="INRIA and others"
+    system="HyperLogLog"
+    year={2007}
+    href="https://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf"
+    source="HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm (Flajolet, Fusy, Gandouet and Meunier, AofA 2007)"
+    found="One pass, a typical standard error of 1.04/√m, and cardinalities beyond a billion estimated within about 2% using 1.5 KB."
+  >
+    The paper presents HyperLogLog as a single-pass algorithm whose relative accuracy, the standard error, is typically
+    about 1.04/√m, improving on the earlier LogLog algorithm, whose accuracy it matches using only 64% of the memory.
+    For example, it can estimate cardinalities well beyond 10⁹ with a typical accuracy of 2% using only 1.5 kilobytes
+    of memory, and it parallelises optimally.
+  </Seen>
+  <Seen
+    company="Google"
+    system="HyperLogLog++"
+    year={2013}
+    href="https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/40671.pdf"
+    source="HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm (Heule, Nunkesser and Hall)"
+    found="Engineering HyperLogLog for production: a sparse representation for small counts and empirical bias correction."
+  >
+    Google's analysis systems, including Sawzall, Dremel and PowerDrill, estimate cardinalities of very large data sets
+    daily, for example the number of distinct search queries over a time period. The paper improves HyperLogLog for
+    that use: when most registers are unused, a sparse representation stores only the used ones, and an empirical bias
+    correction reduces error in an important range of cardinalities.
+  </Seen>
+  <Seen
+    company="Redis"
+    system="HyperLogLog type"
+    year="Docs"
+    href="https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/"
+    source="HyperLogLog (Redis documentation)"
+    found="At most 12 KB per counter with a 0.81% standard error, plus a merge command."
+  >
+    Redis's implementation uses up to 12 KB of memory per key, far less when it has seen few elements, and gives a
+    standard error of 0.81%. PFADD adds elements, PFCOUNT returns the approximate number of distinct elements, and
+    PFMERGE merges several sketches into one.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip keeps an hourly HyperLogLog of visitors per link. An owner asks for unique visitors over the last 30 days. What does Snip do?"
+  options={[
+    { text: "Add up the 720 hourly estimates", why: "That counts a visitor once for every hour they came, so regular visitors are counted many times." },
+    { text: "Merge the 720 hourly sketches by taking the maximum of each register, then estimate", correct: true, why: "Merging gives the sketch of the union, exactly as if one sketch had seen all 30 days, so each visitor counts once." },
+    { text: "It can't without the raw visitor IDs", why: "That's the point of HyperLogLog: sketches merge without the original IDs." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Summing distinct counts across periods.** Uniques don't add. Merge sketches instead.</li>
+    <li>**Using HyperLogLog where exact matters.** Billing by unique users needs exact sets or a different design.</li>
+    <li>**A poor hash.** Estimates assume well-mixed bits; a weak hash skews them.</li>
+    <li>**Expecting intersections.** HyperLogLog does unions well; set differences and intersections are unreliable.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>HyperLogLog estimates distinct counts from the longest runs of leading zeros in hashed items.</li>
+    <li>Memory is fixed by the number of registers, not the count; error is about 1.04/√m (0.81% at 16,384 registers).</li>
+    <li>Duplicates change nothing, and sketches merge by register-wise maximum, so periods and servers combine cleanly.</li>
+    <li>Use Redis's PF commands or your database's approximate distinct count rather than writing your own.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you count unique visitors per page per day for millions of pages?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How does HyperLogLog work?", "How do you get weekly uniques from daily data?"]}
+>
+  <p>Exact sets per page per day take memory proportional to the number of visitors and can't be summed across days, so I'd use HyperLogLog, accepting around 1% error. Each visitor ID is hashed; the first p bits choose one of 2^p registers, and each register stores the longest run of leading zeros seen in the rest of the hash. A harmonic mean of 2 to the register values, with a correction constant, estimates the count, with standard error about 1.04 over the square root of the number of registers, so about 12 KB gives 0.81%.</p>
+  <p>Duplicates hash identically and change nothing, and two sketches merge by taking the maximum of each register, which equals the sketch of the union. So I'd keep hourly or daily sketches per page, for example in Redis with PFADD, and compute weekly or monthly uniques by merging. Where exact counts are required, such as billing, I'd keep exact data instead.</p>
+</InterviewCard>

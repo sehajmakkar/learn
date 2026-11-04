@@ -183,12 +183,12 @@ const modules: Module[] = [
     title: "Counting and analytics",
     blurb: "Counting billions of things, approximately and on purpose.",
     lessons: [
-      l("11.01", "Counting at scale", 10, "CONCEPT"),
-      l("11.02", "Time-window aggregation", 10, "CONCEPT"),
-      l("11.03", "HyperLogLog", 11, "CODE"),
-      l("11.04", "Count-min sketch and top-k", 12, "CODE"),
-      l("11.05", "Percentiles and t-digest", 10, "CONCEPT"),
-      l("11.06", "Raw events vs derived data", 10, "CONCEPT"),
+      l("11.01", "Counting at scale", 10, "CONCEPT", "counting-at-scale"),
+      l("11.02", "Time-window aggregation", 10, "CONCEPT", "time-windows"),
+      l("11.03", "HyperLogLog", 11, "CODE", "hyperloglog"),
+      l("11.04", "Count-min sketch and top-k", 12, "CODE", "count-min-sketch"),
+      l("11.05", "Percentiles and t-digest", 10, "CONCEPT", "percentiles"),
+      l("11.06", "Raw events vs derived data", 10, "CONCEPT", "raw-vs-derived"),
     ],
   },
   {

@@ -74,7 +74,7 @@ Since you can't make every server fast all the time, design so one slow server d
 
 - **Look at percentiles, not averages.** An average hides the tail entirely.
 - **Don't average percentiles.** The p99 of a whole fleet isn't the average of each server's p99. Collect latency
-  histograms and combine those.
+  <Term t="histogram">histograms</Term> and combine those.
 - **Measure from the client's side too.** Server timing misses time spent queued before the server picked the request
   up, which is often where the tail lives.
 

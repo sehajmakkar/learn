@@ -80,7 +80,7 @@ store, where silently losing data would be worse.
 
 **Caffeine**, a widely used Java cache, uses
 [W-TinyLFU](https://github.com/ben-manes/caffeine/wiki/Efficiency): new entries go into a small LRU "window", and when
-one is pushed out of the window it's only admitted to the main cache if a compact frequency sketch says it's been used
+one is pushed out of the window it's only admitted to the main cache if a compact frequency <Term t="sketch">sketch</Term> says it's been used
 more often than the entry it would replace. The window lets brand-new popular keys in, and the frequency check keeps
 one-off scans out: the best of both lab results.
 

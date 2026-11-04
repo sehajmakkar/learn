@@ -1,0 +1,176 @@
+export const meta = {
+  summary: "Counting per minute sounds simple until events arrive late and out of order. Tumbling, sliding and session windows, event time versus processing time, watermarks that decide when a window is done, and what to do with stragglers.",
+  uses: ["11.01", "07.04", "05.06"],
+  usedIn: ["11.06", "16.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="11.01" />: per-minute buckets are windows. Events arrive out of order across partitions
+  (<L id="07.04" />), and their timestamps come from clocks you can't fully trust (<L id="05.06" />).
+</BeforeYouStart>
+
+## The problem: which minute does a click belong to?
+
+Snip's chart shows clicks per minute for each link. A click happened at 14:02:58 on a phone in a train tunnel. The
+phone sends it at 14:09:40, when it gets signal. The CDN's edge logs (<L id="06.07" />) arrive in batches every few
+minutes. A consumer was restarted and replays two minutes of events.
+
+So the click must be counted in the **14:02** bucket, not 14:09, and the 14:02 bucket can't be called final at 14:03,
+because clicks for it may still be on their way. Windowing is the art of answering "how many per minute?" when data
+is late and out of order.
+
+## Event time versus processing time
+
+- **Processing time**: when the system sees the event. Easy, always moving forward, and wrong for analytics: a
+  backlog or a replay shifts clicks into the wrong minute.
+- **Event time**: when the event actually happened, carried in the event. Right for analytics, but events arrive in
+  any order.
+
+Snip counts by event time. The redirect stamps each click with the server's time when it served the 302, so phones'
+clocks don't matter, but delays in the pipeline still do.
+
+## Three shapes of window
+
+| Window | Definition | Snip use |
+| --- | --- | --- |
+| **Tumbling** | Fixed size, no overlap: 14:00–14:01, 14:01–14:02 … | Clicks per minute for the chart |
+| **Sliding** | Fixed size, moving by a smaller step: the last 5 minutes, every minute | "Trending now": clicks in the last 5 minutes |
+| **Session** | Activity separated by gaps of inactivity; no fixed start or end | A visitor's burst of clicks on one owner's links |
+
+Apache Flink's documentation puts it precisely: tumbling windows have a fixed size and don't overlap; sliding windows
+overlap when the slide is smaller than the window; session windows close when no elements arrive for a period.
+
+## Watermarks: when is a window done?
+
+A **watermark** is the stream's own estimate of event-time progress. In Flink's definition, a watermark at time *t*
+declares that event time has reached *t*: there should be no more events with timestamps at or before *t*. When the
+watermark passes the end of a window, the window can be emitted.
+
+The watermark is a judgement call. Snip sets it to "the latest event time seen, minus 5 seconds", because measured
+delays through the pipeline are almost always under 5 seconds:
+
+- **Too eager** (watermark close to the newest event): results appear fast, but more events arrive after their window
+  was emitted.
+- **Too cautious** (watermark minutes behind): fewer late events, but every chart is minutes behind.
+
+Google's Dataflow paper frames this as a three-way trade-off you can't avoid with unbounded, out-of-order data:
+**correctness, latency and cost**.
+
+## Late events
+
+Some events still arrive after the watermark. Choose what happens to them:
+
+1. **Update the window.** Keep each window's state for an **allowed lateness** after it closes, and emit a corrected
+   count if a late event arrives. Downstream must accept updates, which per-minute rows in a database do naturally.
+2. **Drop, but count the drops.** Past the allowed lateness, discard the event from the live windows, increment a
+   "too late" metric, and let the nightly batch over raw events fix the numbers (<L id="11.06" />).
+
+```ts
+type Click = { code: string; at: number }; // event time, ms
+
+export class MinuteCounts {
+  counts = new Map<number, number>(); // window start -> clicks
+  dropped = 0;
+  private maxSeen = 0;
+  constructor(readonly allowedLatenessMs = 120_000) {}
+
+  get watermark() {
+    return this.maxSeen - 5_000; // assume events are at most 5 s out of order
+  }
+
+  add(c: Click) {
+    this.maxSeen = Math.max(this.maxSeen, c.at);
+    const window = Math.floor(c.at / 60_000) * 60_000;
+    if (window + 60_000 + this.allowedLatenessMs <= this.watermark) {
+      this.dropped++; // too late even for an update: count it elsewhere
+      return;
+    }
+    this.counts.set(window, (this.counts.get(window) ?? 0) + 1); // a late event updates an already-emitted window
+  }
+
+  /** Windows whose end is behind the watermark are complete enough to show. */
+  closed() {
+    return [...this.counts].filter(([w]) => w + 60_000 <= this.watermark);
+  }
+}
+```
+
+Tested with ten minutes of clicks, one a second, shuffled by up to a few seconds, plus one click from a phone that
+arrived about nine and a half minutes late: nine windows closed with about 60 clicks each, the jittered clicks were
+counted in their correct minutes, and the very late click was dropped and counted as dropped (600 of 601 counted),
+leaving the nightly batch to account for it.
+
+<Analogy>
+  **Counting postal votes.** Votes are counted by the day they were posted, not the day they arrived (event time). The count for Monday is declared once the post office says nothing older than Monday is still in the system (the watermark). Votes that turn up after that are added as a correction for a week (allowed lateness); after that, they're logged for the official recount.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="The Dataflow Model"
+    year={2015}
+    href="https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf"
+    source="The Dataflow Model: A Practical Approach to Balancing Correctness, Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data Processing (VLDB 2015)"
+    found="With unbounded, out-of-order data you can't fully optimise correctness, latency and cost at once; the model lets each pipeline choose."
+  >
+    Akidau and colleagues at Google argue that for massive-scale, unbounded, out-of-order data, one can never fully
+    optimise along all of correctness, latency and cost, and present a model that lets practitioners choose the
+    trade-offs for each use case, with windowing by event time, watermarks and triggers that decide when results are
+    emitted and refined. They argue that batch, micro-batch and streaming systems can provide equal correctness, rather
+    than an execution engine dictating semantics.
+  </Seen>
+  <Seen
+    company="Apache Flink"
+    system="Windows and watermarks"
+    year="Docs"
+    href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/"
+    source="Timely Stream Processing (Apache Flink documentation)"
+    found="Event time is when it happened; a watermark says no older events should still arrive; anything after it is late."
+  >
+    Flink distinguishes processing time, the system time of the machine running an operation, from event time, the time
+    each event occurred on its producing device. A watermark at time t declares that event time has reached t, meaning
+    there should be no more elements with timestamps at or before t; elements arriving after that are late. Its
+    [windows documentation](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/)
+    defines tumbling, sliding and session windows, and keeps a window's state until the watermark passes its end plus
+    the allowed lateness.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's per-minute chart uses processing time. After a 20-minute consumer outage, the backlog is processed in 3 minutes. What does the chart show?"
+  options={[
+    { text: "The correct counts, a little late", why: "With processing time, events are counted when processed, not when they happened." },
+    { text: "Twenty minutes of near-zero, then a three-minute spike holding all the clicks", correct: true, why: "Processing time puts every backlog event in the minute it was processed. Event-time windows would place each click in the minute it happened." },
+    { text: "The counts are doubled", why: "Nothing is counted twice; it's counted in the wrong minute." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Windowing by processing time.** Outages and replays move events into the wrong windows. Use event time.</li>
+    <li>**Final results with no plan for late data.** Decide: update within an allowed lateness, then drop and count.</li>
+    <li>**A watermark tuned by guesswork.** Measure real pipeline delays and set it from those.</li>
+    <li>**Silently dropping late events.** Count them; a rising number means the watermark or pipeline needs attention.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Count by event time, not processing time, so delays and replays don't distort results.</li>
+    <li>Tumbling windows for regular buckets, sliding for "the last N minutes", session for bursts of activity.</li>
+    <li>A watermark estimates event-time progress and decides when a window is emitted: a trade between latency and completeness.</li>
+    <li>Late events update windows within an allowed lateness; later ones are dropped, counted, and fixed by batch.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you compute per-minute counts from a stream where events can arrive late and out of order?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What's a watermark?", "What do you do with an event that arrives an hour late?"]}
+>
+  <p>Window by event time, the timestamp of when the event happened, not by processing time, so backlogs and replays don't shift counts into the wrong minute. Use tumbling one-minute windows keyed by the entity. A watermark tracks event-time progress, typically the maximum event time seen minus an allowed out-of-orderness, and a window is emitted when the watermark passes its end.</p>
+  <p>For events behind the watermark, keep window state for an allowed lateness and emit updated counts, which downstream stores as upserts. Events later than that are dropped from the streaming result and counted as late, and a periodic batch job over the raw event log recomputes the authoritative numbers. The watermark delay is the trade-off between latency and completeness, set from measured pipeline delays.</p>
+</InterviewCard>

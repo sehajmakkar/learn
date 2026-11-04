@@ -1,0 +1,174 @@
+export const meta = {
+  summary: "Keep the raw events, derive everything else, and you can always fix a bug by recomputing. Rollups and their trade-off, batch versus stream processing, the Lambda architecture's double code path, and the simpler replay-the-log alternative.",
+  uses: ["11.01", "11.02", "07.02", "09.04", "04.12"],
+  usedIn: ["16.09", "16.10"],
+};
+
+<BeforeYouStart>
+  This lesson ties the module together. It uses the log from <L id="07.02" />, cheap storage from <L id="09.04" />,
+  windows from <L id="11.02" />, and the idea of derived copies from <L id="04.12" />.
+</BeforeYouStart>
+
+## The problem: a bug in last month's numbers
+
+A bug in Snip's click consumer counted clicks from link previews (chat apps fetching a link to show a thumbnail) as
+real clicks. It ran for three weeks. Owners' charts, totals, unique visitors and top referrers are all inflated by
+different amounts. If the only thing Snip stored was the counts, the true numbers would be gone for good.
+
+## Raw events are the truth; everything else is derived
+
+Separate two kinds of data:
+
+- **Raw events**: every click as it happened (code, time, country, referrer, user agent, visitor hash). Append-only,
+  never edited. Large, but cheap to keep compressed in object storage (<L id="09.04" />), partitioned by day.
+- **Derived data**: everything computed from them. Per-minute counts, daily unique-visitor <Term t="sketch">sketches</Term>, top referrers,
+  latency <Term t="histogram">histograms</Term>. Small, fast to query, and **replaceable**.
+
+Because derived data can always be recomputed from raw events, a bug in a derivation is fixable: correct the code,
+recompute the affected period, swap the results in. Snip fixed the preview bug by filtering previews by user agent and
+recomputing three weeks of rollups from the archive overnight.
+
+## Rollups
+
+A **rollup** <Term t="pre-aggregation">pre-aggregates</Term> raw events at a coarser grain: one row per (link, country, minute) instead of one per
+click. Analytics stores do this at ingestion; Apache Druid, for example, combines rows with identical dimensions and
+truncated timestamps into one, which can cut row counts by orders of magnitude. The documentation is clear about the
+cost: you lose the ability to query individual events.
+
+So choose rollup dimensions deliberately, and keep the raw events somewhere, so a question nobody anticipated ("clicks
+from Android in Brazil on Tuesday") can still be answered, slowly, from the archive.
+
+Snip's tiers:
+
+| Data | Kept for | Where |
+| --- | --- | --- |
+| Raw click events | 13 months | Compressed daily files in object storage |
+| Per-minute rollups | 30 days | Analytics database |
+| Per-hour rollups and hourly <Term t="hyperloglog">HyperLogLog</Term> sketches | 2 years | Analytics database |
+| Per-day totals | For the link's lifetime | Postgres |
+
+## Batch or stream?
+
+- **Batch** processing runs over a bounded chunk of data (yesterday's files), producing complete, correct results,
+  late.
+- **Stream** processing handles events as they arrive (<L id="11.02" />), producing fresh results that may need
+  correcting as late data turns up.
+
+The **Lambda architecture** runs both: a stream path for fresh, approximate numbers and a batch path that periodically
+recomputes correct ones and overwrites them. Jay Kreps pointed out its main cost: you
+implement your logic twice, in two different systems, and keeping code that must produce the same result in two
+complex distributed systems in sync is really hard.
+
+His alternative, sometimes called the **Kappa architecture**: keep the raw events in a log (or an archive that can be
+replayed as one), run **one** stream processing job, and when the logic changes, start a second instance of the new
+version from the beginning of the retained data, let it catch up, and switch readers to its output. One code path; a
+recompute is a replay.
+
+Snip uses that shape: one streaming job produces the rollups; the raw archive can be replayed through a new version
+of the same job to rebuild any period. A nightly batch job still exists, but runs the same code over the archive, only
+to reconcile and catch the stragglers that arrived too late for the stream (<L id="11.02" />).
+
+## Snip at the end of Module 11
+
+<Arch
+  title="Snip's analytics pipeline"
+  nodes={[
+    { id: "app", label: "Snip app", kind: "service", sub: "1-second pre-agg", x: 0, y: 1 },
+    { id: "log", label: "clicks topic", kind: "queue", sub: "keyed by code", x: 1.2, y: 1 },
+    { id: "stream", label: "Stream job", kind: "worker", sub: "windows, sketches", x: 2.4, y: 0.4 },
+    { id: "archive", label: "Raw archive", kind: "store", sub: "13 months", x: 2.4, y: 1.7 },
+    { id: "olap", label: "Analytics DB", kind: "db", sub: "rollups", x: 3.6, y: 0.4 },
+    { id: "redis", label: "Redis", kind: "cache", sub: "live counts, HLL", x: 3.6, y: 1.4 },
+  ]}
+  edges={[
+    { from: "app", to: "log", label: "click counts" },
+    { from: "log", to: "stream" },
+    { from: "log", to: "archive", label: "hourly files" },
+    { from: "stream", to: "olap", label: "per-minute rows" },
+    { from: "stream", to: "redis" },
+    { from: "archive", to: "stream", label: "replay", dashed: true },
+  ]}
+  steps={[
+    { caption: "App servers pre-aggregate clicks per code for one second and append them to the clicks topic (11.01).", edges: ["app>log"] },
+    { caption: "A stream job counts by event time in one-minute windows with a watermark, builds HyperLogLog and count-min sketches, and handles late events (11.02 to 11.04).", edges: ["log>stream"] },
+    { caption: "Rollups go to the analytics database for charts; live counters and visitor sketches go to Redis.", edges: ["stream>olap", "stream>redis"] },
+    { caption: "Every raw event is also archived as compressed hourly files: the source of truth for every derived number.", edges: ["log>archive"] },
+    { caption: "When logic changes or a bug is found, the same job replays the archive to rebuild any period (11.06).", edges: ["archive>stream"] },
+  ]}
+/>
+
+Every number Snip shows can now be traced to raw events and recomputed. Module 12 turns to the parts of Snip that are
+about people and places: live connections, feeds and location (<L id="12.01" />).
+
+<Analogy>
+  **Receipts and the monthly budget.** The budget spreadsheet is handy and small, but if you discover you'd been categorising coffee as groceries, you can only fix it if you kept the receipts. Keep the receipts in a shoebox (raw events), rebuild the spreadsheet when the rules change (derived data), and don't maintain two spreadsheets by two different methods that must always agree.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Jay Kreps"
+    system="Questioning the Lambda Architecture"
+    year={2014}
+    href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/"
+    source="Questioning the Lambda Architecture (O'Reilly Radar)"
+    found="Writing the same logic twice for batch and stream is the real cost; reprocess by replaying the log through one job instead."
+  >
+    Kreps describes the Lambda Architecture as feeding an immutable sequence of records into a batch system and a
+    stream processing system in parallel, implementing the transformation logic twice. His main criticism is the
+    burden of maintaining code that must produce the same result in two complex distributed systems. As an
+    alternative, he suggests starting a second instance of the stream job from the beginning of the retained data and,
+    once it has caught up, switching the application to read from its output, adding that this "may be too simple of an
+    idea to merit a Greek letter".
+  </Seen>
+  <Seen
+    company="Apache Druid"
+    system="Rollup"
+    year="Docs"
+    href="https://druid.apache.org/docs/latest/ingestion/rollup/"
+    source="Data rollup (Apache Druid documentation)"
+    found="Pre-aggregate at ingestion to cut rows by orders of magnitude, at the cost of individual events."
+  >
+    Rollup is a form of summarization or pre-aggregation: Druid combines into a single row any rows with identical
+    dimension values and timestamps after truncation to the query granularity. It's enabled by default and can reduce
+    row counts by potentially orders of magnitude, but as a trade-off you lose the ability to query individual events.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip only stores per-hour rollups by (link, country). Product wants 'clicks by device type for last quarter'. What's possible?"
+  options={[
+    { text: "Recompute it from the rollups", why: "Device type was never a rollup dimension, so the rollups don't contain it." },
+    { text: "Recompute it from the raw event archive, which kept the user agent; then decide whether device should become a rollup dimension", correct: true, why: "Raw events answer questions nobody planned for. Rollups only answer the questions their dimensions were chosen for." },
+    { text: "It's impossible for past data", why: "Only if the raw events were thrown away. That's why Snip keeps them for 13 months." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Storing only aggregates.** A bug or a new question can't be fixed or answered. Keep raw events, cheaply.</li>
+    <li>**Treating derived data as precious.** It should be rebuildable; test that you can rebuild it.</li>
+    <li>**Two code paths for the same logic.** Batch and stream versions drift. Prefer one job that can replay.</li>
+    <li>**Rolling up away dimensions you'll need.** Choose dimensions from real questions, and keep raw data for the rest.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Raw events are the source of truth; counts, sketches and rollups are derived and replaceable.</li>
+    <li>Rollups shrink data by orders of magnitude but lose individual events; keep the raw archive.</li>
+    <li>Lambda runs batch and stream side by side at the cost of two code paths; replaying the log through one job avoids that.</li>
+    <li>Tier retention: raw for months in cheap storage, fine rollups briefly, coarse rollups for years.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design an analytics pipeline for click events. How do you handle a bug that corrupted a month of metrics?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["Lambda or Kappa architecture?", "How long would you keep raw events?"]}
+>
+  <p>Clicks go to a partitioned log; a stream processor aggregates them by event time into windowed rollups, distinct-count sketches and top-k structures, writing to an analytics store and a cache for live numbers. In parallel, raw events are archived as compressed, partitioned files in object storage. All dashboards read derived data, and every derived table is treated as rebuildable from the raw events.</p>
+  <p>To fix a bug, I'd correct the job and replay the affected period from the archive through the new version, writing to new tables and switching readers when it's done: the Kappa approach, with one code path rather than Lambda's separate batch and stream implementations. A nightly batch run of the same code reconciles late data. Retention is tiered: raw events for as long as reprocessing and compliance require, fine-grained rollups for weeks, coarse rollups for years.</p>
+</InterviewCard>

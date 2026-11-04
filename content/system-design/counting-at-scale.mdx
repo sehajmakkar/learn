@@ -1,0 +1,126 @@
+export const meta = {
+  summary: "Counting 100,000 events a second without melting a database: why one row can't take it, the ladder of fixes from batching to pre-aggregation, deciding what must be exact, and the four kinds of count analytics really needs.",
+  uses: ["02.06", "05.02", "07.03", "07.04", "06.02"],
+  usedIn: ["11.02", "11.03", "11.04", "11.06"],
+};
+
+<BeforeYouStart>
+  This lesson gathers ideas from earlier modules: the click queue (<L id="02.06" />), split counters
+  (<L id="05.02" />), consumers safe to repeat (<L id="07.03" />), partitions (<L id="07.04" />) and write-behind
+  (<L id="06.02" />).
+</BeforeYouStart>
+
+## The problem: 8.6 billion clicks a day
+
+At 100,000 redirects a second, Snip records about 8.6 billion clicks a day. Owners want, per link: total clicks, clicks
+per minute for a chart, unique visitors, top countries and referrers, and a live counter during launches. Counting
+sounds trivial. At this rate it's one of the hardest write workloads Snip has.
+
+## Why the obvious way fails
+
+`UPDATE links SET clicks = clicks + 1 WHERE code = $1` per click means 100,000 writes a second to the primary, and a
+viral link's row takes thousands of updates a second, each waiting for the previous one's row lock
+(<L id="02.06" />). Every fix below reduces either **how many writes** reach storage or **how many go to the same
+place**.
+
+## The ladder of fixes
+
+1. **Batch.** Clicks go to a log; consumers add up a few thousand at a time and write one update per code
+   (<L id="02.06" />). Thousands of writes become one.
+2. **Pre-aggregate at the edge.** Each app server keeps a small map of code → clicks for the last second and sends
+   one event with counts, so a viral link becomes one event per server per second instead of 50,000 (<L id="07.04" />).
+3. **Split the hot counter.** If one key's batched updates still collide, keep N rows and sum on read
+   (<L id="05.02" />).
+4. **Count in memory, persist periodically.** A Redis `INCRBY` per batch is fast enough for a live counter. Copying it
+   to Postgres every few seconds is write-behind (<L id="06.02" />): fine for a display, risky as the only record.
+5. **Store time buckets, not one total.** Write `(code, minute, clicks)` rows rather than updating one ever-growing
+   total. Inserts spread out, charts come for free, and the total is a sum (<L id="11.02" />).
+
+Snip combines them: per-second pre-aggregation in app servers, a clicks topic partitioned by code, consumers that write
+per-minute buckets with their offsets in the same transaction (<L id="07.03" />), and Redis for the live number.
+
+## Decide what must be exact
+
+Exactness costs. Decide per count:
+
+| Count | Snip's use | Needs to be |
+| --- | --- | --- |
+| Clicks on a paid campaign link | Billing, contracts | Exact, eventually: every click counted once |
+| Live counter during a launch | Excitement | Approximately right, right now |
+| Unique visitors | Reports | Within about 1% |
+| Top referrers this hour | Dashboards | The right top ten, roughly ordered |
+
+Exact counts get the durable path (log, idempotent consumer, buckets in the database). Approximate counts can use
+memory and **sketches**, small structures that answer within a known error using a tiny fraction of the space.
+
+## Four kinds of count
+
+Almost every analytics question is one of four, and each has its own tool:
+
+- **How many?** A sum: buckets and batching, this lesson.
+- **How many different?** Distinct counts, like unique visitors: <Term t="hyperloglog">HyperLogLog</Term> (<L id="11.03" />).
+- **Which are the most common?** <Term t="heavy-hitter">Heavy hitters</Term>, like top links: <Term t="count-min-sketch">count-min sketch</Term> and top-k (<L id="11.04" />).
+- **How is it spread?** Distributions, like latency percentiles: <Term t="histogram">histograms</Term> and sketches (<L id="11.05" />).
+
+All four are usually computed over **time windows** (<L id="11.02" />), and all are **derived** from raw events that
+are kept somewhere cheaper (<L id="11.06" />).
+
+<Analogy>
+  **Counting votes on election night.** No one runs to the national office with each ballot. Each polling station counts its own pile (pre-aggregation), sends one total per hour (batching), and the totals are added centrally. The live TV number is an estimate; the official result comes later, from the counted ballots, and must be exact.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="ClickHouse"
+    system="Incremental materialized views"
+    year="Docs"
+    href="https://clickhouse.com/docs/materialized-view/incremental-materialized-view"
+    source="Incremental materialized view (ClickHouse documentation)"
+    found="Aggregate as data arrives: a trigger on each inserted block writes partial aggregates that are merged in the background."
+  >
+    A ClickHouse materialized view is a trigger that runs a query on blocks of data as they're inserted into a table,
+    and inserts the result into a second, target table. For aggregations, the view stores partial aggregation states
+    (functions with a `State` suffix), an AggregatingMergeTree table merges rows with identical keys during background
+    merges, and queries finish the aggregation with the matching `Merge` functions. Counting becomes many small
+    inserts of partial totals rather than updates to one row.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip stores each link's total clicks in one Postgres column, updated by a consumer in batches. Owners now want a clicks-per-hour chart for the last 30 days. What's the best change?"
+  options={[
+    { text: "Query the raw click events each time the chart loads", why: "That scans billions of events per chart view. Raw events are for reprocessing, not dashboards." },
+    { text: "Have the consumer write per-minute or per-hour bucket rows instead of only the running total", correct: true, why: "Time buckets spread writes, make charts a cheap range scan, and the total is just their sum." },
+    { text: "Add a second total column updated every hour", why: "That gives one more number, not a 30-day history." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**One row per counter, updated per event.** It caps throughput at one row's lock. Batch, pre-aggregate, split.</li>
+    <li>**Exactness everywhere.** Billing needs it; a live counter doesn't. Pay for exactness only where it matters.</li>
+    <li>**Only running totals.** Store time buckets; totals, charts and windows all come from them.</li>
+    <li>**Memory as the only record.** A crash loses whatever wasn't persisted. Keep a durable path for counts that matter.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Per-event updates to one row don't scale; reduce the number of writes and spread where they land.</li>
+    <li>Batch through a log, pre-aggregate at the edge, split hot counters, keep live counts in memory, store time buckets.</li>
+    <li>Decide per count whether it must be exact; use sketches where approximate is fine.</li>
+    <li>Analytics questions are sums, distinct counts, heavy hitters or distributions, each with its own tool.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a system to count views on posts at 100,000 events per second.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle one post going viral?", "Which counts need to be exact?"]}
+>
+  <p>Never update a counter row per view. Clients or edge servers send view events to a partitioned log, keyed by post ID; servers can pre-aggregate per second first so a viral post sends one event per server per second. Consumers batch events and upsert per-minute bucket rows, storing their log offset in the same transaction so redelivered batches aren't double counted. Totals are sums of buckets, cached; a live counter can come from Redis increments.</p>
+  <p>For a viral post, pre-aggregation removes most of the load, and if a single bucket row is still hot I'd split it into several sub-rows summed on read. I'd keep exact, durable counting for anything billed or contractual, and use approximate structures for the rest: HyperLogLog for unique viewers, count-min sketches for top posts, and histograms for distributions.</p>
+</InterviewCard>

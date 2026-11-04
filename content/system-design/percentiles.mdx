@@ -1,0 +1,181 @@
+export const meta = {
+  summary: "Why averages hide what users feel, why you can't average percentiles across servers, and how histograms and sketches like t-digest and DDSketch give accurate, mergeable p99s in a few kilobytes. Tested numbers.",
+  uses: ["03.12", "11.01", "11.04"],
+  usedIn: ["11.06", "14.02", "16.10"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.12" /> for why p99 matters. Like the <Term t="sketch">sketches</Term> in <L id="11.04" />, the tools here trade exactness for
+  small, mergeable summaries.
+</BeforeYouStart>
+
+## The problem: "average latency: 22 ms"
+
+Snip's dashboard says redirects average 22 ms. Yet a big customer says links "sometimes take ages". Both are true: most
+redirects are fast and a few are very slow, and the average hides the few. Snip's requirement is about the slow ones:
+**p99 under 50 ms at the server**. To check it, Snip needs percentiles, from 40 app servers, per minute, per region.
+
+## Percentiles can't be averaged
+
+Each of Snip's servers can compute its own p99. The tempting dashboard averages them. Tested with simulated latencies
+from four servers, one of them slower:
+
+| | p99 |
+| --- | --- |
+| Server 1 | 80.4 ms |
+| Server 2 | 80.8 ms |
+| Server 3 | 80.8 ms |
+| Server 4 (slow) | 130.9 ms |
+| **Average of the four p99s** | **93.2 ms** |
+| **True p99 of all requests** | **100.3 ms** |
+
+The average is wrong, and not in a predictable direction: it depends on how the servers' distributions differ. The
+true p99 needs information about the whole distribution from each server, not one number. Prometheus's documentation
+says it plainly: you cannot aggregate quantiles, and averaging them yields statistically nonsensical values.
+
+## Option 1: keep every value
+
+Exact, and expensive: 100,000 redirects a second is 8.6 billion latencies a day, and every percentile query sorts
+them. Fine for offline analysis of raw events (<L id="11.06" />), not for a live dashboard.
+
+## Option 2: histograms
+
+Count values into fixed **buckets**: under 5 ms, 5–10, 10–25, 25–50, 50–100, and so on. Each server sends its bucket
+counts; counts from many servers simply **add up**, so they merge perfectly. A percentile is found by walking the
+buckets until the running count passes 99%.
+
+The catch: the answer is only as precise as the buckets. If p99 falls in the 50–100 ms bucket, you know it's between
+50 and 100. Prometheus notes the error is limited by the width of the bucket the quantile lands in, so buckets have to
+be chosen around the thresholds you care about (Snip puts a boundary exactly at 50 ms).
+
+## Option 3: sketches with guaranteed accuracy
+
+Sketches choose their buckets automatically to keep the error small:
+
+- **Logarithmic buckets** (DDSketch's approach): each bucket is about 2% wider than the last, so any value is known
+  within about 1% **relative** error, whether it's 3 ms or 3 seconds. Buckets add up across servers, like histograms.
+- **t-digest** keeps clusters of nearby values (centroids) and deliberately keeps them small near the extremes, so
+  p99 and p99.9 are accurate even though the middle is summarised coarsely. Digests from different servers can be
+  combined.
+
+```ts
+export class LogHistogram {
+  private buckets = new Map<number, number>();
+  private n = 0;
+  private readonly gamma: number;
+
+  constructor(readonly relativeError = 0.01) {
+    this.gamma = (1 + relativeError) / (1 - relativeError);
+  }
+
+  add(ms: number) {
+    const i = Math.ceil(Math.log(ms) / Math.log(this.gamma)); // bucket covers (gamma^(i-1), gamma^i]
+    this.buckets.set(i, (this.buckets.get(i) ?? 0) + 1);
+    this.n++;
+  }
+
+  merge(other: LogHistogram) {
+    for (const [i, c] of other.buckets) this.buckets.set(i, (this.buckets.get(i) ?? 0) + c);
+    this.n += other.n;
+  }
+
+  quantile(q: number) {
+    const rank = q * (this.n - 1);
+    let seen = 0;
+    for (const i of [...this.buckets.keys()].sort((a, b) => a - b)) {
+      seen += this.buckets.get(i)!;
+      if (seen > rank) return (2 * this.gamma ** i) / (this.gamma + 1); // within relativeError of the true value
+    }
+    return NaN;
+  }
+}
+```
+
+Tested on the same four servers: each server's 50,000 latencies went into its own sketch, the four were merged, and the
+merged sketch reported a p99 of **100.5 ms** against the true 100.3, a p50 of 22.4 (true 22.4) and a p99.9 of 169.0
+(true 167.7), all within the promised 1%, using 257 buckets instead of 200,000 values.
+
+<Analogy>
+  **Exam results from four schools.** Averaging each school's top-1% cut-off doesn't give the national top-1% cut-off, because one school may have many more high scorers. But if every school sends the number of students in each band of marks, you can add the bands and find the national cut-off directly, as precisely as the bands are narrow.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Prometheus"
+    system="Histograms and summaries"
+    year="Docs"
+    href="https://prometheus.io/docs/practices/histograms/"
+    source="Histograms and summaries (Prometheus documentation)"
+    found="Pre-computed quantiles can't be aggregated; bucket counts can, with error set by bucket width."
+  >
+    Summaries calculate quantiles inside each instrumented program and expose them directly, while histograms expose
+    bucketed counts and the quantile is calculated on the server. The documentation is blunt that you cannot
+    aggregate quantiles from summaries, and averaging them gives statistically nonsensical values. For classic
+    histograms, error is limited by the width of the bucket the quantile falls in; it recommends native histograms
+    where possible.
+  </Seen>
+  <Seen
+    company="Ted Dunning and Otmar Ertl"
+    system="t-digest"
+    year={2019}
+    href="https://arxiv.org/abs/1902.04023"
+    source="Computing Extremely Accurate Quantiles Using t-Digests"
+    found="Small sketches with high accuracy near the tails, combinable without losing accuracy."
+  >
+    The t-digest gives high accuracy, particularly near the tails of a distribution, with very small sketches. Its
+    accuracy is relative to max(q, 1−q) rather than absolute, which is why extreme quantiles like p99.9 stay precise,
+    and separately computed summaries can be combined with no loss in accuracy.
+  </Seen>
+  <Seen
+    company="Masson, Rim and Lee"
+    system="DDSketch"
+    year={2019}
+    href="https://arxiv.org/abs/1908.10693"
+    source="DDSketch: A fast and fully-mergeable quantile sketch with relative-error guarantees (PVLDB 2019)"
+    found="Relative-error guarantees that hold after any number of merges; used at wide scale by Datadog."
+  >
+    The paper presents the first fully mergeable, relative-error quantile sketch with formal guarantees, where several
+    combined sketches are as accurate as one sketch of the same data. It points out that rank-error guarantees don't
+    prevent arbitrarily large relative errors on long-tailed data like latencies, and notes the sketch is used by
+    Datadog at wide scale.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's 40 servers each report their own p99 every minute. A dashboard shows the maximum of the 40. Is that the fleet's p99?"
+  options={[
+    { text: "Yes: the worst server's p99 bounds the fleet", why: "It's an upper-ish signal, but not the fleet's p99: if one server has very few requests, its p99 can be far above the fleet's." },
+    { text: "No: percentiles can't be combined from per-server percentiles; send mergeable histograms or sketches and compute the p99 from the merged result", correct: true, why: "Only the merged distribution gives the true fleet p99. Max and average of per-server p99s are both just guesses." },
+    { text: "Yes, if every server has the same traffic", why: "Even with equal traffic, different distributions make the max an overestimate." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Reporting averages for latency.** They hide the slow requests users notice. Use p50, p95, p99.</li>
+    <li>**Averaging or maxing per-server percentiles.** Merge distributions, then compute the percentile.</li>
+    <li>**Histogram buckets that miss your threshold.** Put a bucket boundary at the SLO value.</li>
+    <li>**Too few requests for a p99.** A minute with 50 requests has no meaningful p99; widen the window.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Averages hide tails; track percentiles such as p99.</li>
+    <li>Percentiles can't be averaged across servers; you need each server's distribution.</li>
+    <li>Histograms merge by adding bucket counts, with error set by bucket width.</li>
+    <li>Sketches like DDSketch (relative error) and t-digest (accurate tails) give mergeable, precise percentiles in kilobytes.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you compute the p99 latency across a fleet of 1,000 servers?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why can't you average each server's p99?", "What's the trade-off between histograms and t-digest?"]}
+>
+  <p>You can't combine per-server percentiles, by averaging or otherwise, because the fleet p99 depends on the full distributions and their relative volumes. Instead each server records latencies into a mergeable summary per time window: a histogram with fixed buckets, or a sketch such as DDSketch or t-digest. These are shipped to the aggregator, merged, and the p99 computed from the merged summary.</p>
+  <p>Fixed-bucket histograms merge exactly by adding counts and are cheap, but precision depends on bucket boundaries, so I'd align them with SLO thresholds. Logarithmic-bucket sketches like DDSketch guarantee relative error at every value and merge losslessly; t-digest is very accurate at the tails in a small footprint. For alerting I'd make sure each window has enough requests for p99 to be meaningful.</p>
+</InterviewCard>

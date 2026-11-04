@@ -24,6 +24,7 @@ import { DeliveryLab } from "@/components/labs/delivery";
 import { QuorumLab } from "@/components/labs/quorum";
 import { LsmLab } from "@/components/labs/lsm";
 import { Bm25Lab } from "@/components/labs/bm25";
+import { HyperLogLogLab } from "@/components/labs/hyperloglog";
 
 /** Fenced code blocks (```ts … ```) get the same highlighted, scrollable frame as <Code>. */
 function Pre({ children }: { children?: ReactNode }) {
@@ -72,6 +73,7 @@ const components: MDXComponents = {
   QuorumLab,
   LsmLab,
   Bm25Lab,
+  HyperLogLogLab,
 };
 
 export function useMDXComponents(): MDXComponents {

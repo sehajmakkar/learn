@@ -1,0 +1,177 @@
+export const meta = {
+  summary: "Which links are hot right now? Counting every item exactly needs memory for every item. A count-min sketch estimates any item's count in fixed memory, never undercounting, and a small top-k list built on it finds the heavy hitters. Tested code and the error maths.",
+  uses: ["11.01", "11.03", "05.08", "05.02"],
+  usedIn: ["16.09", "14.03"],
+};
+
+<BeforeYouStart>
+  Read <L id="11.01" /> and <L id="11.03" />. A count-min <Term t="sketch">sketch</Term> is a close cousin of the Bloom filter
+  (<L id="05.08" />), and finding heavy hitters is how you spot hot keys (<L id="05.02" />).
+</BeforeYouStart>
+
+## The problem: top links in the last hour
+
+Snip's home page shows "trending links": the most-clicked links in the last hour. Its abuse team wants "which referrers
+are sending the most clicks right now" to spot bot farms. Within an hour, millions of different codes and referrers
+appear, most clicked once or twice. An exact count per item needs a counter for **every** item, and a sorted list of
+all of them, on every server, every hour.
+
+What's actually wanted is narrower: the **few** items with very high counts, the **heavy hitters**, and roughly how many
+each has.
+
+## Count-min sketch
+
+A **count-min sketch** is a small grid of counters: **d** rows of **w** counters each, with a different hash function
+per row.
+
+- **Add** an item: in each row, hash it to one counter and increment it.
+- **Estimate** an item: in each row, look at its counter, and take the **minimum**.
+
+Every counter for an item includes all of that item's own increments, plus increments from any other items that
+collided with it. So the estimate can be **too high but never too low**, and taking the minimum across rows picks the
+row with the fewest collisions.
+
+The error is controlled by the dimensions. With width w, the over-count is at most about (e / w) × the total number of
+events, with a probability that improves with each extra row. Redis's version takes the error and probability directly
+and sizes the grid: the error sets the width, and the probability sets the number of rows.
+
+```ts
+export class CountMinSketch {
+  private rows: Uint32Array[];
+
+  constructor(readonly width = 2048, readonly depth = 4) {
+    this.rows = Array.from({ length: depth }, () => new Uint32Array(width));
+  }
+
+  add(item: string, n = 1) {
+    for (let d = 0; d < this.depth; d++) this.rows[d][hash32(item, d + 1) % this.width] += n;
+  }
+
+  /** Never below the true count; above it by collisions. Take the smallest row's counter. */
+  estimate(item: string) {
+    let min = Infinity;
+    for (let d = 0; d < this.depth; d++) min = Math.min(min, this.rows[d][hash32(item, d + 1) % this.width]);
+    return min;
+  }
+}
+```
+
+## Top-k on top of it
+
+The sketch estimates any item, but can't list them: it doesn't remember which items it saw. For "top 10", keep a small
+list of candidates alongside it. After each event, estimate the item; if it's already a candidate, update it; if the
+list has room, add it; otherwise, if its estimate beats the smallest candidate, replace that one.
+
+```ts
+export class TopK {
+  private sketch = new CountMinSketch();
+  private candidates = new Map<string, number>(); // the current top k, with estimates
+
+  constructor(readonly k = 10) {}
+
+  add(item: string) {
+    this.sketch.add(item);
+    const est = this.sketch.estimate(item);
+    if (this.candidates.has(item) || this.candidates.size < this.k) {
+      this.candidates.set(item, est);
+      return;
+    }
+    let minItem = "";
+    let minVal = Infinity;
+    for (const [c, v] of this.candidates) if (v < minVal) [minItem, minVal] = [c, v];
+    if (est > minVal) {
+      this.candidates.delete(minItem);
+      this.candidates.set(item, est);
+    }
+  }
+
+  top() {
+    return [...this.candidates].sort((a, b) => b[1] - a[1]);
+  }
+}
+```
+
+## Tested
+
+200,000 simulated clicks over 50,000 codes with a power-law popularity, like real links (28,817 different codes
+actually appeared):
+
+| Measure | Result |
+| --- | --- |
+| Sketch size | 2,048 × 4 counters, 32 KB |
+| Codes underestimated | 0 |
+| Average over-count | about 26 clicks |
+| Largest over-count | 214, inside the e / w bound of 265 |
+| Top 10 found | 10 of 10 correct |
+| Most popular code | estimated 17,746 for a true 17,729 |
+
+Over-counts are small next to heavy hitters' real counts, which is exactly where accuracy matters: being off by 26 on a
+link with 17,000 clicks doesn't change the ranking, while the long tail of one-click codes, where the relative error
+is large, never makes the top 10.
+
+## Windows and merging
+
+Count-min sketches merge by **adding** counters (with the same dimensions and hashes), so each server keeps its own and
+a central job sums them. For "the last hour", keep one sketch per minute and sum the last 60, or decay old counts.
+Redis's Top-K takes the decaying approach: it's based on the HeavyKeeper algorithm, which decays counts exponentially
+so items that stopped being popular fade out.
+
+<Analogy>
+  **Tally marks on a few shared whiteboards.** Instead of a board per song, a radio station has four boards with 2,000 boxes each, and every song is assigned one box per board by a different rule. Each play adds a mark in all four. Some songs share a box on a board, so a box may over-count, but taking the smallest of a song's four boxes gives a close, never-too-low count. A sticky note lists the current top ten.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Redis"
+    system="Count-min sketch and Top-K"
+    year="Docs"
+    href="https://redis.io/docs/latest/develop/data-types/probabilistic/count-min-sketch/"
+    source="Count-min sketch (Redis documentation)"
+    found="Frequency estimates in sub-linear space that over-count via collisions; sized directly from error and probability."
+  >
+    Redis's count-min sketch estimates the frequency of events in a stream, using sub-linear space at the expense of
+    over-counting some events due to collisions. CMS.INITBYPROB sizes it from an error and a probability: the error
+    sets the width and the probability sets the number of hash functions. Redis's
+    [Top-K](https://redis.io/docs/latest/develop/data-types/probabilistic/top-k/) estimates the K highest-ranked
+    elements of a stream and is based on the HeavyKeeper algorithm, using count-with-exponential-decay.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A count-min sketch says referrer 'spam-farm.example' sent 4,100 clicks this hour. What can you conclude?"
+  options={[
+    { text: "Exactly 4,100 clicks came from it", why: "Collisions can inflate the estimate, so it's an upper bound, not an exact count." },
+    { text: "At most 4,100 clicks came from it, and very likely close to that if it's a heavy hitter", correct: true, why: "Count-min never underestimates. For items with large counts, the bounded over-count is small relative to the true value." },
+    { text: "At least 4,100 clicks came from it", why: "It's the other way round: the sketch can over-count but never under-count." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Exact counters for every item to find the top few.** Memory grows with distinct items; use a sketch plus top-k.</li>
+    <li>**Trusting estimates for rare items.** The over-count is small relative to heavy hitters, large relative to items seen a few times.</li>
+    <li>**Merging sketches with different sizes or hashes.** Only identical dimensions and hash functions can be added.</li>
+    <li>**Top lists that never forget.** Use per-window sketches or decay, or yesterday's hits stay "trending".</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A count-min sketch is d rows of w counters; add increments one counter per row; estimate takes the minimum.</li>
+    <li>It never undercounts; the over-count is bounded by about e / w of all events, with probability set by the rows.</li>
+    <li>A small candidate list on top of it finds the top k heavy hitters in fixed memory.</li>
+    <li>Sketches merge by adding counters; windows come from per-minute sketches or decay.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Find the top 10 most frequent items in a stream too large to count exactly.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["What error does a count-min sketch have?", "How would you compute the top items over a sliding hour?"]}
+>
+  <p>Use a count-min sketch: d rows of w counters with independent hashes. Each item increments one counter per row, and its estimated count is the minimum across rows, which can over-count due to collisions but never under-count; the error is at most about e/w times the total count with probability that improves exponentially in d. Alongside it, keep a small min-heap of the top k candidates: after each update, estimate the item and replace the heap's minimum if the new estimate is larger.</p>
+  <p>For scale, each server keeps its own sketch and heap, and an aggregator adds sketches element-wise and re-ranks the union of candidates. For a sliding hour I'd keep per-minute sketches and sum the last 60, or use a decaying variant like HeavyKeeper. If exact counts for the winners matter, a second pass can count just those candidates exactly.</p>
+</InterviewCard>
