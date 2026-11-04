@@ -1,0 +1,158 @@
+export const meta = {
+  summary: "Suggesting completions on every keystroke in a few milliseconds: prefix lookups, a trie that keeps the top suggestions at every node, prefix indexes in search engines, and the client-side tricks (debouncing, caching) that cut the load in half.",
+  uses: ["10.01", "04.02", "06.01", "10.04"],
+  usedIn: ["15.10"],
+};
+
+<BeforeYouStart>
+  Read <L id="10.01" />: autocomplete is search on prefixes, under a much tighter time budget. It leans on B-tree prefix
+  lookups (<L id="04.02" />) and on caching (<L id="06.01" />).
+</BeforeYouStart>
+
+## The problem: a suggestion per keystroke
+
+Snip's dashboard search box should suggest as the owner types: after `su`, show "summer sale", "summer shoes",
+"sunglasses". To feel instant, suggestions must appear within about 100 ms of each keystroke, network included, so
+the server has a few milliseconds. And a ten-letter query is ten requests, so autocomplete traffic is several times
+search traffic.
+
+What to suggest matters as much as how fast: the most **useful** completions first. Snip ranks an owner's link titles
+and tags by how often they've been searched for and clicked.
+
+## Option 1: a prefix query
+
+A prefix is the one thing a B-tree is good at for strings: `title LIKE 'su%'` can use an index (in Postgres, one built
+with `text_pattern_ops`), because all strings starting with `su` sit together in sorted order (<L id="04.02" />). For
+one owner's few thousand titles, that plus `ORDER BY popularity LIMIT 5` is fine.
+
+It breaks down at scale: a short prefix like `s` matches a huge range, which must then be **sorted by popularity** to
+find the top five. The top five are what's wanted, not all matches.
+
+## Option 2: a trie with the answers precomputed
+
+A **trie** is a tree where each edge is a character, so each node represents a prefix. The trick for autocomplete is
+to store, **at every node**, the top k completions for that prefix, computed when phrases are added. A lookup walks
+down the prefix's characters and returns that node's list: no searching or sorting below it.
+
+```ts
+type TrieNode = { children: Map<string, TrieNode>; top: [string, number][] };
+const node = (): TrieNode => ({ children: new Map(), top: [] });
+
+export class Autocomplete {
+  private root = node();
+  constructor(private readonly k = 5) {}
+
+  /** Add a phrase with a weight (say, how often it's searched). Every prefix node keeps its own top k. */
+  add(phrase: string, weight: number) {
+    let n = this.root;
+    for (const ch of phrase.toLowerCase()) {
+      if (!n.children.has(ch)) n.children.set(ch, node());
+      n = n.children.get(ch)!;
+      const top = n.top.filter(([p]) => p !== phrase);
+      top.push([phrase, weight]);
+      top.sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+      n.top = top.slice(0, this.k);
+    }
+  }
+
+  /** Walk down the prefix, then answer from that node's precomputed list: no search below it. */
+  suggest(prefix: string): string[] {
+    let n: TrieNode | undefined = this.root;
+    for (const ch of prefix.toLowerCase()) {
+      n = n.children.get(ch);
+      if (!n) return [];
+    }
+    return n.top.map(([p]) => p);
+  }
+}
+```
+
+Tested with k = 3 and six weighted phrases: `s` suggested "shoes", "summer sale", "summer shoes"; `su` suggested
+"summer sale", "summer shoes", "sunglasses"; an unknown prefix returned nothing; and raising "summer camp"'s weight
+moved it to the top of `summer`. Lookups cost the length of the prefix, whatever the number of phrases.
+
+The costs: memory (every node stores k entries) and updates (a new phrase touches every node along its path). A
+weight that **drops** is awkward, because the node no longer knows the next-best phrase; real systems rebuild the
+trie periodically (hourly, say) from search logs, and serve it read-only from memory.
+
+## Option 3: let the search engine do it
+
+Search engines have prefix features built in:
+
+- **Edge n-grams**: at index time, store every prefix of each word as a term ("s", "su", "sum", "summ" …), so a prefix
+  query becomes a normal term lookup in the inverted index (<L id="10.01" />). Flexible, but the index grows.
+- **Completion suggesters**: Elasticsearch's completion suggester keeps its suggestions in data structures built for
+  fast prefix lookups, held entirely in memory. The documentation is clear about the trade-off: fast to query, costly
+  to build, and best kept in a single-shard index.
+
+Snip uses the completion suggester for owner-scoped suggestions, with each owner's ID as a filter (a "context"), and
+rebuilds weights nightly from search logs.
+
+## The client does half the work
+
+- **Debounce**: wait until the user pauses for about 100 ms before requesting. Fast typists send far fewer requests.
+- **Cancel stale requests**: if the user typed `sum` after `su`, drop the `su` response if it arrives late, or the
+  box shows suggestions for the wrong prefix.
+- **Cache by prefix**: in the browser, and for global suggestions at the CDN (<L id="06.01" />): popular prefixes are
+  requested constantly and change slowly.
+- **Filter locally**: once you have suggestions for `su`, typing `m` can often be answered by filtering them, without
+  asking the server.
+
+<Analogy>
+  **A dictionary's thumb tabs and a well-informed shop assistant.** The tabs take you straight to the section for your first letters (walking the trie). The assistant doesn't list every product starting with "su"; they already know the three that people ask for most, because they learned them beforehand (the precomputed top k).
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Elastic"
+    system="Completion suggester"
+    year="Docs"
+    href="https://www.elastic.co/docs/reference/elasticsearch/rest-apis/search-suggesters"
+    source="Suggester examples: completion suggester (Elasticsearch documentation)"
+    found="Autocomplete from in-memory structures built for prefix lookups: optimised for speed, costly to build."
+  >
+    The completion suggester provides autocomplete and search-as-you-type, and isn't meant for spelling correction. It
+    uses data structures that allow fast lookups but are costly to build and are stored in memory, so it's optimised
+    for speed; the completion index is entirely held in the heap. New suggestions become visible after a refresh,
+    deleted ones are never shown, and the documentation recommends indexing completions into a single-shard index.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's autocomplete sends a request on every keystroke. Users sometimes see suggestions for 'su' after they've typed 'summer'. What's happening, and what fixes it?"
+  options={[
+    { text: "The trie returns the wrong node", why: "The server answered each prefix correctly; the problem is the order in which answers arrive." },
+    { text: "Responses arrive out of order; cancel or ignore responses for prefixes that are no longer current, and debounce", correct: true, why: "The slow 'su' response lands after the 'summer' one and overwrites it. Tag each request with its prefix and drop stale ones." },
+    { text: "The CDN cached the wrong suggestions", why: "A cache keyed by prefix returns the right list for each prefix; it can't swap them." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Sorting all matches per keystroke.** Precompute the top k per prefix, or use a completion structure.</li>
+    <li>**A request per keystroke with no debounce.** Wait for a pause, and cancel stale requests.</li>
+    <li>**Ranking only alphabetically.** Suggest what people actually choose: rank by popularity and relevance to the user.</li>
+    <li>**Suggesting from raw logs unfiltered.** Search logs contain typos and offensive or private text; filter before suggesting.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Autocomplete is prefix search with a few milliseconds of server time and many requests per query.</li>
+    <li>A B-tree prefix query works for small sets; a trie with top k stored at each node answers in prefix-length time.</li>
+    <li>Search engines offer edge n-grams and in-memory completion suggesters.</li>
+    <li>Debounce, cancel stale requests, cache popular prefixes and filter locally to halve the load.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a search autocomplete (typeahead) system.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you keep suggestions fresh as trends change?", "How would you scale it to millions of users?"]}
+>
+  <p>The core is a trie built from search logs, where each node stores the top k completions for its prefix by frequency, so a lookup walks the prefix and returns a precomputed list in time proportional to the prefix length. It's built offline, say hourly, by aggregating query counts, filtered for typos and unsafe terms, and served read-only from memory on replicated servers, sharded by prefix range if it's too big for one machine.</p>
+  <p>Freshness comes from frequent rebuilds plus a small real-time layer for trending queries. On the client I'd debounce keystrokes, cancel stale requests, and cache results by prefix, with a CDN cache for popular global prefixes. For per-user or per-tenant suggestions, I'd use a search engine's completion suggester with a context filter, or edge n-grams in the main index.</p>
+</InterviewCard>

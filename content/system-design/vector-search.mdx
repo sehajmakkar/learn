@@ -1,0 +1,192 @@
+export const meta = {
+  summary: "Searching by meaning instead of words: embeddings, nearest-neighbour search, why exact search doesn't scale and approximate indexes like HNSW do, filtering pitfalls, and combining keyword and vector results with reciprocal rank fusion.",
+  uses: ["10.01", "10.02", "10.04"],
+  usedIn: ["15.10"],
+};
+
+<BeforeYouStart>
+  Read <L id="10.02" />: <Term t="bm25">BM25</Term> matches words, and this lesson is about what it misses. Sharding from
+  <L id="10.04" /> applies to vector indexes too.
+</BeforeYouStart>
+
+## The problem: "sneakers" finds nothing
+
+An agency searches its links for `sneakers for kids`. Its links are titled "Children's running shoes", "Trainers for
+school", "Junior footwear sale". BM25 finds none of them: not one word matches. The user meant something the words
+don't share. To search by **meaning**, Snip needs a different kind of index.
+
+## Embeddings
+
+An **embedding model** turns a piece of text into a list of numbers, a **vector**, typically a few hundred to a few
+thousand numbers long, such that texts with similar meanings get vectors that point in similar directions. "Sneakers
+for kids" and "children's running shoes" land close together; "quarterly tax filing" lands far away.
+
+Search then becomes geometry: embed the query, and find the stored vectors **nearest** to it, usually by **cosine
+similarity** (the angle between vectors) or inner product.
+
+```ts
+const cosine = (a: number[], b: number[]) => {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return dot / Math.sqrt(na * nb);
+};
+```
+
+## Exact search doesn't scale
+
+The exact answer compares the query with **every** stored vector. For Snip's 600 million links at 768 numbers each,
+that's about 460 billion multiplications per search. Far too slow for a search box.
+
+**Approximate nearest neighbour** (ANN) indexes trade a little accuracy for enormous speed: they return most of the
+true nearest neighbours (the fraction is called **recall**) while looking at a tiny fraction of the vectors.
+
+- **HNSW** (Hierarchical Navigable Small World) builds a graph where each vector links to its near neighbours, in
+  several layers: sparse upper layers with long links for travelling far quickly, denser lower layers for the final
+  approach, much like a skip list. A search greedily walks the graph towards the query. Its authors show search cost
+  growing logarithmically with the number of vectors.
+- **IVF** (inverted file) clusters the vectors and, at query time, searches only the few clusters nearest the query.
+
+pgvector, the Postgres extension, offers both. Its README sums up the trade-off: HNSW has better query performance
+for the speed-recall trade-off, but slower builds and more memory; IVFFlat builds faster and uses less memory, but
+queries less well. Both have a knob that buys recall with time (`hnsw.ef_search`, `ivfflat.probes`).
+
+```sql
+CREATE EXTENSION vector;
+ALTER TABLE links ADD COLUMN embedding vector(768);
+CREATE INDEX ON links USING hnsw (embedding vector_cosine_ops);
+
+-- <=> is cosine distance: the 10 nearest titles to the query's embedding
+SELECT code, title FROM links ORDER BY embedding <=> $1 LIMIT 10;
+```
+
+## The filtering trap
+
+Snip's searches are always `WHERE owner_id = 4821`. With an approximate index, the filter is applied **after** the
+index returns its candidates. pgvector's README gives the arithmetic: if a filter matches 10% of rows, then with HNSW's
+default of 40 candidates, only about 4 rows survive on average, so a "top 10" query can return 4. Fixes: raise the
+candidate count, use iterative scans that keep searching until enough rows pass (pgvector 0.8.0 added these), or
+partition the vectors so each owner's search covers only their own (like routing in <L id="10.04" />).
+
+## Hybrid search: words and meaning together
+
+Vectors find "trainers" for "sneakers", but they're vague with exact things: a campaign code like `SPR-2026-DE`, a
+product name, a rare word. BM25 is excellent at those. **Hybrid search** runs both and merges the results.
+
+Merging is awkward because BM25 scores and cosine similarities are on unrelated scales. **Reciprocal rank fusion**
+(RRF) ignores the scores and uses only **ranks**: each list gives a document 1 / (k + rank), and the totals decide the
+order.
+
+```ts
+/** Combine ranked lists of IDs: each list contributes 1 / (k + rank) for every document it contains. */
+export function rrf(lists: string[][], k = 60): [string, number][] {
+  const scores = new Map<string, number>();
+  for (const list of lists) list.forEach((id, i) => scores.set(id, (scores.get(id) ?? 0) + 1 / (k + i + 1)));
+  return [...scores].sort((a, b) => b[1] - a[1]);
+}
+```
+
+Tested with a keyword list `a, b, c, d` and a vector list `c, a, e`: the fused order was `a` (0.0325), `c` (0.0323),
+`b`, `e`, `d`. Documents that both methods rank well rise to the top, and a document only one method found still
+appears. The constant k = 60 comes from the original paper, where it was near-optimal but not critical; Elasticsearch
+uses 60 as its default too.
+
+## What it costs
+
+- **Embedding everything**, and re-embedding everything when you change models: vectors from different models can't
+  be compared.
+- **Memory**: 600 million vectors of 768 four-byte numbers is about 1.8 TB before the graph's links.
+- **Recall is below 100%**: measure it on real queries against exact search, and tune the candidate count.
+- **Explainability**: "why did this match?" has no word to highlight.
+
+Snip starts small: embeddings for titles and notes, an HNSW index per large agency, BM25 for everyone, and RRF to
+merge.
+
+<Analogy>
+  **Finding a book by its topic, not its title.** A librarian who has read everything can put books on a map, with similar topics close together. Asking for "something like this one" means walking to its spot and looking around, rather than checking every shelf. Pairing that with the catalogue's exact title search, and favouring books both methods suggest, gives the best of both.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Malkov and Yashunin"
+    system="HNSW"
+    year={2016}
+    href="https://arxiv.org/abs/1603.09320"
+    source="Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs"
+    found="A layered proximity graph, like a skip list, gives approximate nearest-neighbour search with logarithmic scaling."
+  >
+    The paper builds a multi-layer structure of proximity graphs for nested subsets of the stored elements, and notes
+    its similarity to a skip list, which also allows a straightforward balanced distributed implementation. The
+    abstract describes the approach as allowing logarithmic complexity scaling.
+  </Seen>
+  <Seen
+    company="pgvector"
+    system="Vector search in Postgres"
+    year="Docs"
+    href="https://github.com/pgvector/pgvector"
+    source="pgvector (README)"
+    found="HNSW for the best speed-recall trade-off, IVFFlat for faster builds, and a warning that filters apply after the index scan."
+  >
+    pgvector adds exact and approximate nearest-neighbour search to Postgres, with operators for L2 distance (`<->`),
+    negative inner product (`<#>`) and cosine distance (`<=>`). Adding an index trades some recall for speed. HNSW
+    builds a multilayer graph with better query performance than IVFFlat, at the cost of slower builds and more memory.
+    With approximate indexes, filtering is applied after the index is scanned, and from version 0.8.0 iterative index
+    scans can keep scanning until enough results are found.
+  </Seen>
+  <Seen
+    company="University of Waterloo and Google"
+    system="Reciprocal rank fusion"
+    year={2009}
+    href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf"
+    source="Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods (Cormack, Clarke and Büttcher, SIGIR 2009)"
+    found="Fuse rankings by summing 1/(k + rank); simple, unsupervised, and better than the methods it was compared with."
+  >
+    RRF scores each document by summing 1 / (k + r) over the rankings being combined, with k = 60 fixed during a pilot
+    study, where it was near-optimal but the choice was not critical. In the paper's experiments RRF beat Condorcet
+    fusion, CombMNZ and the best individual system. Elasticsearch's
+    [RRF retriever](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/reciprocal-rank-fusion) uses a
+    default rank constant of 60 to combine, for example, BM25 and vector results.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A user searches Snip for the campaign code 'SPR-2026-DE'. Vector search returns links about spring campaigns in other countries; BM25 returns the exact link first. What's the best design?"
+  options={[
+    { text: "Use vector search only, with a bigger model", why: "Embeddings capture meaning, not exact tokens; a bigger model still blurs codes and IDs." },
+    { text: "Run both and fuse with reciprocal rank fusion", correct: true, why: "BM25 nails exact identifiers, vectors handle paraphrases, and RRF combines the rankings without needing comparable scores." },
+    { text: "Average the BM25 score and the cosine similarity", why: "They're on unrelated scales, so the average is dominated by whichever is larger. RRF uses ranks to avoid that." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Replacing keyword search with vectors.** Exact terms, codes and names still need BM25. Use hybrid.</li>
+    <li>**Filtering after an approximate search.** Results come back short. Raise candidates, iterate, or partition by the filter.</li>
+    <li>**Mixing embedding models.** Vectors from different models aren't comparable; re-embed when you switch.</li>
+    <li>**Never measuring recall.** Compare against exact search on real queries before trusting the index.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Embeddings turn text into vectors whose closeness reflects meaning; search finds the nearest vectors.</li>
+    <li>Exact search compares against everything; ANN indexes like HNSW and IVF trade a little recall for huge speed.</li>
+    <li>Filters applied after an approximate search can starve results; plan for them.</li>
+    <li>Hybrid search runs BM25 and vectors and fuses the ranks with RRF (k = 60).</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you add semantic search to an existing keyword search system?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How does an HNSW index work?", "How do you combine keyword and vector results?"]}
+>
+  <p>Generate embeddings for documents with an embedding model as part of the indexing pipeline, store them in a vector index, and at query time embed the query and run an approximate nearest-neighbour search. Exact search compares against every vector, so I'd use HNSW, a layered proximity graph searched greedily from coarse to fine, or an IVF index, tuning the candidate count for the recall I need and measuring recall against exact search.</p>
+  <p>I wouldn't replace keyword search, because exact identifiers and rare terms are where BM25 is strongest. I'd run both and merge with reciprocal rank fusion, which sums 1 over k plus rank across lists and avoids comparing incompatible scores. I'd also handle filters carefully, since they apply after the approximate search, by raising candidates or partitioning per tenant, and plan for re-embedding when the model changes.</p>
+</InterviewCard>

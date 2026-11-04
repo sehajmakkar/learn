@@ -169,12 +169,12 @@ const modules: Module[] = [
     title: "Search",
     blurb: "Finding things fast, and ranking what you find.",
     lessons: [
-      l("10.01", "Inverted indexes", 11, "CONCEPT"),
-      l("10.02", "Ranking: TF-IDF to BM25", 11, "CONCEPT"),
-      l("10.03", "Keeping a search index in sync", 10, "CONCEPT"),
-      l("10.04", "Sharding a search cluster", 10, "CONCEPT"),
-      l("10.05", "Vector and hybrid search", 12, "CONCEPT"),
-      l("10.06", "Autocomplete", 11, "CODE"),
+      l("10.01", "Inverted indexes", 11, "CONCEPT", "inverted-index"),
+      l("10.02", "Ranking: TF-IDF to BM25", 11, "CONCEPT", "bm25"),
+      l("10.03", "Keeping a search index in sync", 10, "CONCEPT", "search-index-sync"),
+      l("10.04", "Sharding a search cluster", 10, "CONCEPT", "search-sharding"),
+      l("10.05", "Vector and hybrid search", 12, "CONCEPT", "vector-search"),
+      l("10.06", "Autocomplete", 11, "CODE", "autocomplete"),
     ],
   },
   {

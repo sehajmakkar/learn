@@ -1,0 +1,149 @@
+export const meta = {
+  summary: "Spreading a search index over many machines: splitting by document, scatter-gather queries, why one slow shard sets the latency, routing a tenant's searches to one shard, sizing shards, and replicas for throughput.",
+  uses: ["10.01", "10.03", "05.01", "05.02", "03.12"],
+  usedIn: ["15.10"],
+};
+
+<BeforeYouStart>
+  Read <L id="05.01" /> for sharding in general and <L id="03.12" /> for fan-out and tail latency. Hot tenants are the
+  hot keys of <L id="05.02" />.
+</BeforeYouStart>
+
+## The problem: 600 million links in one index
+
+Snip's search index covers every link: 600 million documents, about 600 GB of index. One machine can't hold it in
+memory, and can't serve the agencies' query rate alone. The index has to be split.
+
+## Split by document, not by term
+
+There are two ways to cut an <Term t="inverted-index">inverted index</Term>:
+
+- **By term**: one machine owns terms A–F, another G–M. A query touches only the machines owning its terms, but
+  multi-word queries cross machines to intersect, and popular terms make hot machines.
+- **By document**: each shard holds **all terms for a subset of documents**, a complete small index. A query goes to
+  every shard; each finds and scores its own matches.
+
+Search engines almost always split **by document**: each shard is independent, and adding documents or shards is
+simple. In Elasticsearch and OpenSearch each shard is a complete Lucene index.
+
+## Scatter, gather, then fetch
+
+A query against a document-sharded index runs in two phases:
+
+1. **Query**: the coordinating node sends the query to one copy of every shard. Each returns the IDs and scores of
+   its own top 10.
+2. **Fetch**: the coordinator merges the lists into the global top 10, then fetches only those 10 documents from the
+   shards that hold them.
+
+Asking each shard for its top 10 is enough for the global top 10, since every document in the global top 10 is in
+its own shard's top 10. But page 50 (results 491–500) needs each shard's top 500, so deep pagination gets expensive
+fast. Use search-after cursors, as in keyset pagination (<L id="05.07" />), and cap how deep users can go.
+
+## The slowest shard sets the pace
+
+A query fanned out to 20 shards waits for all 20 (<L id="03.12" />). If each shard is slow 1% of the time, about 18%
+of queries hit at least one slow shard. Defences: keep shards evenly sized, keep each shard's hot data in memory, use
+**replicas** so a slow copy can be avoided, and route around busy nodes. Elasticsearch does the last by default with
+**adaptive replica selection**, which picks a copy using the response time of earlier requests and the size of each
+node's search queue.
+
+## Route a tenant's searches to one shard
+
+Snip's searches are always within one owner's links. Fanning every query out to all 20 shards wastes 19 of them. With
+**custom routing**, each document is indexed with a routing value, here `owner_id`, which decides its shard, and a
+search that passes the same routing value runs only on that shard.
+
+| | Fan out to every shard | Route by owner |
+| --- | --- | --- |
+| Shards per query | 20 | 1 |
+| Tail latency | Slowest of 20 | One shard's |
+| Throughput | Every query costs every shard | Each query costs one shard |
+| Risk | None from tenants | A huge owner makes a hot, oversized shard |
+
+Routing by owner is a big win for Snip, with the usual catch: the largest agency has 40 million links, far more than
+its share. Like any hot key (<L id="05.02" />), it gets special handling: very large owners get **their own index**,
+sharded across machines, while the long tail of small owners shares routed shards.
+
+## Sizing shards
+
+- **Not too big.** Elastic's guidance is to aim for shards of 10 GB to 50 GB, and fewer than 200 million documents
+  each. Big shards are slow to move and recover.
+- **Not too many.** Each shard is a separate Lucene index with its own memory and CPU overhead, and every unrouted
+  query touches all of them. Thousands of tiny shards waste resources.
+- **Replicas** serve reads and survive node failure. Two replicas triple the storage and roughly triple read capacity.
+
+For Snip's 600 GB: 20 primary shards of about 30 GB, each with one replica, plus separate indexes for the three
+largest agencies.
+
+<Analogy>
+  **Several branches of a library, each with its own catalogue.** To find every book on a topic, you phone all branches, each tells you its best few matches, and you pick the overall best and ask only those branches to send the books. If one branch is slow to answer, everyone waits. If you only ever need books from your local branch, you phone just that one.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Elastic"
+    system="Shard sizing and routing"
+    year="Docs"
+    href="https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/size-shards"
+    source="Size your Elasticsearch shards (Elasticsearch documentation)"
+    found="Shards of 10–50 GB and under 200 million documents; each one is a Lucene index with its own overhead."
+  >
+    Elastic recommends shard sizes between 10 GB and 50 GB and fewer than 200 million documents per shard. Each shard
+    is a separate Lucene index, and every index and shard needs some memory and CPU. Its
+    [search shard routing](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/search-shard-routing)
+    documentation describes routing a document to a specific shard with a routing value, so a search with the same
+    value runs on that shard, and adaptive replica selection, which picks copies by response time and search queue
+    size to reduce latency.
+  </Seen>
+  <Seen
+    company="GitHub"
+    system="Code search shards"
+    year={2023}
+    href="https://github.blog/engineering/architecture-optimization/the-technology-behind-githubs-new-code-search/"
+    source="The technology behind GitHub's new code search (Timothy Clem)"
+    found="Shard by content hash for even spread; per-shard p99 around 100 ms, with the whole query a bit slower."
+  >
+    GitHub shards its code search index by Git blob object ID, which spreads documents evenly between shards and
+    avoids duplication. It reports p99 response times from individual shards on the order of 100 ms, with total
+    response times a bit longer.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip routes searches by owner_id. One agency with 40 million links now has slow searches, and its shard's node runs hot while others are idle. What's the best fix?"
+  options={[
+    { text: "Add more shards to the shared index", why: "Routing still sends all of that owner's documents to one shard, whatever the shard count." },
+    { text: "Give the largest owners their own index, sharded across machines, and keep routing for everyone else", correct: true, why: "Routing works for the many small tenants; a tenant too big for one shard needs its own spread, the same special case as any hot key." },
+    { text: "Stop routing and fan out every query", why: "That fixes the hot shard but makes every query from every owner hit every shard, worsening throughput and tail latency for all." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Fanning out when you could route.** If every query is scoped to a tenant, route by tenant.</li>
+    <li>**Unbounded deep pagination.** Page N asks every shard for N × page size results. Use search-after cursors.</li>
+    <li>**Thousands of tiny shards.** Each costs memory and CPU; size them at tens of gigabytes.</li>
+    <li>**Uneven shards.** The biggest one sets the latency. Watch for hot tenants and give them their own index.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Search indexes are split by document: each shard is a full index of a subset.</li>
+    <li>Queries scatter to all shards, gather each top k, then fetch only the winners; deep pages are expensive.</li>
+    <li>The slowest shard sets latency; replicas and adaptive replica selection help.</li>
+    <li>Route tenant-scoped searches to one shard, give giant tenants their own index, and size shards at tens of gigabytes.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How does a distributed search engine execute a query across shards?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why is deep pagination expensive?", "When would you use custom routing?"]}
+>
+  <p>The index is partitioned by document, so each shard is a complete inverted index over a subset of documents. A coordinating node sends the query to one copy of each shard; each shard finds its matches, scores them and returns the top k IDs and scores. The coordinator merges these into a global top k, then fetches the full documents for just those results.</p>
+  <p>Because every shard must return enough results to cover the requested page, page n costs about n times the page size per shard, so deep pagination should use search-after cursors. Latency is set by the slowest shard, so I'd keep shards balanced, use replicas and adaptive replica selection. If queries are always scoped to a tenant, routing by tenant ID sends each query to a single shard, with very large tenants moved to their own index.</p>
+</InterviewCard>

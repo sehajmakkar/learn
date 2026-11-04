@@ -1,0 +1,156 @@
+export const meta = {
+  summary: "A search index is a copy of data that lives somewhere else. How to feed it from the database without losing or reordering changes, how fresh it can be, how to rebuild it from scratch without downtime, and how to notice when it has drifted.",
+  uses: ["07.06", "07.03", "10.01", "04.11", "06.04"],
+  usedIn: ["10.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.06" /> (the outbox and change data capture) and <L id="07.03" /> (consumers that are safe to repeat).
+  A search index is never the source of truth (<L id="04.11" />); like a cache (<L id="06.04" />), it has a staleness
+  budget.
+</BeforeYouStart>
+
+## The problem: two copies of every link
+
+Snip outgrows Postgres full-text search: the agencies want typo tolerance, facets by tag and campaign, and ranking
+that blends relevance with clicks. Snip adds an OpenSearch cluster. Links still live in Postgres, the source of truth;
+the search cluster holds a copy shaped for searching. Every create, edit and delete in Postgres has to reach it, in the
+right order, without losing any, and searches should see an edit within a few seconds.
+
+## Don't dual-write
+
+The tempting version updates both in the <Term t="api">API</Term> handler:
+
+```ts
+await db.query("UPDATE links SET title = $2 WHERE code = $1", [code, title]);
+await search.index({ index: "links", id: code, body: { title } }); // what if this fails, or runs out of order?
+```
+
+That's the dual write of <L id="07.06" />: if the second call fails, the index is wrong until someone notices; if two
+edits race, the older one can land last. Scripts and admin tools that change Postgres directly never reach the index
+at all.
+
+## Feed it from the database's changes
+
+Make Postgres the only thing that's written, and stream its changes to an **indexer**:
+
+<Flow
+  title="How an edit reaches the search index"
+  steps={[
+    { label: "Commit", detail: "The edit commits in Postgres, with a link.updated row in the outbox (or captured by CDC)." },
+    { label: "Publish", detail: "The relay publishes the event to a topic keyed by link code, so one link's events stay in order (07.04)." },
+    { label: "Index", detail: "The indexer reads the current row, builds the search document, and sends it in a bulk request." },
+    { label: "Refresh", detail: "The engine makes new documents searchable at its next refresh: about one second." },
+  ]}
+/>
+
+Three details keep it correct:
+
+- **Re-read, don't trust the event.** The indexer fetches the link's current row rather than applying the change in
+  the event. A late or repeated event then just re-indexes the latest state: safe to repeat (<L id="07.03" />).
+- **Version every document.** Index each document with the row's version (an `updated_at` or a counter), and tell the
+  engine to ignore a write whose version is older than the one it holds. Two indexers racing can't regress a link.
+- **Deletes are events too.** A deleted link must be removed from the index, or searches keep finding links that 404.
+
+## How fresh is "fresh"?
+
+Add up the stages: commit to outbox relay (a fraction of a second, or the poll interval), the topic, the indexer's
+batching (say, 500 ms), and the engine's refresh. Elasticsearch refreshes every second by default, though only for
+indices that have been searched in the last 30 seconds. Snip's measured end-to-end is two to three seconds, inside the
+"a few seconds" it promised owners.
+
+For an owner's own edits, two seconds can still feel broken: they rename a link, search for the new name, and get
+nothing. Like read-your-writes elsewhere (<L id="08.02" />), the dashboard covers the gap: after an edit it shows the
+updated link from Postgres at the top of the results until the index catches up.
+
+## Rebuilding from scratch
+
+Sometimes the whole index must be rebuilt: a new <Term t="analyzer">analyzer</Term>, a new field, a mapping change, or a bug that corrupted
+documents. Doing it in place means a long period where search is half-built. Instead:
+
+1. Create a **new index** (`links_v8`) with the new settings, alongside the live one (`links_v7`).
+2. **Backfill** it from Postgres in bulk, while the live change stream is written to **both** indexes.
+3. Compare counts and sample queries between the two.
+4. Switch an **alias** (`links` → `links_v8`) in one atomic step. Searches use the alias, so nothing else changes.
+5. Keep `links_v7` for a day as a way back, then delete it.
+
+It's the same shape as expand and contract (<L id="04.09" />): build the new thing beside the old, move over, clean up.
+
+## Notice when it drifts
+
+Bugs, missed deletes and failed bulk requests make copies drift (<L id="04.12" />). A nightly **reconciliation** job
+compares the index with Postgres: counts per owner, a sample of documents by version, and links deleted in Postgres but
+still in the index. It repairs what it finds and alerts if the drift is large, because large drift means a bug in the
+pipeline.
+
+<Analogy>
+  **A library catalogue.** The books on the shelves are the truth; the catalogue is a copy that makes them findable. Librarians update the catalogue from the returns and acquisitions log, not from memory. When the cataloguing system changes, they build the new catalogue alongside the old one and switch the desk over in one go. And once a year, they do a stocktake to find cards for books that are long gone.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="GitHub"
+    system="Code search indexing"
+    year={2023}
+    href="https://github.blog/engineering/architecture-optimization/the-technology-behind-githubs-new-code-search/"
+    source="The technology behind GitHub's new code search (Timothy Clem)"
+    found="Changes arrive as events, indexing is a pipeline of topics, and a full rebuild is planned for, not feared."
+  >
+    Kafka events tell GitHub's indexers what to index, and the documents they produce are published to another Kafka
+    topic; each index shard consumes a single Kafka partition. The ingest pipeline can publish around 120,000
+    documents a second, and with delta indexing a full re-index takes about 18 hours.
+  </Seen>
+  <Seen
+    company="Elastic"
+    system="Near real-time search"
+    year="Docs"
+    href="https://www.elastic.co/docs/manage-data/data-store/near-real-time-search"
+    source="Near real-time search (Elasticsearch documentation)"
+    found="Documents become searchable at the next refresh, about a second, by opening new Lucene segments without a full commit."
+  >
+    A refresh makes every operation since the last refresh available for search, and documents are fully searchable in
+    near real-time, within about a second. By default, indices are refreshed every second, but only those that have
+    received a search request in the last 30 seconds. Lucene makes this cheap by writing and opening new segments,
+    each similar to an <Term t="inverted-index">inverted index</Term>, without performing a full commit.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's indexer applies each link.updated event by writing the event's title to the index. Two edits, 'Spring' then 'Summer', are published in order, but the second is retried and the first is redelivered after it. What does the index show, and what's the fix?"
+  options={[
+    { text: "Summer: the events were published in order", why: "Redelivery after a retry can apply the older event last. Order at publish time doesn't protect against that." },
+    { text: "Possibly Spring; re-read the current row when indexing and version each document so older writes are ignored", correct: true, why: "Re-reading makes every event index the latest state, and external versioning stops a stale write from overwriting a newer document." },
+    { text: "Both titles, as two documents", why: "Both writes use the link code as the document ID, so the second replaces the first." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Dual writes from the API.** Feed the index from the database's changes instead.</li>
+    <li>**Applying event payloads blindly.** Re-read the current row and version documents, so retries and reordering are harmless.</li>
+    <li>**Forgetting deletes.** Deleted rows must leave the index.</li>
+    <li>**Rebuilding in place.** Build a new index beside the old one and switch an alias.</li>
+    <li>**Never reconciling.** Copies drift; compare and repair on a schedule.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>The search index is a derived copy; the database stays the source of truth.</li>
+    <li>Feed it from committed changes (outbox or CDC), re-read current state, version documents and handle deletes.</li>
+    <li>Freshness is the sum of pipeline stages plus the engine's refresh, usually seconds; cover the owner's own edits in the UI.</li>
+    <li>Rebuild beside the live index and switch an alias; reconcile regularly to catch drift.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you keep an Elasticsearch index in sync with a relational database?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you reindex without downtime?", "How stale can search results be, and how do you hide it from the user who made the change?"]}
+>
+  <p>Treat the database as the source of truth and avoid dual writes from the application. Capture committed changes with a transactional outbox or change data capture, publish them to a log keyed by the entity ID, and have an indexer consume them, re-read the current row, and bulk-index documents with the row's version using external versioning so stale or duplicated events can't overwrite newer data. Deletes become delete operations.</p>
+  <p>Freshness is the pipeline lag plus the refresh interval, typically a few seconds; for the user who just made the change I'd show their updated record from the database or use a wait-for-refresh option on that write. For mapping changes I'd build a new index alongside the old one, backfill it while dual-consuming the change stream, verify, and switch an alias atomically. A periodic reconciliation job compares counts and samples to catch drift.</p>
+</InterviewCard>

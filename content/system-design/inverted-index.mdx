@@ -1,0 +1,203 @@
+export const meta = {
+  summary: "Why LIKE '%shoes%' can't search millions of rows, and the structure every search engine is built on: an inverted index from each word to the documents containing it. Analysis, posting lists, intersecting them, and the same idea inside Postgres.",
+  uses: ["04.02", "09.01", "09.03", "04.11"],
+  usedIn: ["10.02", "10.03", "10.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.02" /> for why a B-tree can't help here, and <L id="04.11" /> for when a separate search store earns
+  its place. Search indexes are built in immutable segments, like the <Term t="lsm-tree">LSM-tree</Term> of <L id="09.03" />.
+</BeforeYouStart>
+
+## The problem: searching link titles
+
+Snip's team plan adds a search box to the dashboard. A marketing agency with 2 million links types `summer shoes`
+and expects, in a fraction of a second, every link whose title, destination, tags or notes mention those words.
+
+The obvious query:
+
+```sql
+SELECT code, title FROM links
+ WHERE owner_id = 4821 AND title ILIKE '%summer%' AND title ILIKE '%shoes%';
+```
+
+A B-tree index can find values by their **beginning**, but `%shoes%` can start anywhere, so Postgres reads every one
+of the owner's 2 million titles. It also misses "Shoe sale" (singular) and "SHOES" written differently, and it can't
+rank the results. Search needs a different index, built the other way round.
+
+## Turn it inside out
+
+A normal index maps a row to its contents. An **inverted index** maps each **term** to the documents containing it:
+
+| Term | Posting list (document IDs) |
+| --- | --- |
+| `summer` | 1, 2, 9 |
+| `shoe` | 1, 3, 5, 10 |
+| `sale` | 1, 4, 8, 10 |
+| `kid` | 2, 10 |
+
+To find documents containing `summer` **and** `shoe`, read two short lists and **intersect** them: `{1}`. The cost
+depends on how many documents contain the terms, not on how many documents exist.
+
+## Analysis: deciding what a "term" is
+
+Before text goes into the index, and before a query is looked up, both pass through the same **analyzer**:
+
+1. **Tokenize**: split into words. "Kids' shoes: back-to-school" → kids, shoes, back, to, school.
+2. **Normalize**: lowercase, strip accents.
+3. **Remove stop words**: words so common they're useless for searching ("the", "to", "and").
+4. **Stem**: reduce words to a common root, so "shoes" and "shoe" become the same term.
+
+Analysis is where most search quality is won or lost. If the index stems and the query doesn't, nothing matches. Snip
+analyses titles and tags with an English stemmer, and destination URLs differently: split on `/`, `.` and `-`, no
+stemming.
+
+## A small inverted index
+
+```ts
+const STOP = new Set(["a", "an", "and", "the", "to", "for", "of", "on"]);
+
+export const analyze = (text: string) =>
+  text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t && !STOP.has(t))
+    .map((t) => (t.length > 3 && t.endsWith("s") && !t.endsWith("ss") ? t.slice(0, -1) : t)); // a crude stemmer
+
+export class InvertedIndex {
+  private postings = new Map<string, number[]>(); // term -> sorted document IDs
+
+  add(docId: number, text: string) {
+    for (const term of new Set(analyze(text))) {
+      const list = this.postings.get(term) ?? [];
+      list.push(docId); // IDs are added in increasing order, so lists stay sorted
+      this.postings.set(term, list);
+    }
+  }
+
+  /** Documents containing every query term: intersect the posting lists, shortest first. */
+  search(query: string): number[] {
+    const lists = [...new Set(analyze(query))].map((t) => this.postings.get(t) ?? []).sort((a, b) => a.length - b.length);
+    if (lists.length === 0) return [];
+    return lists.reduce((acc, list) => intersect(acc, list));
+  }
+}
+
+function intersect(a: number[], b: number[]) {
+  const out: number[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      out.push(a[i]);
+      i++;
+      j++;
+    } else if (a[i] < b[j]) i++;
+    else j++;
+  }
+  return out;
+}
+```
+
+Tested on six titles: `shoes` found four of them (singular and plural alike), `shoe sale` found the two with both
+words, and a word not in any title found nothing. On 5,000 random documents, every query returned exactly what a
+brute-force scan returned. Intersecting the **shortest** list first keeps the work small: a rare word cuts the
+candidates down before the common words are checked.
+
+## What real engines add
+
+- **Positions** in each posting, so phrase queries ("summer sale" as adjacent words) and highlighting work.
+- **Compression**: sorted IDs are stored as small gaps between neighbours, packed into few bits.
+- **Segments**: Lucene, the library inside Elasticsearch and OpenSearch, writes new documents into small immutable
+  index segments and merges them in the background, like an LSM-tree's files (<L id="09.03" />). A deleted document is
+  marked deleted and removed at the next merge.
+- **Scores**: finding matches is half the job; ordering them is the other (<L id="10.02" />).
+
+## Postgres can do it too
+
+Postgres has full-text search built in: `to_tsvector` analyses text into normalized terms (lexemes), and a **GIN**
+index, short for Generalized Inverted Index, is an inverted index over them:
+
+```sql
+ALTER TABLE links ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(notes, ''))) STORED;
+CREATE INDEX links_search ON links USING GIN (search);
+
+SELECT code, title FROM links
+ WHERE owner_id = 4821 AND search @@ plainto_tsquery('english', 'summer shoes');
+```
+
+For Snip's first version, this is enough, with no new system to run. A dedicated search engine earns its place when
+ranking, typo tolerance, facets and scale outgrow it (<L id="10.03" />).
+
+<Analogy>
+  **The index at the back of a book.** You don't read the whole book to find "photosynthesis"; you look it up in the index, which lists the pages it appears on. To find pages mentioning both "light" and "water", you compare the two page lists. The index was built once, by going through every page; using it is quick.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="PostgreSQL"
+    system="Full-text search and GIN"
+    year="Docs"
+    href="https://www.postgresql.org/docs/current/textsearch-indexes.html"
+    source="Preferred Index Types for Text Search (PostgreSQL documentation)"
+    found="An inverted index inside the database you already run, with the same analysis steps as a search engine."
+  >
+    Postgres stores preprocessed documents as `tsvector` and queries as `tsquery`. Normalization almost always folds
+    upper case to lower case and often removes suffixes, and typically drops stop words, words so common they're useless
+    for searching. GIN indexes, Generalized Inverted Indexes, are the preferred text search index type; GiST indexes are
+    lossy, so matches must be rechecked against the table row.
+  </Seen>
+  <Seen
+    company="GitHub"
+    system="Code search"
+    year={2023}
+    href="https://github.blog/engineering/architecture-optimization/the-technology-behind-githubs-new-code-search/"
+    source="The technology behind GitHub's new code search (Timothy Clem)"
+    found="Code needs a different kind of term: an inverted index over n-grams, so any substring can be found."
+  >
+    Code search can't split text into words the way prose search does, since a query can be any fragment of
+    code, so GitHub built a special kind of inverted index called an ngram index, using dynamic gram sizes. At the
+    beta, it covered almost 45 million repositories, 115 TB of code and 15.5 billion documents; deduplication brought
+    that to about 28 TB of unique content, and the whole index, ngrams included, came to about 25 TB.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip indexes link titles with stemming (shoes → shoe) but the search API passes the user's query straight to the index without analysis. What happens when someone searches 'Shoes'?"
+  options={[
+    { text: "It works: the index handles plurals", why: "The index only contains the term 'shoe'. The unanalysed query looks for 'Shoes', which isn't a term in it." },
+    { text: "Nothing matches, because the query term 'Shoes' isn't in the index; queries must go through the same analyzer as documents", correct: true, why: "Index-time and query-time analysis have to agree, or terms never line up." },
+    { text: "Only titles with the exact word 'Shoes' match", why: "No indexed term is 'Shoes': it was lowercased and stemmed to 'shoe'." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**LIKE '%word%' on big tables.** It reads every row and can't rank. Use an inverted index.</li>
+    <li>**Different analysis at index and query time.** Terms stop matching. Use the same analyzer, or deliberately compatible ones.</li>
+    <li>**One analyzer for every field.** URLs, codes, names and prose need different tokenizing.</li>
+    <li>**Adding a search cluster on day one.** Postgres full-text search often covers the first version.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>An inverted index maps each term to the sorted list of documents that contain it.</li>
+    <li>Multi-word queries intersect posting lists, shortest first, so cost tracks matches, not table size.</li>
+    <li>Analysis (tokenize, normalize, stop words, stem) decides what a term is; documents and queries must agree.</li>
+    <li>Real engines add positions, compression and merged segments; Postgres's GIN gives you the same idea in-database.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How does a full-text search engine find documents containing a set of words?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What is an analyzer, and why does it matter?", "Why doesn't a B-tree index help with LIKE '%word%'?"]}
+>
+  <p>It uses an inverted index: for each term, a sorted posting list of the documents containing it, often with positions for phrase queries. Text is first passed through an analyzer that tokenizes, lowercases, removes stop words and stems, and queries go through the same analyzer so their terms match. A query with several terms reads their posting lists and intersects them, starting with the shortest, so the work depends on the number of matches rather than the collection size.</p>
+  <p>A B-tree only helps find values by their prefix, so a pattern with a leading wildcard scans every row and can't rank results. Engines like Lucene store the index in immutable segments merged in the background, compress posting lists, and score the matches with a ranking function like BM25.</p>
+</InterviewCard>

@@ -1,0 +1,159 @@
+export const meta = {
+  summary: "Finding matches is easy; putting the best first is the work. Term frequency, inverse document frequency, and BM25's two fixes: repeats stop counting after a while, and long documents don't win just by being long. A lab to tune it by hand.",
+  uses: ["10.01"],
+  usedIn: ["10.04", "10.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="10.01" />: ranking scores the documents an <Term t="inverted-index">inverted index</Term> found.
+</BeforeYouStart>
+
+## The problem: 4,000 matches, which first?
+
+The agency searches `summer shoes` and 4,000 of its links match. Nobody reads past the first ten. Which ten? Sorting
+by date ignores relevance; sorting by "contains both words" doesn't separate them. A search engine needs a **score**
+for how well each document matches the query. Three ideas build it.
+
+## 1. Term frequency: more mentions, more relevant
+
+A title that says "shoes" twice is probably more about shoes than one that says it once. So count each query term's
+occurrences in the document: its **term frequency** (TF).
+
+The flaw shows straight away: a spammy title that repeats "shoes" five times beats a title that's exactly what the
+user wants.
+
+## 2. Inverse document frequency: rare words matter more
+
+In the agency's links, "sale" appears in half of all titles, and "sandals" in very few. Matching "sandals" says much
+more about a document than matching "sale". **Inverse document frequency** (IDF) weights each term by how rare it is,
+typically the logarithm of (number of documents ÷ documents containing the term). **TF-IDF** multiplies the two.
+
+## 3. BM25: saturation and length
+
+**BM25**, the default ranking function in Lucene, Elasticsearch and OpenSearch, keeps IDF and fixes TF in two ways:
+
+- **Saturation.** Each extra occurrence adds less, and a term's contribution levels off at a ceiling, however often it
+  repeats. Robertson and Zaragoza's review of the framework behind BM25 calls this saturation: one term's
+  contribution can't exceed a limit, however frequently it occurs. The parameter **k1** controls how fast it
+  saturates (default 1.2).
+- **Length normalization.** A long document mentions more words just by being long. BM25 compares each document's
+  length with the average and discounts term counts in longer ones. The parameter **b** controls how strongly (0 = not
+  at all, 1 = fully; default 0.75).
+
+For each query term, BM25 adds:
+
+```
+idf(term) × tf × (k1 + 1) / (tf + k1 × (1 − b + b × length / averageLength))
+```
+
+## Try it
+
+<Lab
+  id="sd-10-02-bm25"
+  title="Rank ten titles"
+  tasks={[
+    "Search 'summer shoes' and count matches. Which title wins, and should it?",
+    "Switch to TF-IDF, then BM25. What happens to the 'Shoes, shoes, shoes' title?",
+    "With BM25, set k1 to 0. What does the ranking become, and why?",
+    "Search 'sale' with BM25 and b at 0.75, then 0. Why does the shortest title move?",
+  ]}
+>
+  <Bm25Lab preset={{ query: "summer shoes", mode: "count" }} />
+</Lab>
+
+What the lab shows for `summer shoes`:
+
+| Scoring | First | Second |
+| --- | --- | --- |
+| Count matches | "Shoes, shoes, shoes…" (5) | "Summer sale: shoes and sandals…" (2) |
+| TF-IDF | "Shoes, shoes, shoes…" (3.47) | "Summer sale: shoes and sandals…" (1.61) |
+| BM25 (k1 1.2, b 0.75) | **"Summer sale: shoes and sandals…" (1.52)** | "Shoes, shoes, shoes…" (1.04) |
+
+Counting and TF-IDF both reward repetition. BM25 saturates the five "shoes" and penalises that title for being more
+than twice the average length, so the title that matches **both** words wins. Set k1 to 0 and term frequency stops
+counting at all: every match is worth only its IDF. Search `sale` with b at 0.75 and "Sale ends tonight", the shortest
+title, comes first; set b to 0 and all four matches tie.
+
+## Beyond BM25
+
+BM25 scores text against text. Real ranking usually combines it with other signals:
+
+- **Field weights**: a match in the title matters more than one in the notes.
+- **Business signals**: recency, popularity (Snip boosts links with more clicks), the user's own links first.
+- **Learning to rank**: a model trained on what people clicked reorders the top results BM25 found.
+- **Meaning**: BM25 matches words, not ideas; "sneakers" won't find "running shoes". Vector search does
+  (<L id="10.05" />).
+
+<Analogy>
+  **Judging a CV for a job.** Mentioning "Python" once means something; mentioning it twenty times doesn't make someone twenty times better (saturation). A rare skill like "Fortran" tells you more than "Microsoft Word" (IDF). And a forty-page CV will mention everything somewhere, so you allow for its length (normalization).
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Robertson and Zaragoza"
+    system="BM25"
+    year={2009}
+    href="https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf"
+    source="The Probabilistic Relevance Framework: BM25 and Beyond (Foundations and Trends in Information Retrieval)"
+    found="Saturation is the key property: no single term's contribution can exceed a limit, however often it occurs."
+  >
+    The review traces BM25 from the probabilistic relevance framework. It names saturation, where any one term's
+    contribution to the document's score can't exceed an asymptotic limit however frequently the term occurs, and calls
+    it a very valuable property of BM25's weighting. It also discusses why documents differ in length, for example
+    the "verbosity" hypothesis that some authors simply use more words, which motivates normalizing term frequencies
+    by document length.
+  </Seen>
+  <Seen
+    company="Elastic"
+    system="Elasticsearch similarity"
+    year="Docs"
+    href="https://www.elastic.co/docs/reference/elasticsearch/index-settings/similarity"
+    source="Similarity settings (Elasticsearch documentation)"
+    found="BM25 is the default, with k1 = 1.2 for saturation and b = 0.75 for length normalization."
+  >
+    Elasticsearch's default similarity is BM25. Its k1 parameter controls non-linear term frequency normalization, or
+    saturation, defaulting to 1.2, and b controls how much document length normalizes term frequencies, defaulting to
+    0.75. Elastic's
+    [Practical BM25 series](https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables)
+    explains the variables in more depth.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip indexes each link's title and its full destination page text in one field. Searches for 'pricing' now rank huge product pages above links titled 'Pricing'. Which change helps most?"
+  options={[
+    { text: "Lower k1 to 0", why: "That stops term frequency counting at all, which doesn't address long pages dominating, and loses useful signal." },
+    { text: "Index titles and page text as separate fields, and weight title matches higher", correct: true, why: "Field weights let a title match outrank a passing mention in long body text. BM25's length normalization then works per field." },
+    { text: "Set b to 0", why: "That removes length normalization entirely, making long pages win even more often." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Ranking by match count.** Repetition wins. Use BM25.</li>
+    <li>**One field for everything.** Titles, tags and body text deserve different weights.</li>
+    <li>**Tuning k1 and b by feel.** Measure with real queries and judgments before and after.</li>
+    <li>**Relevance only.** Users also want recent, popular and their own results; blend business signals in.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Term frequency rewards documents that mention query terms; IDF weights rare terms more.</li>
+    <li>BM25 adds saturation (k1) so repeats stop counting, and length normalization (b) so long documents don't win by size.</li>
+    <li>It's the default in Lucene-based engines, with k1 = 1.2 and b = 0.75.</li>
+    <li>Real ranking combines BM25 with field weights, business signals and sometimes learned models.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do search engines rank results? Explain TF-IDF and BM25.", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What do BM25's k1 and b parameters do?", "What else would you add to the score for a product search?"]}
+>
+  <p>TF-IDF scores a document by how often each query term appears in it, term frequency, multiplied by how rare the term is across the collection, inverse document frequency, so rare, specific terms count more than common ones. Its weakness is that raw term frequency rewards repetition and long documents.</p>
+  <p>BM25 fixes both: term frequency saturates, so extra occurrences add less and less, controlled by k1, and term frequency is normalized by the document's length relative to the average, controlled by b. It's the default in Lucene, Elasticsearch and OpenSearch with k1 of 1.2 and b of 0.75. For a product search I'd add field boosts, such as title over description, plus signals like popularity, stock and recency, possibly with a learning-to-rank model reordering the top results.</p>
+</InterviewCard>
