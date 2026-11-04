@@ -1,0 +1,220 @@
+export const meta = {
+  summary: "Inside an LSM-tree: the write path (log, memtable, flush), the read path (memtable, then files newest first, with Bloom filters), tombstones, and compaction strategies. A lab to watch it happen, and a tiny implementation.",
+  uses: ["09.02", "09.01", "05.08", "04.06"],
+  usedIn: ["10.01", "15.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="09.02" /> for why <Term t="lsm-tree">LSM-trees</Term> exist. The memtable is protected by a write-ahead log (<L id="04.06" />), and
+  reads lean on Bloom filters (<L id="05.08" />).
+</BeforeYouStart>
+
+## The problem: 40,000 click writes a second
+
+Snip's click history store takes about 40,000 writes a second per region at peak, each a small row: code, time,
+country, referrer. A B-tree would rewrite a page for most of them. The LSM-tree turns them into large sequential
+writes instead. Here's exactly how, and what it costs.
+
+## The write path
+
+1. **Append to the write-ahead log**, so the write survives a crash (<L id="04.06" />).
+2. **Insert into the memtable**, a sorted structure in memory (a skip list or balanced tree). The write is now done;
+   the client gets its acknowledgement.
+3. **Flush.** When the memtable reaches its size limit, it's frozen, a new empty one takes its place, and the frozen
+   one is written to disk in one sequential pass as an immutable sorted file, usually called an **SSTable** (sorted
+   string table). Its log can then be deleted.
+
+Each SSTable has a small index of where keys are in the file (one entry per block, not per key) and a Bloom filter
+saying which keys it might contain.
+
+## The read path
+
+1. Check the memtable (and any frozen one still being flushed).
+2. Check SSTables from **newest to oldest**. For each, ask its Bloom filter first: "definitely not here" skips the file
+   without reading it. Otherwise look up the block in the file's index and read that block.
+3. The **first** version found is the answer, because it's the newest. If it's a <Term t="tombstone">tombstone</Term>, the key was deleted.
+
+## Try it
+
+<Lab
+  id="sd-09-03-lsm"
+  title="Write, flush, read, compact"
+  tasks={[
+    "Press 'Write 8' twice. How many files are on disk, and why did each appear?",
+    "Read m4Zt. How many files were searched before finding it? Turn on Bloom filters and read it again.",
+    "Find a key that was deleted. What does the read find, and where?",
+    "Compact. What happened to overwritten values and tombstones, and to the write amplification figure?",
+  ]}
+>
+  <LsmLab />
+</Lab>
+
+## Tombstones
+
+A delete can't remove anything from immutable files, so it writes a **tombstone**: "this key is gone as of now". The
+tombstone hides older values during reads, and both are dropped only when <Term t="compaction">compaction</Term> merges the tombstone with every
+older file that might hold the key.
+
+In a replicated store, tombstones must also outlive the time a replica might be offline: if a tombstone were dropped
+before a lagging replica heard about the delete, that replica could later bring the old value back. Cassandra keeps
+tombstones for `gc_grace_seconds`, by default 864,000 seconds (ten days), and removes them only at a compaction after
+that.
+
+## Compaction strategies
+
+Without compaction, files multiply, reads check more of them, and dead data piles up. How compaction chooses what
+to merge is the main tuning knob:
+
+**Leveled** (RocksDB's default style, Cassandra's LCS). Freshly flushed files land in level 0, where key ranges
+overlap. Every level below is one sorted run, split into files by key range, with size targets that grow
+exponentially, typically about ten times per level. A read checks at most one file per level below L0. The cost is
+<Term t="write-amplification">write amplification</Term>: data is rewritten as it moves down each level, and RocksDB's documentation describes leveled
+compaction's write amplification as often larger than 10.
+
+**Tiered** (RocksDB's universal compaction, Cassandra's size-tiered STCS). Instead of merging small runs into big ones
+straight away, it waits for several runs of similar size and merges them together. Far lower write amplification, at
+the cost of more runs to check on reads, and temporary double disk usage during a full compaction. RocksDB suggests
+trying it when leveled compaction can't keep up with the write rate.
+
+**Time-window** (Cassandra's TWCS). For data written in time order and expired by TTL, like Snip's clicks: files are
+grouped by time window and whole old windows are dropped when they expire, with almost no merging.
+
+Snip uses time-window compaction for click history: the data arrives in time order, is never updated, and expires
+after 13 months.
+
+## A tiny LSM-tree
+
+```ts
+type Value = string | null; // null is a tombstone
+
+export class TinyLsm {
+  memtable = new Map<string, Value>();
+  runs: Map<string, Value>[] = []; // sorted runs on "disk", newest first
+  written = 0; // entries written to disk, for write amplification
+
+  constructor(private readonly memtableLimit = 4) {}
+
+  put(key: string, value: Value) {
+    this.memtable.set(key, value);
+    if (this.memtable.size >= this.memtableLimit) this.flush();
+  }
+
+  flush() {
+    if (this.memtable.size === 0) return;
+    const sorted = new Map([...this.memtable].sort(([a], [b]) => (a < b ? -1 : 1)));
+    this.runs.unshift(sorted);
+    this.written += sorted.size;
+    this.memtable = new Map();
+  }
+
+  /** Newest first: memtable, then each run. The first hit wins, and a tombstone means "deleted". */
+  get(key: string): { value: Value; runsSearched: number } {
+    if (this.memtable.has(key)) return { value: this.memtable.get(key)!, runsSearched: 0 };
+    let searched = 0;
+    for (const run of this.runs) {
+      searched++;
+      if (run.has(key)) return { value: run.get(key)!, runsSearched: searched };
+    }
+    return { value: null, runsSearched: searched };
+  }
+
+  /** Merge every run into one, keeping only the newest value per key and dropping tombstones. */
+  compact() {
+    const merged = new Map<string, Value>();
+    for (const run of [...this.runs].reverse()) for (const [k, v] of run) merged.set(k, v); // newer overwrite older
+    for (const [k, v] of merged) if (v === null) merged.delete(k);
+    this.runs = [new Map([...merged].sort(([a], [b]) => (a < b ? -1 : 1)))];
+    this.written += merged.size;
+  }
+}
+```
+
+Tested with the lab's 24 writes (six keys, every seventh write a delete): six runs on disk, every read returned the
+same value as a plain map would, deleted keys read as tombstones, and after compaction one run remained, still
+matching. This sketch has no write-ahead log, Bloom filters or levels; it shows the shape.
+
+<Analogy>
+  **Sorting the post.** Letters land on your desk all day (the memtable). When the pile gets big you sort it and box it, labelled by date (a flush to an SSTable). To find a letter, you check the desk, then the newest box, then older ones, with a list on each box of who's inside (the Bloom filter). Every weekend you merge the boxes into one, throwing out superseded letters and anything marked "cancelled" (compaction and tombstones).
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="RocksDB"
+    system="Leveled compaction"
+    year="Wiki"
+    href="https://github.com/facebook/rocksdb/wiki/Leveled-Compaction"
+    source="Leveled Compaction (RocksDB wiki)"
+    found="Overlapping files in L0, one sorted run per level below, exponentially growing level sizes, and write amplification often above 10."
+  >
+    Level 0 holds files just flushed from the memtable, and they usually overlap, so compaction normally has to pick
+    up all of them. Every level below is one sorted run, range-partitioned into SST files, with size targets that
+    usually grow exponentially; the wiki's example uses a multiplier of 10 between levels. It describes the usual
+    write amplification of leveled compaction as often larger than 10.
+  </Seen>
+  <Seen
+    company="Apache Cassandra"
+    system="Compaction and tombstones"
+    year="Docs"
+    href="https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/overview.html"
+    source="Compaction overview (Apache Cassandra documentation)"
+    found="Compaction merges SSTables and discards old data, and tombstones wait out a grace period before removal."
+  >
+    Cassandra periodically merges SSTables and discards old data. A tombstone's grace period is set with
+    gc_grace_seconds, ten days by default, after which it can be deleted during compaction, and not before a
+    compaction runs. The strategies offered are UCS (recommended for new workloads), size-tiered STCS (the default
+    fallback), leveled LCS for read-heavy or update-heavy workloads, and time-window TWCS for TTL'd, mostly immutable
+    time-series data.
+  </Seen>
+  <Seen
+    company="O'Neil, Cheng, Gawlick and O'Neil"
+    system="The LSM-tree"
+    year={1996}
+    href="https://www.cs.umb.edu/~poneil/lsmtree.pdf"
+    source="The Log-Structured Merge-Tree (Patrick O'Neil, Edward Cheng, Dieter Gawlick and Elizabeth O'Neil, Acta Informatica)"
+    found="The original design: a small in-memory tree, a larger on-disk tree, and a rolling merge between them."
+  >
+    The paper starts from transaction systems that insert rows into a history table at a high rate. New index entries
+    go into a small tree in memory (C0); whenever it nears its size limit, a rolling merge process moves a contiguous
+    segment of entries out of it and merges them into a larger tree on disk (C1), which is optimised for sequential
+    disk access. A search looks in C0 first, then in C1.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's click store slows down every afternoon: reads touch 30 or more files each. Disk throughput is maxed by incoming writes. What's happening?"
+  options={[
+    { text: "Bloom filters have stopped working", why: "They still skip files without the key, but every file still costs at least a filter check, and many may match a time range." },
+    { text: "Compaction can't keep up with the write rate, so files pile up and each read checks more of them", correct: true, why: "When ingest uses all the disk bandwidth, compaction falls behind. Options: more disk throughput, a strategy with lower write amplification (tiered or time-window), or throttling writes." },
+    { text: "The memtable is too small", why: "A bigger memtable means fewer, larger flushes, which helps a little, but the root cause is compaction debt." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Under-provisioning disk for compaction.** Compaction needs I/O and spare space; without them, read latency climbs.</li>
+    <li>**Delete-heavy workloads without watching tombstones.** Reads scan past tombstones until they're compacted away.</li>
+    <li>**Dropping tombstones too early in a replicated store.** A replica that missed the delete can resurrect the data.</li>
+    <li>**One compaction strategy for every table.** Match it to the data: leveled for reads and updates, tiered for heavy writes, time-window for time series.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Writes: log, memtable, then a sequential flush to an immutable sorted SSTable.</li>
+    <li>Reads: memtable, then SSTables newest first, skipping most with Bloom filters; the first version found wins.</li>
+    <li>Deletes write tombstones, which compaction drops once they've covered every older copy.</li>
+    <li>Compaction strategy is the main trade-off: leveled for reads, tiered for writes, time-window for time series.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Walk through the write and read path of an LSM-tree database like Cassandra or RocksDB.", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["How are deletes handled?", "What's the difference between leveled and size-tiered compaction?"]}
+>
+  <p>A write is appended to the commit log for durability and inserted into the memtable, a sorted in-memory structure, and then acknowledged. When the memtable fills it's flushed sequentially to disk as an immutable SSTable with a block index and a Bloom filter. A read checks the memtable, then SSTables from newest to oldest, using each Bloom filter to skip files that can't contain the key; the first version found is returned.</p>
+  <p>Deletes write tombstones that shadow older values until compaction merges them away, and in replicated systems tombstones are kept for a grace period so lagging replicas don't resurrect data. Compaction merges SSTables to bound read amplification and reclaim space. Leveled compaction keeps each level as one sorted run, so reads touch few files, at the cost of high write amplification; size-tiered merges similar-sized runs, giving lower write amplification but more files to read and temporary extra space. Time-window compaction suits TTL'd time series.</p>
+</InterviewCard>

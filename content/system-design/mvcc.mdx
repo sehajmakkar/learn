@@ -58,7 +58,7 @@ That brings costs you'll meet in practice:
   falls behind, tables and <Term t="index">indexes</Term> grow and queries slow down.
 - **Long transactions hold everything back.** Vacuum can't remove any version a running transaction might still see.
   One forgotten transaction left open for hours stops cleanup across the whole database.
-- **Write amplification.** In Postgres, a new row version can also mean new entries in the table's indexes, so an
+- **<Term t="write-amplification">Write amplification</Term>.** In Postgres, a new row version can also mean new entries in the table's indexes, so an
   update to one column can cost writes to every index (<L id="04.02" />).
 
 This is part of why Snip's workers **batch** click counts (<L id="02.06" />): one update per link per batch leaves far

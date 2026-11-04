@@ -45,7 +45,7 @@ the common case.
 Most slow requests aren't caused by the request itself. They're caused by what else the server was doing:
 
 - **Queueing:** a burst arrives and requests wait behind each other (<L id="03.11" />).
-- **Pauses:** garbage collection, a background compaction, a log rotation.
+- **Pauses:** garbage collection, a background <Term t="compaction">compaction</Term>, a log rotation.
 - **Shared machines:** another program on the same host using the CPU, disk or network.
 - **Cold <Term t="cache">caches</Term>:** the first request after a restart or eviction goes to disk.
 - **Retries:** a request that needed a retry took at least two round trips (<L id="03.09" />).

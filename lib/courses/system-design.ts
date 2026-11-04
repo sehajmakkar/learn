@@ -155,12 +155,12 @@ const modules: Module[] = [
     title: "Storage under the hood",
     blurb: "How data actually reaches the disk, and stays correct there.",
     lessons: [
-      l("09.01", "A storage engine is a log and an index", 10, "CONCEPT"),
-      l("09.02", "B-trees vs LSM-trees", 12, "CONCEPT"),
-      l("09.03", "The LSM write and read path", 12, "CONCEPT"),
-      l("09.04", "How object storage works", 12, "CONCEPT"),
-      l("09.05", "Replication vs erasure coding", 10, "CONCEPT"),
-      l("09.06", "Checksums and silent corruption", 8, "CONCEPT"),
+      l("09.01", "A storage engine is a log and an index", 10, "CONCEPT", "log-and-index"),
+      l("09.02", "B-trees vs LSM-trees", 12, "CONCEPT", "btree-vs-lsm"),
+      l("09.03", "The LSM write and read path", 12, "CONCEPT", "lsm-tree"),
+      l("09.04", "How object storage works", 12, "CONCEPT", "object-storage"),
+      l("09.05", "Replication vs erasure coding", 10, "CONCEPT", "erasure-coding"),
+      l("09.06", "Checksums and silent corruption", 8, "CONCEPT", "checksums"),
     ],
   },
   {

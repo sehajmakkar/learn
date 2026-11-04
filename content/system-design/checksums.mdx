@@ -1,0 +1,173 @@
+export const meta = {
+  summary: "Disks, networks, memory and even CPUs sometimes return wrong data without any error. Checksums are how you notice: per block, end to end, verified on read and by background scrubbing, with redundancy to repair what's found.",
+  uses: ["09.05", "09.04", "04.06", "08.01"],
+  usedIn: ["14.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="09.05" />: redundancy can only repair corruption that's been detected. This is the <Term t="gray-failure">gray failure</Term> of
+  <L id="08.01" />, for data: everything reports success, and the bytes are wrong.
+</BeforeYouStart>
+
+## The problem: a correct-looking wrong answer
+
+An owner downloads last March's click export from Snip and opens it. One row reads `x7Kp,2026-03-14,DE,…` with a few
+characters of nonsense in the middle. No error was logged anywhere: the disk returned the bytes, the network delivered
+them, the app streamed them. Somewhere along the way, a few bits flipped.
+
+That's **silent data corruption**: the hardware or software reports success and hands back the wrong data. It's rare
+per operation, and at Snip's scale (billions of reads, petabytes stored) rare things happen weekly.
+
+## Where bits go wrong
+
+- **Disks**: a sector that decays over time ("bit rot"), a write that lands in the wrong place, firmware bugs.
+- **Networks**: corruption that slips past link-level checks. TCP's 16-bit checksum is weak, and some errors pass it.
+- **Memory**: a flipped bit in RAM without error-correcting (ECC) memory.
+- **Software**: a bug that writes the wrong buffer, or reads a page before it's fully written.
+- **CPUs**: an occasional core that computes wrong results. Google and Facebook both found such cores in their fleets
+  (below), and they produce no error at all.
+
+Redundancy (<L id="09.05" />) doesn't help by itself. If a replica silently returns wrong data, you serve it. You need
+to **detect** first.
+
+## Checksums
+
+A **checksum** is a short value computed from data, such as CRC32C, CRC64 or a cryptographic hash like SHA-256.
+Store it with the data; recompute it on read; if they differ, the data changed. A good checksum makes it
+overwhelmingly unlikely that random corruption leaves it unchanged.
+
+```ts
+import { crc32 } from "node:zlib";
+
+const BLOCK = 4096;
+
+export function writeWithChecksums(data: Buffer) {
+  const blocks: { data: Buffer; crc: number }[] = [];
+  for (let i = 0; i < data.length; i += BLOCK) {
+    const block = data.subarray(i, i + BLOCK);
+    blocks.push({ data: Buffer.from(block), crc: crc32(block) });
+  }
+  return blocks;
+}
+
+export function readVerified(blocks: { data: Buffer; crc: number }[]) {
+  return blocks.map((b, i) => {
+    if (crc32(b.data) !== b.crc) throw new Error(`block ${i} is corrupt: checksum mismatch`);
+    return b.data;
+  });
+}
+```
+
+Tested on 12 KB of data in four blocks: reads verified cleanly, then flipping a single bit in block 2 made the next
+read fail with "block 2 is corrupt", instead of returning wrong data.
+
+## Where to check
+
+**Per block, on read.** Storage systems keep a checksum per block or page and verify it every time it's read. In
+Postgres, each data page carries a checksum updated when it's written and verified each time it's read; current
+versions enable this by default. ZFS checksums every block, and on a mismatch repairs it automatically from a
+redundant copy.
+
+**End to end.** The strongest check is computed where the data is created and verified where it's finally used,
+covering every hop in between. Snip's export worker computes a CRC64 of each export as it writes it and sends it with
+the upload; the object store verifies it on arrival, stores it, and the download can be checked against it. S3 accepts
+several checksum algorithms on upload, with CRC64NVME as the default, and AWS's own SDKs calculate one on every upload.
+
+**In the background (scrubbing).** Data that's rarely read, like Snip's archives, could rot for years unnoticed and be
+found only when it's needed, by which time the redundant copy may be bad too. A **scrubber** reads everything
+periodically, verifies checksums, and repairs mismatches from redundancy while it still can. S3 says it regularly
+verifies data integrity with checksums and repairs lost redundancy; ZFS runs scrubs to catch "bit rot".
+
+## When the CPU is wrong
+
+Checksums catch bits that change at rest or in transit. A CPU that computes the wrong result produces wrong data with
+a **correct** checksum, because the checksum is computed over the wrong data. Defences are expensive and partial:
+compute critical results twice on different machines and compare, check invariants ("a compressed file can't have
+size zero"), and screen hardware with test suites to retire bad cores.
+
+<Analogy>
+  **A tally on a delivery note.** The warehouse writes "12 boxes, total weight 84 kg" on the note. At the door you count and weigh. If the numbers don't match, something went wrong in transit, even though every box looks fine. The note can't tell you which box is wrong, and it can't help if the warehouse packed the wrong goods and wrote the weight of the wrong goods.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="Mercurial cores"
+    year={2021}
+    href="https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s01-hochschild.pdf"
+    source="Cores that don't count (HotOS 2021)"
+    found="Some CPU cores silently compute wrong answers; rare per core, but visible across a large fleet."
+  >
+    Google describes "silent" corrupt execution errors, where the only symptom is an erroneous computation, and calls
+    the cores that produce them "mercurial". Such cores are extremely rare, but in a large fleet the detected incidence
+    is much higher than software engineers expect. The errors can appear long after installation and typically affect
+    specific cores on a multi-core CPU rather than the whole chip. The paper calls for better detection, isolation and
+    tolerance in software.
+  </Seen>
+  <Seen
+    company="Facebook"
+    system="Silent data corruptions"
+    year={2021}
+    href="https://arxiv.org/abs/2102.11245"
+    source="Silent Data Corruptions at Scale (Dixit et al.)"
+    found="Hundreds of CPUs across a fleet were found to corrupt data silently; one case made valid files look empty."
+  >
+    Running silent-error test scenarios across hundreds of thousands of machines found hundreds of CPUs with these
+    errors, across hardware generations, so the paper treats silent data corruption as a systemic problem. Its case
+    study follows a corruption in a Spark-based decompression pipeline: on a faulty core, a library function returned a
+    size of zero for a file known to be non-empty, so the file was never written to the output and the database ended
+    up with missing files, without any error being raised.
+  </Seen>
+  <Seen
+    company="OpenZFS"
+    system="Block checksums"
+    year="Docs"
+    href="https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Data%20Storage/Checksums.html"
+    source="Checksums and Their Use in ZFS (OpenZFS documentation)"
+    found="Checksum every block, verify on read, repair from redundancy, and scrub to find rot before it's read."
+  >
+    ZFS detects data corruption when reading from media, and blocks found to be corrupt are automatically repaired, if
+    possible, from RAID protection or redundant copies. Periodic scrubs check data to detect and repair latent media
+    degradation, or bit rot. The checksum algorithm is recorded in each block pointer; the default, `on`, means
+    fletcher4 for ordinary datasets and SHA-256 for deduplicated ones.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's archive is erasure-coded across three zones, but nothing verifies checksums except when a file is read. A file untouched for two years is requested, and two of its pieces are found corrupt. Why is this a problem, and what prevents it?"
+  options={[
+    { text: "It isn't: erasure coding rebuilds them", why: "Only if enough pieces are still good. Two years of unnoticed rot may have damaged more pieces than the code tolerates." },
+    { text: "Corruption accumulated unnoticed; a background scrubber that reads and verifies everything regularly would have repaired it early", correct: true, why: "Redundancy repairs what's detected while enough good copies remain. Scrubbing finds silent corruption before it compounds." },
+    { text: "Use replication instead", why: "Replicas rot too. Without verification, you can't tell which copy is right." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Trusting a read because it returned no error.** Silent corruption returns success. Verify checksums.</li>
+    <li>**Checking only one hop.** Network and disk checks leave gaps between them. Use end-to-end checksums for data that matters.</li>
+    <li>**Never scrubbing cold data.** Rot is found too late. Verify everything on a schedule.</li>
+    <li>**Assuming checksums catch everything.** A wrong computation gets a correct checksum. Check invariants for critical results.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Disks, networks, memory, software and CPUs can all return wrong data while reporting success.</li>
+    <li>Checksums detect it: store one per block, verify on every read, and carry one end to end.</li>
+    <li>Scrub cold data in the background and repair from redundancy before corruption accumulates.</li>
+    <li>Checksums can't catch wrong computations; verify critical results another way.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you protect a storage system against silent data corruption?", level: "Senior", frequency: 1, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why isn't replication enough?", "What can't checksums detect?"]}
+>
+  <p>Checksum every block when it's written, store the checksum separately or alongside, and verify it on every read, failing the read or falling back to another replica on a mismatch. For data crossing several systems, compute an end-to-end checksum where it's produced and verify it where it's consumed, so every hop is covered. Run background scrubbing over all data, including cold data, and repair corrupt blocks from replicas or erasure-coded pieces while enough good copies remain.</p>
+  <p>Replication alone isn't enough because without checksums you can't tell which copy is wrong, and corruption may go unnoticed until every copy has degraded. Checksums also can't catch a CPU or software bug that computes wrong data and then checksums it, so critical results need invariant checks or independent recomputation.</p>
+</InterviewCard>

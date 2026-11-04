@@ -1,0 +1,153 @@
+export const meta = {
+  summary: "Two ways to survive lost disks: keep whole copies, or split data into pieces plus parity so any k of n pieces rebuild it. The storage overhead, repair cost and latency of each, with tested parity code and real systems that use both.",
+  uses: ["09.04", "04.07", "01.05"],
+  usedIn: ["09.06", "16.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="09.04" />: this is how an <Term t="object-storage">object store</Term> protects its pieces. Replication in <L id="04.07" /> was about
+  availability of a database; here the question is cost per byte kept safe.
+</BeforeYouStart>
+
+## The problem: 2 PB of archives, kept safe, cheaply
+
+Snip's archived click history (<L id="09.04" />) has grown to 2 PB. Disks fail all the time at that scale: with tens
+of thousands of drives, several die every week. The archive must survive that, and survive losing a whole rack or
+data centre. Keeping three full copies would mean buying 6 PB of disk to store 2 PB.
+
+## Replication: whole copies
+
+Store each piece of data on three machines, in different racks or zones. Lose any two and the third still has
+everything.
+
+- **Overhead**: 200% (3 bytes stored per byte of data).
+- **Reads**: any one copy answers, so reads are simple and fast.
+- **Repair**: copy the data from a surviving replica. Cheap and quick.
+
+That's ideal for **hot** data: frequently read, latency-sensitive, small.
+
+## Erasure coding: pieces plus parity
+
+Split the data into **k** data pieces, compute **m** parity pieces from them, and store all **k + m** on different
+machines. The code is designed so that **any k of the k + m pieces** rebuild the original. Lose up to m pieces and
+nothing is lost.
+
+The simplest example is one parity piece made by XOR, as in RAID 5:
+
+```ts
+export function parity(shards: Buffer[]): Buffer {
+  const p = Buffer.alloc(shards[0].length);
+  for (const s of shards) for (let i = 0; i < p.length; i++) p[i] ^= s[i];
+  return p;
+}
+
+/** Any one missing shard is the XOR of all the others, parity included. */
+export const rebuildMissing = (survivors: Buffer[]) => parity(survivors);
+```
+
+Tested with three 8-byte shards ("Snip cli", "ck histo", "ry 2026!"): XOR of the parity and two survivors rebuilt the
+missing middle shard exactly. XOR tolerates one loss; **Reed-Solomon** codes generalise it to any m.
+
+| Scheme | Pieces | Survives losing | Storage per byte of data |
+| --- | --- | --- | --- |
+| 3× replication | 3 copies | 2 | 3.0× |
+| RS(10, 4) | 10 data + 4 parity | 4 | 1.4× |
+| RS(17, 3) | 17 data + 3 parity | 3 | about 1.18× |
+| XOR (RAID 5 style), 4 + 1 | 4 data + 1 parity | 1 | 1.25× |
+
+RS(10, 4) survives **more** failures than triple replication while storing **less than half** as many bytes. For 2 PB
+of archive, that's 2.8 PB of disk instead of 6.
+
+## What erasure coding costs
+
+- **Repair is expensive.** Rebuilding one lost piece means reading k others across the network, and computing. With
+  RS(10, 4), losing one 1 GB piece costs 10 GB of reads. Replication's repair reads 1 GB.
+- **Reads can be slower.** A whole-object read gathers k pieces from k machines; if one is slow or gone, the reader
+  must fetch a parity piece and decode (<L id="03.12" />).
+- **Small objects don't split well.** Splitting a 5 KB object into 14 pieces is silly, so systems erasure-code large
+  stripes or volumes made of many objects (<L id="09.04" />).
+- **Placement matters.** All k + m pieces must be on independent failure domains, or one rack failure takes out
+  several.
+
+## Hot, warm, cold
+
+Most large storage systems use both: replicate hot data, and erasure-code data once it cools down. Facebook moved
+older, less-requested photos and videos from Haystack (replicated) to f4, an erasure-coded system for "warm"
+data, cutting the effective copies stored per byte from 3.6 to 2.8, or 2.1 with a cross-datacenter scheme.
+
+Snip does the same with click history: the current month lives in the replicated LSM cluster (<L id="09.03" />),
+three copies; monthly archives go to object storage, which erasure-codes them.
+
+<Analogy>
+  **Photocopies versus a Sudoku.** Three photocopies of a document survive two being lost, but cost three times the paper. Erasure coding is more like a puzzle with built-in redundancy: tear out some squares and the rest are enough to work out what was there, as long as not too many are missing. It's far less paper, but filling in a missing square takes work.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Facebook"
+    system="f4 warm BLOB storage"
+    year={2014}
+    href="https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-muralidhar.pdf"
+    source="f4: Facebook's Warm BLOB Storage System (OSDI 2014)"
+    found="Erasure-code data once it's warm: Reed-Solomon within a data centre and XOR across data centres cut storage from 3.6 copies to 2.1."
+  >
+    The paper observes a strong correlation between a BLOB's age and how often it's read: requests for week-old BLOBs
+    are an order of magnitude lower than for new ones. f4 stores warm BLOBs with Reed-Solomon(10, 4) coding, placing
+    blocks on different racks to survive disk, machine and rack failures within a data centre, and XOR coding across
+    data centres. It reduced the effective replication factor from 3.6 to 2.8 or 2.1, and stored over 65 PB of logical
+    data, saving over 53 PB of storage.
+  </Seen>
+  <Seen
+    company="Backblaze"
+    system="Vaults"
+    year={2019}
+    href="https://www.backblaze.com/blog/vault-cloud-storage-architecture/"
+    source="Backblaze Vaults: Zettabyte-Scale Cloud Storage Architecture"
+    found="Each file as 17 data shards plus 3 parity shards over 20 Storage Pods: three failures survived for 17.6% overhead."
+  >
+    A Backblaze Vault is made of 20 Storage Pods, and each file is stored as 20 shards, 17 data and three parity,
+    computed with Reed-Solomon erasure coding. A Vault can lose up to three drives in the same group at once, or three
+    whole Storage Pods, without losing data, and all data is available as long as 17 of the 20 pods are. The post puts
+    the overhead of 17 data plus three parity at 17.6%. Backblaze also
+    [open-sourced its Reed-Solomon library](https://www.backblaze.com/blog/reed-solomon/).
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A storage system uses RS(6, 3): 6 data pieces and 3 parity pieces per stripe. How many pieces can be lost, and what's the storage overhead?"
+  options={[
+    { text: "3 lost; 50% overhead (1.5× storage)", correct: true, why: "Any 6 of the 9 pieces rebuild the data, so up to 3 can be lost. Storing 9 pieces for 6 pieces of data is 1.5×." },
+    { text: "6 lost; 300% overhead", why: "That's mixing up data and parity. Only the m parity pieces' worth of losses can be tolerated." },
+    { text: "1 lost; 33% overhead", why: "That's a single parity piece, like XOR. RS(6, 3) has three." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Erasure-coding hot, small, latency-sensitive data.** Decoding and fan-out reads cost latency. Replicate it.</li>
+    <li>**Ignoring repair traffic.** Rebuilding pieces reads k times as much over the network; plan for it after a failure.</li>
+    <li>**Pieces sharing a failure domain.** Spread pieces across racks and zones, or one failure removes several.</li>
+    <li>**Confusing redundancy with backup.** Neither protects against a bad delete or corruption written to every copy.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Replication keeps whole copies: simple, fast reads and repair, but 3× storage.</li>
+    <li>Erasure coding stores k data plus m parity pieces; any k rebuild the data, for far less storage.</li>
+    <li>It costs expensive repairs, slower reads when a piece is missing, and doesn't suit small objects.</li>
+    <li>Replicate hot data; erasure-code warm and cold data across independent failure domains.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's erasure coding, and when would you use it instead of replication?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What does repair cost with each?", "Why not erasure-code everything?"]}
+>
+  <p>Erasure coding splits data into k pieces and computes m parity pieces so that any k of the k + m rebuild the original. With Reed-Solomon (10, 4), data survives four lost pieces at 1.4 times storage, versus three-way replication surviving two losses at 3 times storage. So for large amounts of data it gives better durability per byte.</p>
+  <p>The costs are repair, which must read k pieces to rebuild one, reads that have to gather and possibly decode from k machines, CPU, and awkwardness for small objects, which are usually grouped into larger stripes first. I'd replicate hot, small, latency-sensitive data and erasure-code warm and cold data such as archives, backups, media older than a few weeks, spreading pieces across racks and zones.</p>
+</InterviewCard>

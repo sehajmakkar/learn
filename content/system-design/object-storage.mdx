@@ -1,0 +1,171 @@
+export const meta = {
+  summary: "Where files, images, exports and archives go: object storage like S3. The model (buckets, keys, whole immutable objects), why it scales where file systems and databases don't, and how such a system is built underneath: metadata, packed storage, spreading data over many disks.",
+  uses: ["09.01", "08.02", "02.05", "05.03"],
+  usedIn: ["09.05", "13.01", "13.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="09.01" />: object stores reuse the log-and-index idea. Consistency is from <L id="08.02" />, and objects
+  are usually served through a CDN (<L id="02.05" />).
+</BeforeYouStart>
+
+## The problem: bytes that don't belong in a database
+
+Snip now produces three kinds of file:
+
+- **QR code images** for every paid link, about 5 KB each, millions of them, fetched by browsers.
+- **CSV exports** of an owner's click history, from kilobytes to several gigabytes.
+- **Archived click history**, compressed monthly files kept for years, rarely read.
+
+Postgres could hold them as large values, but it would bloat backups, replication and the buffer cache with data that
+doesn't need transactions or indexes. A shared file system on the app servers doesn't scale past a few machines and is
+one more thing to keep available. This is what **object storage** is for: Amazon S3, Google Cloud Storage, Azure Blob
+Storage, or self-hosted MinIO and Ceph.
+
+## The model
+
+- **Buckets** hold **objects**. Each object has a **key** (`qr/x7Kp.png`, `exports/4821/2026-11.csv`), its bytes, and a
+  little metadata (content type, custom tags).
+- The namespace is **flat**. The slashes in keys look like folders, but there are no directories; listing by prefix
+  just filters keys.
+- Objects are written and read **whole**. You can read a byte range, but you can't change byte 1,000 of an object; you
+  replace the object. That immutability is what makes the system simple to replicate, cache and scale.
+- Operations are few: `PUT`, `GET`, `DELETE`, `LIST` by prefix, plus **multipart upload** for big objects (upload parts
+  in parallel, retry failed parts, then combine) and **pre-signed URLs**, which let a browser upload or download
+  directly without passing through your servers (<L id="13.05" />).
+
+On S3 today, reads after a successful write, overwrite or delete always return the latest version, including `LIST`
+(<L id="08.02" />).
+
+## How it's built underneath
+
+The systems differ, but the shape is common:
+
+1. **A front end** authenticates the request and finds where the object lives.
+2. **A metadata service** maps each key to its location: which storage nodes, which files, which offsets. It's a
+   huge, partitioned key-value store in its own right (<L id="05.03" />).
+3. **Storage nodes** hold the bytes, usually split into pieces with redundancy across machines, racks and data centres,
+   either by replication or <Term t="erasure-coding">erasure coding</Term> (<L id="09.05" />).
+
+### Small objects: don't use a file per object
+
+The naive design stores each object as a file on a storage node's file system. With billions of small files, the
+problem isn't data; it's **file-system metadata**. Finding a file's blocks means reading its inode and directory
+entries, often from disk, before reading the data. Facebook's photo store hit exactly this: reading metadata became
+the throughput bottleneck.
+
+Their answer, **Haystack**, packs many photos ("needles") into a few huge append-only files, and keeps a compact
+in-memory index from photo ID to file offset: the log-and-index design from <L id="09.01" />, so a read needs at most
+one disk operation. Modern object stores pack small objects into large files in a similar spirit.
+
+### Spreading the load
+
+A hard disk does only about a hundred random operations a second, so the key to performance at scale is spreading
+each customer's data over very many drives, so no single disk gets hot. Andy Warfield, describing S3, calls this
+"heat management": objects are deliberately placed on different sets of drives, so each customer's requests are spread
+over a very large number of disks, and S3 has tens of thousands of customers whose buckets span millions of drives.
+
+<Arch
+  title="Snip's files in object storage"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+    { id: "cdn", label: "CDN", kind: "cdn", sub: "QR images", x: 1.2, y: 0 },
+    { id: "app", label: "Snip app", kind: "service", sub: "signs URLs", x: 1.2, y: 1.6 },
+    { id: "s3", label: "Object store", kind: "store", sub: "qr/, exports/", x: 2.4, y: 0.8 },
+    { id: "w", label: "Export worker", kind: "worker", sub: "writes CSVs", x: 3.6, y: 0.8 },
+  ]}
+  edges={[
+    { from: "user", to: "cdn", label: "GET qr/x7Kp.png" },
+    { from: "cdn", to: "s3", label: "on miss", dashed: true },
+    { from: "user", to: "app", label: "export please" },
+    { from: "w", to: "s3", label: "multipart PUT" },
+    { from: "user", to: "s3", label: "pre-signed GET", dashed: true },
+  ]}
+  steps={[
+    { caption: "QR images are public and never change, so browsers fetch them through the CDN, which fetches from the object store on a miss (02.05).", edges: ["user>cdn", "cdn>s3"] },
+    { caption: "An owner asks for an export. The app queues a job (07.05) instead of building a 2 GB file in a request.", edges: ["user>app"] },
+    { caption: "The export worker streams the CSV into the object store as a multipart upload: parts in parallel, each retried on its own.", edges: ["w>s3"] },
+    { caption: "The owner downloads it directly from the store with a short-lived pre-signed URL; the bytes never pass through Snip's servers.", edges: ["user>s3"] },
+  ]}
+/>
+
+## Storage classes and lifecycle
+
+Object stores price by how often you read. Snip's archives move automatically, by lifecycle rules on their key
+prefix, from the standard class to an infrequent-access class after 30 days and to an archive class after a year:
+cheaper to keep, slower and costlier to read. Exports are deleted after 30 days.
+
+<Analogy>
+  **A cloakroom.** You hand over a coat and get a ticket (the key); you don't care which rail it's on. You can't alter the coat while it's checked in, only swap it for another. The cloakroom keeps a ledger of which ticket is on which rail (metadata) and spreads coats across all its rails so no attendant is swamped.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="S3"
+    year={2023}
+    href="https://www.allthingsdistributed.com/2023/07/building-and-operating-a-pretty-big-storage-system.html"
+    source="Building and operating a pretty big storage system called S3 (Andy Warfield, All Things Distributed)"
+    found="Millions of hard disks, erasure-coded shards, and deliberate spreading of data so no drive gets hot."
+  >
+    Based on his USENIX FAST '23 keynote, Warfield describes S3 as built from millions of hard disks, each able to do
+    only about 120 operations a second. Objects are split with an algorithm such as <Term t="reed-solomon">Reed-Solomon</Term> into k shards plus m
+    parity shards, and can be read as long as k of them are available. S3 calls the problem of keeping load even
+    "heat management", and intentionally places different objects on different sets of drives so each customer's
+    accesses are spread over a very large number of disks. The lowest storage layer on each disk, ShardStore, was
+    rewritten in Rust.
+  </Seen>
+  <Seen
+    company="Facebook"
+    system="Haystack"
+    year={2010}
+    href="https://www.usenix.org/legacy/events/osdi10/tech/full_papers/Beaver.pdf"
+    source="Finding a needle in Haystack: Facebook's photo storage (OSDI 2010)"
+    found="With billions of small files, file-system metadata becomes the bottleneck; pack objects into big files and keep the index in memory."
+  >
+    At the time, Facebook stored over 260 billion images, more than 20 petabytes, with users uploading a billion new
+    photos (about 60 TB) a week and over a million images served per second at peak. With a network file system, each
+    file's metadata had to be read from disk before the file, which became the throughput bottleneck. Haystack keeps
+    all metadata in main memory, made practical by drastically shrinking the metadata needed per photo, so a read
+    needs at most one disk operation.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip stores each QR image as its own file on a shared network file system. At 300 million images, reads are slow even though the disks are mostly idle. What's the likely bottleneck?"
+  options={[
+    { text: "Network bandwidth", why: "5 KB images use little bandwidth, and the disks are idle, so bytes aren't the problem." },
+    { text: "File-system metadata: each read first fetches directory entries and inodes, often from disk", correct: true, why: "With hundreds of millions of small files, metadata doesn't fit in memory. Object stores and Haystack-style designs pack small objects into large files with an in-memory index." },
+    { text: "The images aren't compressed", why: "PNGs are already compressed, and the size isn't what's slow." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Large files in the database.** They bloat backups and replication. Store the bytes in object storage and the key in the database.</li>
+    <li>**Proxying downloads through app servers.** Use pre-signed URLs and a CDN; let the store serve the bytes.</li>
+    <li>**Treating keys like directories.** "Renaming a folder" means copying every object under the prefix.</li>
+    <li>**Uploading big files in one request.** Use multipart uploads so a failure retries a part, not the whole file.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Object storage holds whole, immutable objects under keys in a flat namespace, with PUT, GET, LIST and multipart uploads.</li>
+    <li>Underneath: a front end, a partitioned metadata service, and storage nodes holding redundant pieces.</li>
+    <li>Small objects are packed into large files with in-memory indexes, because per-file metadata becomes the bottleneck.</li>
+    <li>Spread data over many drives, serve through CDNs and pre-signed URLs, and use lifecycle rules for cold data.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you design an object storage service like S3?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How do you store billions of tiny objects efficiently?", "How do you make it durable?"]}
+>
+  <p>The API is simple: buckets and keys with PUT, GET, DELETE, LIST by prefix and multipart upload; objects are immutable, which simplifies replication and caching. Behind a stateless front end, a metadata service maps each key to the locations of its data; it's a large partitioned, replicated key-value store, and LIST is a range scan over it. Storage nodes hold the bytes, split into chunks protected by replication or erasure coding across racks and availability zones, with background processes that verify checksums and repair lost redundancy.</p>
+  <p>For small objects I'd avoid a file per object, since file-system metadata dominates; instead append objects to large volume files and keep an in-memory index of offsets, like Facebook's Haystack. To spread load, place objects pseudo-randomly across many drives so no disk is hot, and put a CDN in front for popular public objects.</p>
+</InterviewCard>

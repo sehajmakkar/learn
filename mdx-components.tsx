@@ -22,6 +22,7 @@ import { HashRingLab } from "@/components/labs/hash-ring";
 import { EvictionLab } from "@/components/labs/eviction";
 import { DeliveryLab } from "@/components/labs/delivery";
 import { QuorumLab } from "@/components/labs/quorum";
+import { LsmLab } from "@/components/labs/lsm";
 
 /** Fenced code blocks (```ts … ```) get the same highlighted, scrollable frame as <Code>. */
 function Pre({ children }: { children?: ReactNode }) {
@@ -68,6 +69,7 @@ const components: MDXComponents = {
   EvictionLab,
   DeliveryLab,
   QuorumLab,
+  LsmLab,
 };
 
 export function useMDXComponents(): MDXComponents {

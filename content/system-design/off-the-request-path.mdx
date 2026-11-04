@@ -19,7 +19,7 @@ to the same request. Today, `POST /links` does all of this before it answers:
 | Insert the link | 5 ms | The database is down |
 | Check the URL against the safety service (<L id="02.06" />) | 200 ms, sometimes 2 s | The service is down |
 | Fetch the page's title and image for a preview | 300 ms to 5 s | The site is slow or blocks bots |
-| Render a QR code image and upload it | 80 ms | Object storage is slow |
+| Render a QR code image and upload it | 80 ms | <Term t="object-storage">Object storage</Term> is slow |
 | Call the owner's webhook ("a link was created") | Whatever their server takes | Their server is down |
 | Update the search index for the dashboard | 30 ms | The index is being rebuilt |
 

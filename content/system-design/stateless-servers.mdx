@@ -110,7 +110,7 @@ stuck to it still loses their session.
 | State | Where it goes instead |
 | --- | --- |
 | Sessions | A shared store like Redis or the database, or a signed token the browser holds itself |
-| Uploaded files | Object storage (S3 or similar), not the server's disk |
+| Uploaded files | <Term t="object-storage">Object storage</Term> (S3 or similar), not the server's disk |
 | Counters, rate limits | Redis or the database |
 | Cached data | A shared <Term t="cache">cache</Term> (<L id="02.04" />) |
 

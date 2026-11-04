@@ -1,0 +1,139 @@
+export const meta = {
+  summary: "The two families of storage engine. B-trees update sorted pages in place; LSM-trees write sorted files once and merge them later. Read, write and space amplification, why you can only minimise two, and which suits which workload.",
+  uses: ["09.01", "04.02", "04.06", "05.08"],
+  usedIn: ["09.03", "15.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="09.01" />. The B-tree itself is in <L id="04.02" />, the write-ahead log in <L id="04.06" />, and Bloom
+  filters, which LSM-trees depend on, in <L id="05.08" />.
+</BeforeYouStart>
+
+## The problem: two workloads, two engines
+
+Snip runs two very different stores:
+
+- **Links** in Postgres: 600 million rows, read 100,000 times a second (mostly via cache), occasionally edited.
+- **Click history** in a Cassandra-style cluster: billions of tiny rows, **written** tens of thousands of times a
+  second, never edited, read in bulk for analytics.
+
+Postgres uses B-trees. Cassandra, RocksDB, ScyllaDB and many others use LSM-trees. Both keep keys sorted, which fixes
+the hash index's problems from <L id="09.01" />. They differ in **when** the sorting work happens.
+
+## B-trees: sorted pages, updated in place
+
+A B-tree stores keys in sorted, fixed-size **pages** on disk: usually 8 kB in Postgres, 16 KB by default in MySQL's
+InnoDB. Each page holds hundreds of keys and pointers, so a few levels cover billions of rows, and a lookup reads
+three or four pages (<L id="04.02" />).
+
+To change a value, the engine finds its page and **rewrites the page in place**. For crash safety, the change first
+goes to the write-ahead log (<L id="04.06" />). So one small update costs a log record **and** eventually an 8 kB page
+write, even if one byte changed. If the page is full, it splits in two, updating the parent too.
+
+## LSM-trees: write sorted files once, merge later
+
+A **log-structured merge-tree** never updates in place. Writes go to a sorted structure in memory (the **<Term t="memtable">memtable</Term>**),
+plus a write-ahead log for safety. When the memtable fills, it's written out in one sequential pass as an immutable
+sorted file. Files pile up, so a background process **compacts** them: merging several sorted files into one, keeping
+only the newest version of each key and dropping deleted ones. A read checks the memtable, then files from newest to
+oldest, skipping most of them with a Bloom filter per file. <L id="09.03" /> walks through it with a lab.
+
+## Three kinds of amplification
+
+Storage engines are compared by how much extra work they do beyond what you asked:
+
+- **Write amplification**: bytes written to disk per byte you wrote. B-trees rewrite whole pages; LSM-trees rewrite data
+  each time <Term t="compaction">compaction</Term> merges it.
+- **Read amplification**: pages or files touched per lookup. B-trees: one path down the tree. LSM-trees: possibly
+  several files.
+- **Space amplification**: disk used per byte of live data. B-trees leave pages partly empty; LSM-trees keep old
+  versions until compaction removes them.
+
+Mark Callaghan's blog on database performance puts the rule bluntly: an algorithm can optimise for **at most two**
+of read, write and space amplification.
+
+| | B-tree | LSM-tree |
+| --- | --- | --- |
+| **Writes** | Random page rewrites; higher write amplification for small updates | Sequential writes; batched; usually higher throughput |
+| **Point reads** | Predictable: one path down the tree | Memtable plus some files; Bloom filters keep it close |
+| **Range scans** | Excellent: keys are in sorted pages | Good, but must merge across files |
+| **Space** | Pages partly empty after splits | Dead versions until compacted; compact well and it's tight |
+| **Background work** | Vacuum (in Postgres) and page splits | Compaction, which competes with foreground traffic |
+| **Latency** | Steady | Occasional spikes when compaction falls behind |
+| **Typical** | Postgres, MySQL InnoDB, SQLite | RocksDB, Cassandra, ScyllaDB, LevelDB |
+
+So the click history goes to an LSM store: it's write-heavy, never updated in place, and read mostly in big scans.
+Links stay in a B-tree: updates are rare, reads must be fast and predictable, and Postgres's transactions and
+indexes are worth having.
+
+<Analogy>
+  **A filing cabinet versus an inbox tray.** With a cabinet (B-tree), every new letter is filed into its folder straight away, which is slow per letter but makes finding things easy. With an inbox tray (LSM), letters are dropped in a pile and sorted in batches later, which is fast to drop, and finding something means checking the latest piles first, until the piles are merged into the cabinet.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Mark Callaghan"
+    system="Read, write and space amplification"
+    year={2015}
+    href="https://smalldatum.blogspot.com/2015/11/read-write-space-amplification-pick-2_23.html"
+    source="Read, write & space amplification: pick 2 (Small Datum)"
+    found="No storage engine minimises all three amplifications; B-trees favour reads, LSM-trees favour writes."
+  >
+    Callaghan argues that an algorithm can optimise for at most two of read, write and space amplification. As one
+    example, a B-tree has less read amplification than an LSM-tree, while an LSM-tree has less write amplification
+    than a B-tree.
+  </Seen>
+  <Seen
+    company="Meta"
+    system="RocksDB"
+    year="Wiki"
+    href="https://github.com/facebook/rocksdb/wiki/RocksDB-Overview"
+    source="RocksDB Overview (RocksDB wiki)"
+    found="An LSM engine built for fast storage, with the amplification trade-offs exposed as settings."
+  >
+    New writes go into an in-memory memtable and, optionally, a write-ahead log. When the memtable fills, it's flushed
+    to a sorted file on storage. RocksDB's primary design point is performance on fast storage for server workloads,
+    and its architecture is meant to make it easy to tune trade-offs for different workloads: its default leveled
+    compaction optimises space amplification, while universal compaction typically gives lower write amplification
+    but higher space and read amplification.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A metrics service ingests 500,000 small data points a second, never updates them, and reads them as time ranges for dashboards. Which engine family fits, and what's the main cost to watch?"
+  options={[
+    { text: "A B-tree; watch page splits", why: "It would work, but random page rewrites at that write rate are expensive. This is the textbook write-heavy, append-only case." },
+    { text: "An LSM-tree; watch compaction keeping up with ingest", correct: true, why: "Sequential batched writes suit the ingest rate. The risk is compaction falling behind, which raises read amplification and causes latency spikes." },
+    { text: "A hash index; watch memory", why: "Dashboards read time ranges, which a hash index can't do." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Picking an engine by brand.** Pick by workload: write rate, update pattern, read shape.</li>
+    <li>**Ignoring background work.** Vacuum and compaction use the same disks as your queries; budget for them.</li>
+    <li>**Assuming LSM reads are slow.** With Bloom filters and caching, point reads are usually close to a B-tree's.</li>
+    <li>**Forgetting space amplification.** An LSM store under constant updates can use several times its live data until compaction catches up.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>B-trees keep sorted pages and update them in place; LSM-trees write sorted files once and merge them later.</li>
+    <li>Compare engines by read, write and space amplification; you can minimise at most two.</li>
+    <li>B-trees give predictable reads and great range scans; LSM-trees give high write throughput and compact storage.</li>
+    <li>Both need background work: vacuum and page splits, or compaction, which competes with live traffic.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Compare B-trees and LSM-trees. When would you choose each?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What is write amplification, and where does it come from in each?", "Why do LSM-trees need Bloom filters?"]}
+>
+  <p>A B-tree stores keys in sorted fixed-size pages and updates them in place, with a write-ahead log for crash safety. Lookups follow one path of a few pages, range scans are efficient, and latency is predictable, but each small write can rewrite a whole page. An LSM-tree buffers writes in a memtable, flushes them as immutable sorted files, and merges files in the background with compaction. Writes are sequential and fast, but a read may check several files, which Bloom filters mitigate, and compaction adds background I/O and rewrites data repeatedly.</p>
+  <p>The trade-off is framed as read, write and space amplification, of which you can minimise at most two. I'd choose a B-tree engine for read-heavy, update-in-place, transactional workloads like user records, and an LSM engine for write-heavy, append-mostly data like events, logs, metrics or time series.</p>
+</InterviewCard>

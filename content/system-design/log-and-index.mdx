@@ -1,0 +1,168 @@
+export const meta = {
+  summary: "Strip a database down and two parts remain: a log you append to, and an index that finds things in it. Build the simplest working key-value store, see why appending is fast, why the index has to be rebuilt after a restart, and why old values need compacting away.",
+  uses: ["04.02", "04.06", "01.04"],
+  usedIn: ["09.02", "09.03", "09.04"],
+};
+
+<BeforeYouStart>
+  <L id="04.02" /> showed an index from the outside, and <L id="04.06" /> the write-ahead log. The speed differences
+  come from <L id="01.04" />: sequential disk writes are far cheaper than random ones.
+</BeforeYouStart>
+
+## The problem: what is a database actually doing?
+
+Snip leans on three stores: Postgres for links, Redis for the cache, and a Cassandra-style cluster for click history
+(<L id="08.04" />). They behave very differently: Postgres updates rows in place, the click store never does, and both
+have a background process that "compacts" or "vacuums". To choose between storage engines, and to understand their
+odd behaviour under load, it helps to build the simplest one yourself.
+
+## The simplest database: append to a file
+
+Store each write as one line at the end of a file. To read a key, scan the file and take the **last** value written
+for it. Writes are as fast as a disk can be, because appending is sequential: no seeking, and nothing existing is
+touched. A delete is just another append: a special **tombstone** value meaning "gone".
+
+But reads are terrible: finding one key scans the whole file, and the file grows for ever.
+
+## Add an index
+
+Keep a hash map in memory from each key to the **byte offset** of its latest record in the file. A write appends a
+line and updates the map; a read looks up the offset and reads exactly that record: **one seek, one read**. This is
+the design of **Bitcask**, the storage engine Riak used:
+
+```ts
+type Pos = { offset: number; length: number };
+
+export class LogStore {
+  private index = new Map<string, Pos>(); // key -> where its latest value is in the file
+  private size = 0; // bytes in the file so far
+
+  constructor(private readonly path: string) {
+    if (!existsSync(path)) writeFileSync(path, "");
+    this.rebuild();
+  }
+
+  /** Each record is one line: JSON [key, value], or [key, null] for a delete (a tombstone). */
+  set(key: string, value: string | null) {
+    const line = Buffer.from(JSON.stringify([key, value]) + "\n");
+    const offset = this.size;
+    appendFileSync(this.path, line); // the only write: an append at the end
+    this.size += line.length;
+    if (value === null) this.index.delete(key);
+    else this.index.set(key, { offset, length: line.length });
+  }
+
+  get(key: string): string | null {
+    const pos = this.index.get(key);
+    if (!pos) return null;
+    const fd = openSync(this.path, "r");
+    const buf = Buffer.alloc(pos.length);
+    readSync(fd, buf, 0, pos.length, pos.offset); // one seek, one read
+    closeSync(fd);
+    return JSON.parse(buf.toString())[1];
+  }
+
+  /** After a restart, the index is gone: scan the whole log to rebuild it. */
+  private rebuild() {
+    this.index.clear();
+    let offset = 0;
+    for (const line of readFileSync(this.path).toString().split("\n")) {
+      if (!line) continue;
+      const length = Buffer.byteLength(line) + 1;
+      const [key, value] = JSON.parse(line);
+      if (value === null) this.index.delete(key);
+      else this.index.set(key, { offset, length });
+      offset += length;
+    }
+    this.size = offset;
+  }
+
+  /** Compaction: rewrite only the latest value of each live key, then swap files. */
+  compact() {
+    const tmp = this.path + ".compact";
+    writeFileSync(tmp, "");
+    for (const key of this.index.keys()) appendFileSync(tmp, JSON.stringify([key, this.get(key)]) + "\n");
+    renameSync(tmp, this.path);
+    this.rebuild();
+  }
+}
+```
+
+(Imports from `node:fs` omitted.) Tested: after setting `x7Kp` twice and deleting `b2Qe`, reads returned the newer
+destination and nothing for the deleted key, both before and after a simulated restart that rebuilt the index from
+the file.
+
+## Three problems, three ideas
+
+**The file grows with every overwrite.** Snip's link `x7Kp` edited twice leaves three records, two of them dead.
+**Compaction** rewrites only the live records into a new file and swaps it in. In the test, 1,000 writes to 10 keys
+made a 13,929-byte log; compacting it left 179 bytes. Real engines split the log into segments and compact old
+segments in the background while new writes go to the newest one.
+
+**A restart loses the index.** Rebuilding it means reading the whole log. Bitcask also writes a small "hint" file
+alongside each segment so the index can be rebuilt without reading every value.
+
+**Every key must fit in memory, and ranges are impossible.** A hash map has no order, so "all codes between `x7A`
+and `x7Z`" means checking everything. Fixing both needs the index to be **sorted**, and that's the fork in the road:
+keep a sorted tree on disk and update it in place (a **B-tree**), or keep sorted files that are written once and merged
+later (an **LSM-tree**). <L id="09.02" /> compares them.
+
+<Analogy>
+  **A notebook and a bookmark list.** You never cross anything out: every new fact goes on the next line of the notebook (fast, nothing to find). A separate card says which page holds the latest version of each fact. Lose the card and you must reread the whole notebook. Every so often you copy the facts still current into a fresh notebook and throw the old one away.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Basho"
+    system="Bitcask"
+    year={2010}
+    href="https://riak.com/assets/bitcask-intro.pdf"
+    source="Bitcask: A Log-Structured Hash Table for Fast Key/Value Data (Justin Sheehy and David Smith)"
+    found="An append-only file plus an in-memory hash of key to file offset: the whole design of a fast key-value store."
+  >
+    Bitcask was built as a local storage engine for the Riak distributed database. Each write appends an entry to the
+    active file, which is only ever appended to, so writes need no disk seeking. A delete is a write of a special
+    tombstone value, removed at the next merge. After each append, an in-memory structure called the keydir, a hash
+    table from every key to the file, offset and size of its most recent entry, is updated, so reads go straight to
+    the latest version while old data stays on disk until merged away.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's log store holds 50 million keys. After a crash it takes 20 minutes to start, and the disk usage is five times the live data. What two features fix these?"
+  options={[
+    { text: "A bigger hash map and a faster disk", why: "The map isn't the issue; it has to be rebuilt by reading everything, and dead records are still on disk." },
+    { text: "Hint files (or index snapshots) for fast rebuilds, and compaction to remove overwritten records", correct: true, why: "A saved index avoids rescanning every value on restart, and compaction rewrites only live records so the files stop growing with every overwrite." },
+    { text: "Switch to updating records in place", why: "That's a different engine design with its own costs, covered next. The log design has direct fixes for both problems." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Thinking appends are always cheap.** They are, until reads or restarts have to scan them. The index is what makes a log usable.</li>
+    <li>**Forgetting tombstones.** A delete must be written, or the old value reappears on restart.</li>
+    <li>**Never compacting.** Overwritten data stays on disk for ever.</li>
+    <li>**A hash index for range queries.** Hashes have no order; ranges need a sorted structure.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A storage engine is a log of writes plus an index that finds the latest value quickly.</li>
+    <li>Appending is fast because it's sequential; deletes are tombstones; overwritten records are dead weight.</li>
+    <li>Compaction removes dead records; hint files or snapshots speed up rebuilding the index after a restart.</li>
+    <li>Hash indexes need every key in memory and can't do ranges, which leads to sorted structures: B-trees and LSM-trees.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you build a simple persistent key-value store?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["What happens on restart?", "How do you reclaim space from overwritten values?"]}
+>
+  <p>Append every write, including deletes as tombstones, to a log file, and keep an in-memory hash map from each key to the byte offset of its latest record. Writes are a single sequential append plus a map update; reads are one lookup and one disk read. This is Bitcask's design.</p>
+  <p>On restart the map has to be rebuilt by scanning the log, so I'd split the log into segments and write a hint file or index snapshot per segment to speed that up. Old segments are compacted in the background, keeping only the latest value of each live key. The limits are that all keys must fit in memory and there are no range queries; for those I'd move to a sorted structure, a B-tree or an LSM-tree.</p>
+</InterviewCard>
