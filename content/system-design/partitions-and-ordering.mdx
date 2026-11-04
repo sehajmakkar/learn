@@ -1,0 +1,160 @@
+export const meta = {
+  summary: "How a log scales: split into partitions by key, read by a consumer group with one reader per partition. What order you really get, what breaks it, and how to retry a failing message without stalling everything behind it.",
+  uses: ["07.02", "07.03", "05.02", "05.01"],
+  usedIn: ["07.06", "07.09", "16.11"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.02" /> and <L id="07.03" />. Partitioning a log works like <Term t="sharding">sharding</Term> a database
+  (<L id="05.01" />), with the same hot-key problem (<L id="05.02" />).
+</BeforeYouStart>
+
+## The problem: one reader can't keep up
+
+Snip's clicks topic receives 100,000 events a second at peak. One click-counter process can apply perhaps 20,000 a
+second. Adding a second process that reads the same events would just count everything twice. Snip needs a way to
+**split the stream** between readers, while keeping the guarantee that matters: events about one link are processed in
+the order they happened.
+
+## Partitions
+
+A topic is divided into **partitions**, each its own ordered log. When a producer appends an event, it picks a
+partition from the event's **key**: in Kafka, events with the same key are written to the same partition, and a
+consumer of that partition always reads its events in the order they were written.
+
+Snip keys click events by **link code** and gives the topic 32 partitions. Every click for `x7Kp` lands in the same
+partition, in order. Across partitions there's no order at all: a click on `x7Kp` and one on `b2Qe` may be processed
+in either order, and that's fine, because nothing depends on it.
+
+## Consumer groups
+
+Readers that share the work join a **consumer group**. Each partition is consumed by exactly one member of the group
+at a time, so the group divides the partitions among its members:
+
+| Click counters in the group | Partitions each | Note |
+| --- | --- | --- |
+| 1 | 32 | One process does everything |
+| 8 | 4 | Each reads its own four partitions |
+| 32 | 1 | Maximum parallelism |
+| 40 | 1 (8 idle) | More members than partitions: the extra ones have nothing to read |
+
+That last row is why **the partition count caps parallelism**, and why it's chosen generously up front, like logical
+shards (<L id="05.01" />). Adding partitions later changes which partition a key maps to, breaking per-key order for
+the keys that move.
+
+When a member joins, leaves or dies, the group **rebalances**: partitions are reassigned, and the new owner continues
+from the last saved <Term t="consumer-offset">offset</Term>. Anything the old owner processed but hadn't saved is processed again, which is why
+<L id="07.03" /> matters.
+
+Different groups are independent. The fraud detector is its own group, also spread over the same 32 partitions, with
+its own offsets.
+
+## The order you actually get
+
+Per-key order holds only if everything along the way preserves it:
+
+- **The key has to be the thing whose order matters.** Snip's link events (`created`, `edited`, `deleted`) are keyed
+  by code, so an edit can't overtake the creation. Keyed by owner, they'd still be in order per owner, which also
+  works. Keyed randomly, they wouldn't be in order at all.
+- **The producer mustn't reorder.** A producer with several requests in flight that retries one can, unless it's
+  configured to preserve order (Kafka's idempotent producer does).
+- **The consumer mustn't reorder.** Handing a partition's events to a thread pool processes them out of order. Run
+  events for the same key one after another; parallelise across keys.
+- **Retries mustn't reorder.** The hard one, below.
+
+## A failing message: block, skip or set aside
+
+Event 1,042 in partition 7 makes the click counter throw an error. Because the consumer's progress is one offset per
+partition, it has three choices:
+
+1. **Retry in place until it works.** Order is kept, but partition 7 stops completely. Fine for a brief outage of a
+   database; disastrous for a malformed event that will never succeed.
+2. **Skip it.** Partition 7 carries on, and the event is lost.
+3. **Set it aside.** Write it to a **retry topic** that's consumed later, after a delay, and move on. After a few
+   failed retries it goes to a **dead-letter topic** for a person to look at. Partition 7 keeps flowing.
+
+Option 3 is the usual answer for independent events like clicks. But it breaks order for that key: if `x7Kp`'s
+`edited` event is set aside and its `deleted` event goes through, the retry later "un-deletes" it. For events where
+order matters, either retry in place (and alert fast), or, when one event for a key is set aside, set aside the rest of
+that key's events too until it's resolved.
+
+<Analogy>
+  **Supermarket checkouts.** Each customer is assigned to one till, and each till serves its queue in order. More tills means more customers served at once, but there's no point having more cashiers than tills. And if one customer's card keeps being declined, the cashier asks them to step aside so the rest of the queue can move.
+</Analogy>
+
+## Hot partitions
+
+Keying by code means a viral link puts all its clicks on one partition, and one consumer. At 50,000 clicks a second
+on `x7Kp` (<L id="05.02" />), partition 12 falls behind while the other 31 are idle. Fixes, as with any hot key:
+
+- **Pre-aggregate before the log.** Each app server counts clicks per code for a second and sends one event with a
+  count, turning 50,000 events into 40.
+- **Use a finer key** when strict per-link order isn't needed. Click events aren't edits; Snip could key them by code
+  plus a random suffix of 0 to 7, spreading one link over eight partitions, and sum later.
+
+<SeenInProduction>
+  <Seen
+    company="Uber"
+    system="Kafka retries and dead-letter queues"
+    year={2018}
+    href="https://www.uber.com/blog/reliable-reprocessing/"
+    source="Building Reliable Reprocessing and Dead Letter Queues with Apache Kafka"
+    found="Move failing messages to retry topics with increasing delays, so one failure doesn't block a partition."
+  >
+    Uber's insurance engineering team describes a chain of retry topics. When the handler for a topic returns an
+    error, the message is published to the next retry topic, and each level of retry consumers can enforce a longer
+    processing delay. The end of the line is a dead-letter topic. Failed messages enter their own channels, so
+    successes in the same batch carry on, and the post notes that Kafka offers <Term t="at-least-once">at-least-once</Term> semantics by default.
+  </Seen>
+  <Seen
+    company="Amazon"
+    system="SQS FIFO message groups"
+    year="Docs"
+    href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html"
+    source="FIFO queue delivery logic in Amazon SQS"
+    found="Order per key, parallelism across keys: the same idea as partitions, on a queue."
+  >
+    SQS FIFO queues order messages per message group ID: within a group, messages are sent and received in strict
+    order, while messages with different group IDs may be processed out of order relative to one another, which
+    allows parallel processing across groups. Choosing the group ID is choosing the key whose order matters.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's link-events topic (created, edited, deleted) is keyed by code with 16 partitions. To go faster, a developer makes each consumer process a partition's events with a pool of 10 threads. What breaks?"
+  options={[
+    { text: "Nothing: events are still in order within the partition", why: "They're stored in order, but a thread pool finishes them in any order." },
+    { text: "An edit and a delete for the same link can be applied in the wrong order", correct: true, why: "Two threads can work on x7Kp's events at once and finish in either order. Parallelise across keys (one queue per key, or per-key locking), not within one." },
+    { text: "Consumers will be assigned more partitions", why: "Threads inside a consumer don't change the group's partition assignment." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Too few partitions.** They cap consumer parallelism, and adding more later moves keys between partitions.</li>
+    <li>**Keying by something other than what needs ordering.** Order holds only per key.</li>
+    <li>**Parallel processing inside a partition.** It quietly discards the ordering you chose the key for.</li>
+    <li>**Retrying a poison message in place for ever.** The whole partition stops. Set it aside after a few attempts.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A topic is split into partitions by key; order is guaranteed only within a partition.</li>
+    <li>A consumer group gives each partition to one member, so partitions cap parallelism.</li>
+    <li>Rebalances and retries reprocess events: consumers must be idempotent.</li>
+    <li>For failures, choose between blocking (keeps order) and retry topics with a dead-letter topic (keeps flowing); hot keys need pre-aggregation or finer keys.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How does Kafka guarantee ordering, and how do you scale consumers without losing it?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What happens when a consumer in the group dies?", "How do you handle a message that keeps failing?"]}
+>
+  <p>Kafka orders events only within a partition. Producers choose the partition from a key, so all events for one key go to one partition in order. A consumer group assigns each partition to exactly one consumer, so each key is processed by one consumer in order, and parallelism comes from having many partitions, up to one consumer per partition.</p>
+  <p>To keep order end to end, I key by the entity whose order matters, configure the producer not to reorder on retries, and process events for the same key sequentially inside the consumer. If a consumer dies, the group rebalances and another consumer resumes from the last committed offset, so processing must be idempotent. For failing messages I'd retry briefly in place, then move them to retry topics with delays and finally a dead-letter topic, accepting that this breaks per-key order unless I also hold back later events for that key.</p>
+</InterviewCard>

@@ -1,0 +1,199 @@
+export const meta = {
+  summary: "A business process that spans several services can't be one database transaction. A saga runs it as a series of local steps, each with a compensating step that undoes it if a later one fails. Orchestration versus choreography, and durable workflow engines.",
+  uses: ["07.06", "07.03", "07.07", "04.04"],
+  usedIn: ["08.11", "16.02"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.03" /> (steps get retried, so they must be safe to repeat) and <L id="07.06" /> (how a step's result
+  becomes an event). A saga is what you use instead of one <Term t="transaction">transaction</Term> (<L id="04.04" />)
+  when the work spans systems.
+</BeforeYouStart>
+
+## The problem: one action, four systems
+
+Snip's paid plan adds **custom domains**: an owner can use `go.shop.example/summer` instead of `snip.link/x7Kp`.
+Setting one up touches four systems:
+
+1. **Charge** the domain add-on to the owner's card, through a payment provider.
+2. **Record** the domain in Snip's database as pending.
+3. **Get a TLS certificate** for it from a certificate authority, which only works once the owner's DNS points at Snip.
+4. **Configure the CDN** to serve the domain, then mark it active.
+
+If step 3 fails because the owner hasn't changed their DNS, the card has been charged for a domain that doesn't work.
+In one database, a transaction would roll everything back. But the payment provider, the certificate authority and
+the CDN aren't in Snip's database, and none of them will join a transaction that spans the others.
+
+## Sagas
+
+A **saga** is the answer from a 1987 paper by Hector Garcia-Molina and Kenneth Salem, written for long-running
+database transactions and now used across services. A long transaction is a saga if it can be written as a
+**sequence of smaller transactions**, each committed on its own, where the system guarantees that either all of them
+complete, or **compensating transactions** run to undo the ones that did.
+
+For Snip's custom domain:
+
+| Step | Compensation if a later step fails |
+| --- | --- |
+| Charge the card | Refund the charge |
+| Record the domain as pending | Mark it failed |
+| Issue the TLS certificate | Revoke it |
+| Configure the CDN | Remove the configuration |
+| Mark the domain active | (last step: nothing after it can fail) |
+
+<Sequence
+  title="Certificate issuance fails, so the saga compensates"
+  walk
+  participants={[{ id: "o", label: "Domain saga" }, { id: "pay", label: "Payments" }, { id: "db", label: "Snip DB" }, { id: "ca", label: "Certificate authority" }]}
+  messages={[
+    { from: "o", to: "pay", label: "charge £5", explain: "Step 1 commits at the payment provider." },
+    { from: "o", to: "db", label: "domain: pending", explain: "Step 2 commits in Snip's database." },
+    { from: "o", to: "ca", label: "issue certificate", fail: true, explain: "The certificate authority checks the domain, finds DNS still points elsewhere, and refuses. Retries won't help until the owner acts." },
+    { from: "o", to: "db", label: "domain: failed", explain: "Compensations run in reverse order. The domain is marked failed, with the reason for the owner." },
+    { from: "o", to: "pay", label: "refund £5", explain: "The charge is refunded. The owner sees a charge and a refund, not nothing: compensation is a new action, not time travel." },
+  ]}
+/>
+
+## Compensation isn't rollback
+
+A database rollback makes it as if the transaction never happened. A compensation is a **new action** that undoes
+the business effect, and the world can see both:
+
+- **Others may have seen the in-between state.** Between steps 2 and 5, the dashboard showed "pending". That's a
+  real state the product must design for.
+- **Some things can't be undone.** An email can't be unsent; send it only after the last step that can fail, or send a
+  follow-up instead. Order the steps so the hard-to-undo ones come last.
+- **Compensations can fail too.** A refund call can time out. Compensations must be retried until they succeed, so,
+  like every step, they must be safe to repeat (<L id="07.03" />): refund with an idempotency key, so a retried refund
+  doesn't refund twice.
+
+## Who drives the steps?
+
+**Orchestration.** One component, the orchestrator, knows the steps, calls each service, records progress, and runs
+the compensations on failure. The whole process is in one place, readable and easy to monitor.
+
+**Choreography.** No one is in charge. Payments publishes `charge.succeeded`; the domain service hears it and records
+the domain, then publishes `domain.recorded`; the certificate service hears that, and so on. Each service reacts to
+events (<L id="07.06" />). It's loosely coupled, but the process exists only as the sum of many subscriptions, which
+makes it hard to see, change, or answer "where is this order stuck?".
+
+A rough rule: choreography for simple reactions with two or three steps, orchestration once there's a real process
+with branches, waits and compensations. Snip's domain setup has a wait (for DNS that may take a day), so it's
+orchestrated.
+
+```ts
+type Step<C> = { name: string; run: (ctx: C) => Promise<void>; undo?: (ctx: C) => Promise<void> };
+
+/** Run steps in order; if one fails, undo the completed ones in reverse, then rethrow. */
+export async function runSaga<C>(steps: Step<C>[], ctx: C, record: (event: string) => Promise<void>) {
+  const completed: Step<C>[] = [];
+  for (const step of steps) {
+    try {
+      await step.run(ctx);
+      await record(`done: ${step.name}`);
+      completed.push(step);
+    } catch (err) {
+      await record(`failed: ${step.name} (${(err as Error).message})`);
+      for (const done of completed.reverse()) {
+        if (done.undo) {
+          await done.undo(ctx); // must be retried until it succeeds, and safe to repeat
+          await record(`undone: ${done.name}`);
+        }
+      }
+      throw err;
+    }
+  }
+}
+```
+
+Run with a certificate step that throws, it records `done: charge card`, `done: reserve domain`, `failed: issue
+certificate`, `undone: reserve domain`, `undone: charge card`, and leaves nothing charged or reserved. This sketch
+shows the shape, but it keeps its progress in memory: if the process dies between steps, nobody knows to carry on or
+compensate. A real orchestrator **records each step durably** (the `record` function writing to a table, in the same
+transaction as the step where possible) and resumes from that record after a crash, and it can wait for a day for DNS
+without holding anything open.
+
+## Durable workflow engines
+
+That durable record-and-resume is hard to get right, so there are engines for it: Temporal, AWS Step Functions,
+Netflix's Conductor and others. In Temporal's model you write the workflow as ordinary code; every step's result is
+saved to an event history, and if the worker running it dies, another worker fetches the history and replays the code
+against it to rebuild its state and carry on. The price is that workflow code must be deterministic (no reading the
+clock or random numbers directly), because it's re-run during replay. Steps that talk to the outside world, called
+activities, are retried with backoff.
+
+For a single process like Snip's domain setup, a jobs table and a saga table with each step's status (<L id="07.05" />)
+are enough. When a company has dozens of long processes with waits and branches, an engine pays for itself.
+
+<Analogy>
+  **Booking a holiday yourself.** You book the flight, then the hotel, then the car. If the car hire falls through and the trip is off, you can't un-book the flight; you cancel it and get a refund, maybe minus a fee. The bookings are separate, each confirmed on its own, and undoing the trip means a cancellation for each one, in reverse.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Princeton University"
+    system="Sagas"
+    year={1987}
+    href="https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf"
+    source="Sagas (Hector Garcia-Molina and Kenneth Salem, ACM SIGMOD 1987)"
+    found="Break a long transaction into a sequence of committed steps, and guarantee that either all complete or compensations amend the partial result."
+  >
+    The paper starts from long-lived transactions, such as producing monthly account statements at a bank or
+    processing claims at an insurance company, which hold database resources for a long time and delay shorter
+    transactions. It proposes that a long-lived transaction is a saga if it can be written as a sequence of
+    transactions that can be interleaved with others, with the database guaranteeing that either all of them complete
+    or compensating transactions are run to amend a partial execution.
+  </Seen>
+  <Seen
+    company="Temporal"
+    system="Durable execution"
+    year="Docs"
+    href="https://docs.temporal.io/evaluate/understanding-temporal"
+    source="Understanding Temporal (Temporal documentation)"
+    found="Record every step, and recover from a crash by replaying the workflow code against that record."
+  >
+    Temporal describes a workflow that, once started, runs to completion whether that takes a second or a year. If
+    the process running it fails, a new worker fetches the event history and replays the workflow code against it to
+    rebuild local state, which is why workflow definitions must be deterministic. A failed activity is retried with
+    backoff, and one whose worker dies is rescheduled.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="In Snip's domain saga, the 'email the owner: your domain is live' step runs second, right after the charge. Then the certificate step fails. What's the problem?"
+  options={[
+    { text: "None: the saga refunds the card", why: "The refund undoes the charge, but the owner has already been told the domain is live, and an email can't be unsent." },
+    { text: "An action that can't be undone ran before a step that can fail; send the email last", correct: true, why: "Order saga steps so that irreversible actions come after every step that might fail. Then they never need compensating." },
+    { text: "The email step needs a compensation that deletes the email", why: "There's no way to delete an email from someone's inbox. The fix is the order, not a compensation." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Treating compensation as rollback.** Others may have seen intermediate states, and some actions can't be undone.</li>
+    <li>**Irreversible steps early.** Put emails, shipments and other one-way actions after every step that can fail.</li>
+    <li>**Steps and compensations that aren't idempotent.** Both get retried. Use idempotency keys.</li>
+    <li>**Keeping saga progress in memory.** A crash leaves it half-done with no record. Persist every step.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A saga runs a cross-service process as local steps, each with a compensating step that undoes it.</li>
+    <li>Compensations are new actions, not rollback: design for visible in-between states and order irreversible steps last.</li>
+    <li>Orchestration keeps the process in one place; choreography spreads it across event handlers.</li>
+    <li>Persist progress so a crash can resume; durable workflow engines do this by recording and replaying each step.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you keep data consistent across microservices without distributed transactions?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Orchestration or choreography: which would you choose and why?", "What if a compensating action fails?"]}
+>
+  <p>With a saga: the business process becomes a sequence of local transactions, one per service, each committed on its own, and each with a compensating action that semantically undoes it. If a step fails, the completed steps are compensated in reverse order. For an order, that might be reserve stock, charge the card, create the shipment, with compensations release stock and refund.</p>
+  <p>It isn't isolated like a database transaction: other parts of the system can see intermediate states, so the product needs states like "pending", and irreversible steps should come last. Every step and compensation must be idempotent and retried until it succeeds, and progress must be stored durably so a crashed coordinator can resume. I'd orchestrate anything with more than a couple of steps, waits or branches, possibly with a workflow engine like Temporal or Step Functions, and use choreography with events for simple reactions.</p>
+</InterviewCard>

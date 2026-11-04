@@ -1,0 +1,232 @@
+export const meta = {
+  summary: "A reliable job queue in one table, using the database you already run. FOR UPDATE SKIP LOCKED lets many workers take jobs without blocking each other; leases, retries with backoff and a dead state handle the rest. Tested code, and where it stops being the right tool.",
+  uses: ["07.01", "07.03", "04.04", "04.02", "03.09"],
+  usedIn: ["07.06", "07.07", "15.11"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.01" /> and <L id="07.03" />. You'll need row locks and transactions from <L id="04.04" />, a partial
+  index from <L id="04.02" />, and backoff from <L id="03.09" />.
+</BeforeYouStart>
+
+## The problem: a queue that agrees with the database
+
+Snip's link creation now queues four jobs: fetch the preview, render the QR code, call the owner's webhook, update
+the search index (<L id="07.01" />). With a separate queue service, the code looks like this:
+
+```ts
+await db.query("INSERT INTO links ...");
+await queue.send({ type: "preview", code });   // what if this fails?
+```
+
+If the send fails after the insert commits, the link exists with no preview job, ever. Send first, and if the insert
+then fails, a worker fetches a preview for a link that doesn't exist. The two systems can't commit together.
+
+If the jobs live **in Postgres**, in the same transaction as the link, both happen or neither does. River, a Postgres
+job queue, puts it simply: a job inserted in a transaction becomes visible to workers only after the transaction
+commits. For Snip's few hundred jobs a second, Postgres is easily fast enough, and it's one less system to run.
+
+## The table
+
+```sql
+CREATE TABLE jobs (
+  id           bigserial   PRIMARY KEY,
+  queue        text        NOT NULL,
+  payload      jsonb       NOT NULL,
+  status       text        NOT NULL DEFAULT 'ready',  -- ready, running, dead
+  run_at       timestamptz NOT NULL DEFAULT now(),    -- not before this time
+  attempts     int         NOT NULL DEFAULT 0,
+  max_attempts int         NOT NULL DEFAULT 5,
+  locked_until timestamptz,                           -- a running job's lease
+  last_error   text
+);
+
+-- Workers only ever look for jobs that could run, in run_at order.
+CREATE INDEX jobs_claimable ON jobs (queue, run_at) WHERE status IN ('ready', 'running');
+```
+
+Creating a link and its jobs is now one transaction:
+
+```sql
+BEGIN;
+INSERT INTO links (code, long_url, owner_id) VALUES ('x7Kp', 'https://shop.example/spring', 4821);
+INSERT INTO jobs (queue, payload) VALUES
+  ('previews', '{"code": "x7Kp"}'),
+  ('webhooks', '{"code": "x7Kp", "event": "link.created"}');
+COMMIT;
+```
+
+## Taking a job without fighting: SKIP LOCKED
+
+Twenty workers asking "what's the oldest ready job?" at the same moment all find the same row. With a plain
+`FOR UPDATE`, nineteen of them wait for the first to finish with it. With **`FOR UPDATE SKIP LOCKED`**, each skips rows
+another transaction has locked and takes the next one. The PostgreSQL documentation is frank about the trade: skipping
+locked rows "provides an inconsistent view of the data", so it isn't for general use, but it suits "multiple consumers
+accessing a queue-like table". That's exactly this.
+
+```ts
+type Job = { id: string; payload: any; attempts: number; max_attempts: number };
+
+/** Take the oldest runnable job, skipping any another worker has locked. */
+async function claim(db: pg.Pool, queue: string, leaseSeconds = 300): Promise<Job | null> {
+  const { rows } = await db.query(
+    `UPDATE jobs
+        SET status = 'running', attempts = attempts + 1,
+            locked_until = now() + make_interval(secs => $2)
+      WHERE id = (
+        SELECT id FROM jobs
+         WHERE queue = $1 AND run_at <= now()
+           AND (status = 'ready' OR (status = 'running' AND locked_until < now()))
+         ORDER BY run_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT 1)
+      RETURNING id, payload, attempts, max_attempts`,
+    [queue, leaseSeconds],
+  );
+  return rows[0] ?? null;
+}
+
+async function complete(db: pg.Pool, job: Job) {
+  await db.query("DELETE FROM jobs WHERE id = $1 AND attempts = $2", [job.id, job.attempts]);
+}
+
+async function fail(db: pg.Pool, job: Job, err: Error) {
+  // Retry later with exponential backoff (2 s, 4 s, 8 s …, capped at an hour); give up after max_attempts.
+  await db.query(
+    `UPDATE jobs
+        SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'ready' END,
+            run_at = now() + make_interval(secs => least(power(2, attempts), 3600)),
+            locked_until = NULL, last_error = $3
+      WHERE id = $1 AND attempts = $2`,
+    [job.id, job.attempts, err.message],
+  );
+}
+
+export async function work(db: pg.Pool, queue: string, handle: (payload: any) => Promise<void>) {
+  for (;;) {
+    const job = await claim(db, queue);
+    if (!job) {
+      await new Promise((r) => setTimeout(r, 1000)); // nothing to do: poll again in a second
+      continue;
+    }
+    try {
+      await handle(job.payload);
+      await complete(db, job);
+    } catch (err) {
+      await fail(db, job, err as Error);
+    }
+  }
+}
+```
+
+A few details carry most of the reliability:
+
+- **Claiming is its own short transaction.** The job is marked `running` and the transaction commits at once; the
+  work itself happens outside any transaction. Holding a transaction open during a five-second preview fetch would
+  hold locks and a database connection for five seconds per job.
+- **The lease.** `locked_until` is the queue's version of SQS's visibility timeout (<L id="07.02" />). If a worker
+  dies mid-job, nobody completes or fails it, and once the lease passes the claim query picks it up again.
+- **The `attempts` guard.** `complete` and `fail` only touch the row if `attempts` still matches. A worker that was
+  presumed dead and comes back late can't delete a job that another worker has since claimed.
+- **Backoff and a dead state.** Failures retry after 2, 4, 8 … seconds; after `max_attempts` the job is `dead`, kept
+  with its last error for a person to inspect: the table's own dead-letter queue.
+- **At least once, still.** A job whose lease expires while its worker is merely slow runs twice. Handlers must be
+  safe to repeat (<L id="07.03" />), and the lease should be comfortably longer than the slowest job.
+
+## Tested
+
+Run against PostgreSQL 16 with 8 workers in parallel:
+
+| Test | Result |
+| --- | --- |
+| 2,000 jobs, 8 workers | Each job ran exactly once; the workers took between 244 and 259 jobs each |
+| Every job fails once | All 50 retried after the 2-second backoff and succeeded |
+| A job that always fails, `max_attempts` 2 | Marked `dead` with its error after the second attempt |
+| A worker claims a job and dies | Other workers couldn't take it while its lease was live; after the lease it was taken (attempt 2), and the dead worker's late `complete` changed nothing |
+| 50,000 waiting jobs | The claim query uses the `jobs_claimable` index |
+
+## Polling, and waking up faster
+
+Idle workers poll once a second, which is cheap with the index but adds up to a second of delay. For faster pickup,
+the enqueuing transaction can run `NOTIFY jobs` and idle workers `LISTEN jobs`, waking immediately; keep the poll as
+a fallback, since notifications aren't stored.
+
+## Where it stops
+
+A Postgres queue is a good default up to thousands of jobs a second. Beyond that, watch for:
+
+- **Table churn.** Every job is inserted, updated and deleted, leaving dead row versions for autovacuum to clean up
+  (<L id="04.05" />). A queue table that vacuum can't keep up with gets slower.
+- **Load on the primary.** Every claim is a write on the database that also serves your product.
+- **Event streams.** 100,000 click events a second, read by several systems, is a job for a log (<L id="07.02" />), not
+  a jobs table.
+
+<Analogy>
+  **A ticket rail in a busy kitchen.** Each order is a ticket. A cook takes the first ticket nobody's holding, writes their name and the time on it, and cooks. If a cook vanishes, anyone can see their ticket has been held far too long and take it over. A burnt dish goes back on the rail for later; a ticket that's failed five times goes to the manager.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Rails"
+    system="Solid Queue"
+    year="Rails 8"
+    href="https://github.com/rails/solid_queue"
+    source="Solid Queue (rails/solid_queue on GitHub)"
+    found="A database-backed queue built on FOR UPDATE SKIP LOCKED is now the default for new Rails applications."
+  >
+    Solid Queue describes itself as "a database-based queuing backend for Active Job". When polling for jobs it uses
+    `FOR UPDATE SKIP LOCKED`, where available, to avoid blocking and waiting on locks, and the README says it was
+    designed for the highest throughput on MySQL 8+, MariaDB 10.6+ and PostgreSQL 9.5+ because they support it. It's
+    configured by default in new Rails 8 applications.
+  </Seen>
+  <Seen
+    company="PostgreSQL"
+    system="SKIP LOCKED"
+    year={2016}
+    href="https://www.postgresql.org/docs/9.5/release-9-5.html"
+    source="PostgreSQL 9.5 release notes"
+    found="The one feature that makes a fast table-based queue possible arrived in 2016."
+  >
+    PostgreSQL 9.5, released on 7 January 2016, added the `SKIP LOCKED` option to `SELECT` "to skip locked rows",
+    noting that unlike `NOWAIT` it doesn't throw an error for locked rows.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A developer wraps claim, the 5-second preview fetch and complete in one transaction, to make it 'atomic'. What goes wrong at 200 jobs a second?"
+  options={[
+    { text: "Nothing: it's safer because a crash rolls the claim back", why: "It is crash-safe, but at a high cost, below." },
+    { text: "Each job holds a row lock and a database connection for 5 seconds, so about 1,000 connections are busy at once", correct: true, why: "200 jobs a second × 5 seconds = 1,000 open transactions. Claim and commit quickly, do the work outside a transaction, and rely on the lease for crashes." },
+    { text: "SKIP LOCKED stops working inside a transaction", why: "It works, and other workers do skip the locked rows. The cost is the long-held connections and locks." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Doing the work inside the claiming transaction.** Long transactions hold locks and connections. Claim, commit, work.</li>
+    <li>**No lease.** A crashed worker's job stays `running` for ever. Give every claim an expiry.</li>
+    <li>**A lease shorter than the slowest job.** The job is taken again while still running. Size leases generously, or extend them as you go.</li>
+    <li>**Enqueuing outside the transaction.** That throws away the main reason to keep jobs in Postgres.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Jobs in Postgres can be enqueued in the same transaction as the data they're about.</li>
+    <li>`FOR UPDATE SKIP LOCKED` lets many workers claim different jobs without waiting on each other.</li>
+    <li>Claim in a short transaction, work outside it, with a lease for crashes, backoff for failures and a dead state.</li>
+    <li>Good up to thousands of jobs a second; watch vacuum and primary load, and use a log for event streams.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you build a job queue on a relational database? What are the pitfalls?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How do you handle a worker that crashes mid-job?", "When would you move to a dedicated queue?"]}
+>
+  <p>A jobs table with a status, a run-at time, attempt counts and a lease expiry, plus a partial index on runnable jobs. Workers claim with an UPDATE whose subquery selects the oldest runnable job with FOR UPDATE SKIP LOCKED LIMIT 1, so concurrent workers take different rows instead of blocking. The claim commits immediately and the work runs outside the transaction. On success the job is deleted; on failure it's rescheduled with exponential backoff, and after a maximum number of attempts it's marked dead for inspection.</p>
+  <p>Crashes are handled by the lease: a running job whose lease has expired becomes claimable again, which makes delivery at least once, so handlers must be idempotent. The big advantage is enqueuing in the same transaction as the business data. The pitfalls are long transactions, table bloat from constant churn, extra write load on the primary and polling latency, which LISTEN/NOTIFY can reduce. Past a few thousand jobs a second, or for streams many systems consume, I'd move to a dedicated queue or a log.</p>
+</InterviewCard>

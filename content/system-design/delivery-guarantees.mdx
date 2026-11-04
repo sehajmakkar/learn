@@ -1,0 +1,204 @@
+export const meta = {
+  summary: "At most once, at least once, exactly once: where duplicates and losses really come from, why 'exactly once' is about effects rather than delivery, and how to write consumers that are safe to run twice.",
+  uses: ["07.02", "02.06", "03.10", "04.04"],
+  usedIn: ["07.04", "07.05", "07.06", "07.08"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.02" /> for <Term t="consumer-offset">offsets</Term> and acknowledgements, and <L id="03.10" /> for idempotency. The fix in this lesson
+  is a database <Term t="transaction">transaction</Term> (<L id="04.04" />).
+</BeforeYouStart>
+
+## The problem: the counts don't add up
+
+Snip's click counter reads click events from the log in batches, adds them to the totals in Postgres, and saves its
+offset. One evening a worker is restarted during a deploy, and an owner notices that a link's click count jumped by
+about 500 more than its traffic graph shows. Nothing was clicked twice. A batch was **counted** twice.
+
+Every messaging system has to answer the same question: if something crashes partway through handling a message, is
+the message tried again (and possibly handled twice), or not (and possibly lost)?
+
+## The three guarantees
+
+Kafka's documentation defines them plainly:
+
+- **At most once**: messages may be lost but are never redelivered.
+- **At least once**: messages are never lost but may be redelivered.
+- **Exactly once**: each message is processed once and only once.
+
+Duplicates come from two places. A **producer** that sends a message and doesn't hear back can't tell whether it
+arrived, so it sends again. And a **consumer** that does its work and then crashes before recording that it's done
+will be handed the same message again. Losses come from the opposite order: recording "done" before doing the work.
+
+## Try it
+
+<Lab
+  id="sd-07-03-delivery"
+  title="Crash the consumer"
+  tasks={[
+    "With 'Count, then save position', step until a batch is counted but its position isn't saved, then crash. What happens to those clicks?",
+    "Switch to 'Save position, then count'. Crash between the two steps. What's the final count?",
+    "Switch to 'Count and position in one transaction' and crash at the same point. Why does the repeat do no harm?",
+    "In each mode, run to the end without crashing. Why do all three give 12?",
+  ]}
+>
+  <DeliveryLab preset={{ strategy: "count-first" }} />
+</Lab>
+
+Without crashes, every order gives the right answer, which is why these bugs survive testing. With a crash between the
+two steps, "save, then count" **loses** a batch, and "count, then save" **counts it twice**. That's at most once and at
+least once. Most systems choose at least once, because a lost click can't be recovered, and then make the duplicate
+harmless.
+
+## "Exactly once" means exactly-once effects
+
+No network can guarantee a message is delivered exactly once: the receiver can always crash just after doing the work
+and just before saying so. What systems can offer is that the **effect** happens once, even when the message is seen
+twice. Two kinds of help exist:
+
+- **Inside the messaging system.** Since version 0.11, Kafka's producer can be idempotent: the broker gives each
+  producer an ID and drops resent messages by sequence number, so producer retries don't create duplicates in the log.
+  Kafka transactions let a consumer read, write its output to other topics and save its offset as one atomic step.
+  That's exactly-once **within Kafka**.
+- **At the edges, in your code.** As soon as the effect is outside the log (a row in Postgres, an email, a charge),
+  the consumer has to make it safe itself. Kafka's documentation suggests the classic approach: store the consumer's
+  position **in the same place as its output**.
+
+## Making consumers safe to repeat
+
+**1. Store the offset with the result.** The click counter keeps its offset in Postgres, next to the counts, and
+updates both in one transaction. A redelivered batch finds its offsets already counted and skips them:
+
+```ts
+type Click = { offset: number; code: string };
+
+export async function applyBatch(db: pg.Pool, partition: number, batch: Click[]) {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      "SELECT next_offset FROM consumer_offsets WHERE consumer = 'click-counter' AND partition = $1 FOR UPDATE",
+      [partition],
+    );
+    const fresh = batch.filter((m) => m.offset >= Number(rows[0].next_offset)); // skip what's already counted
+    if (fresh.length > 0) {
+      const totals = new Map<string, number>();
+      for (const m of fresh) totals.set(m.code, (totals.get(m.code) ?? 0) + 1);
+      for (const [code, n] of totals) {
+        await client.query(
+          `INSERT INTO click_counts (code, clicks) VALUES ($1, $2)
+           ON CONFLICT (code) DO UPDATE SET clicks = click_counts.clicks + $2`,
+          [code, n],
+        );
+      }
+      await client.query("UPDATE consumer_offsets SET next_offset = $2 WHERE consumer = 'click-counter' AND partition = $1", [
+        partition,
+        fresh[fresh.length - 1].offset + 1,
+      ]);
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+Tested against Postgres with the same batch delivered twice, overlapping batches, and three copies of a batch applied
+at once: the counts came out exactly right every time. The `FOR UPDATE` lock on the offset row makes concurrent
+deliveries of one partition wait their turn. On startup, the consumer reads its position from this table, not from the
+broker.
+
+**2. Remember processed message IDs.** For a queue with no offsets, record each message's ID in a table with a unique
+constraint, in the same transaction as the effect: `INSERT INTO processed (message_id) VALUES ($1) ON CONFLICT DO
+NOTHING`. If no row was inserted, it's a repeat; skip it.
+
+**3. Make the operation naturally idempotent.** "Set the link's status to blocked" can run twice harmlessly; "add 1"
+can't (<L id="03.10" />). Where you can, send states, not changes.
+
+**4. Pass an idempotency key to the next system.** An email or payment provider that accepts an
+<Term t="idempotency-key">idempotency key</Term> can drop the repeat for you. Use the event's ID as the key.
+
+Effects with no undo and no key, like a plain SMTP email, can't be made exactly once. Pick which way to fail: a
+duplicate email is usually better than a missing one.
+
+<Analogy>
+  **Paying a bill by bank transfer.** If the banking app freezes after you press "pay", you don't know whether it went through. Paying again risks paying twice; not paying risks paying never. Writing the invoice number in the reference lets the supplier spot and refund a double payment: the payment arrives twice, but the effect happens once.
+</Analogy>
+
+## Messages that always fail
+
+At least once has a nasty corner: a message that crashes the consumer every time is redelivered for ever. Count
+attempts, and after a few failures move the message to a **dead-letter queue** with the error, alert someone, and
+carry on (<L id="07.04" /> covers how this interacts with ordering).
+
+<SeenInProduction>
+  <Seen
+    company="Apache Kafka"
+    system="Delivery semantics"
+    year="Docs"
+    href="https://kafka.apache.org/44/design/design/"
+    source="Kafka documentation: message delivery semantics"
+    found="Where you save the position relative to processing decides between at most once and at least once."
+  >
+    The design documentation walks through the consumer's options. Reading, saving the position and then processing
+    risks a crash after the save but before the output: at most once. Reading, processing and then saving risks a crash
+    after processing but before the save, so a new process receives messages that were already processed: at least
+    once. For writing to an external system, it suggests letting "the consumer store its offset in the same place as
+    its output", rather than a two-phase commit between the two.
+  </Seen>
+  <Seen
+    company="Confluent"
+    system="Kafka exactly-once semantics"
+    year={2017}
+    href="https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/"
+    source="Exactly-once Semantics Are Possible: Here's How Kafka Does It (Neha Narkhede and others)"
+    found="Exactly once is achievable inside Kafka with idempotent producers and transactions, but needs the application's cooperation."
+  >
+    The post announced exactly-once semantics in Kafka 0.11, built from an idempotent producer, which makes retries
+    safe, and transactions. It's explicit that this requires cooperation between the messaging
+    system and the application: Kafka can guarantee what happens within Kafka, and effects in other systems still need
+    to be made idempotent or written atomically with the offset.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's webhook worker reads link.created events, POSTs to the owner's server, then acknowledges. The owner reports occasional duplicate webhooks. What's the right fix?"
+  options={[
+    { text: "Acknowledge before sending the webhook", why: "Then a crash after the ack and before the POST loses the webhook entirely: at most once." },
+    { text: "Include the event's ID in each webhook and tell owners to ignore IDs they've already seen", correct: true, why: "Snip can't make an HTTP call to someone else's server exactly once. Delivering at least once with a stable ID lets the receiver make the effect happen once." },
+    { text: "Turn on Kafka's exactly-once setting", why: "That covers writes within Kafka. An HTTP request to an outside server is outside its reach." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Believing a system delivers exactly once.** Assume duplicates and design the consumer for them.</li>
+    <li>**Acknowledging before the work is durable.** That's at most once: a crash loses the message.</li>
+    <li>**Saving the offset somewhere other than the output.** Two writes can always be split by a crash. Put them in one transaction.</li>
+    <li>**No limit on retries.** A poison message loops for ever. Dead-letter it after a few attempts.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>At most once loses messages on a crash; at least once repeats them. Most systems choose at least once.</li>
+    <li>"Exactly once" really means the effect happens once, even if the message arrives twice.</li>
+    <li>Make consumers safe to repeat: store the offset with the output, record processed IDs, prefer setting state, pass idempotency keys on.</li>
+    <li>Dead-letter messages that keep failing so they don't block the rest.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Explain at-most-once, at-least-once and exactly-once delivery. How do you get exactly-once processing in practice?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Where do duplicates come from?", "How would you make a consumer that sends emails safe to retry?"]}
+>
+  <p>At most once means a message may be lost but never repeated, for example if the consumer commits its position before processing and then crashes. At least once means it's never lost but may be repeated, if the consumer processes and crashes before committing. Exactly once means the effect happens once. Delivery itself can't be exactly once over a network, so in practice you get at-least-once delivery plus idempotent processing.</p>
+  <p>Techniques: store the consumer offset in the same database transaction as the output, so a redelivered batch is recognised and skipped; keep a table of processed message IDs with a unique constraint, written in the same transaction as the effect; design operations to set state rather than increment; and pass the event ID as an idempotency key to downstream services. Within Kafka, idempotent producers and transactions give exactly-once between topics, but anything external still needs these techniques.</p>
+</InterviewCard>

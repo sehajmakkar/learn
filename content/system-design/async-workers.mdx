@@ -78,7 +78,7 @@ is down, was judged worse. A stricter product could choose differently.
 
 - **Results arrive later.** Counts are seconds behind, and a link is checked a moment after it starts working. Only
   move work whose result can wait.
-- **Duplicates.** Most queues guarantee each message is delivered **<Term t="at-least-once">at least once</Term>**, not exactly once. If a worker
+- **Duplicates.** Most queues guarantee each message is delivered **<Term t="at-least-once">at least once</Term>**, not <Term t="exactly-once">exactly once</Term>. If a worker
   adds a batch to the counts and then crashes before telling the queue it's done, the batch is delivered again and
   counted twice. Workers need to be safe to repeat, for example by recording which batches they've applied. That's
   <L id="07.03" />.

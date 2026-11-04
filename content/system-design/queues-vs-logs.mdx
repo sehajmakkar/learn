@@ -1,0 +1,160 @@
+export const meta = {
+  summary: "Two kinds of messaging that look alike and behave differently. A queue hands each message to one worker and forgets it; a log keeps every event in order so any number of readers can go through it at their own pace.",
+  uses: ["07.01", "02.06", "04.06"],
+  usedIn: ["07.03", "07.04", "07.06", "07.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.01" /> for jobs versus events. A log here is the same idea as the database's write-ahead log in
+  <L id="04.06" />, used as a product.
+</BeforeYouStart>
+
+## The problem: one stream of clicks, many readers
+
+Snip's click events started with one reader: the worker that adds them up (<L id="02.06" />). Now three more teams
+want them. Fraud detection wants to spot bots clicking a link thousands of times. Analytics wants every click in its
+data warehouse. And the paid plan wants to stream each owner's clicks to their own systems.
+
+With a classic queue, a click message goes to **one** worker and is deleted once handled. Four readers would need four
+copies of every message, and a new reader next year would get nothing from the past. Snip needs a different shape of
+messaging for this. There are two, and choosing between them is one of the most common design decisions in this area.
+
+## A queue: each message to one worker, then gone
+
+A **message queue** (Amazon SQS, RabbitMQ, the Postgres queue in <L id="07.05" />) holds messages until a worker
+takes one, does the work and **acknowledges** it, after which the message is deleted.
+
+- **Workers compete.** Ten workers share one queue, and each message goes to one of them. To go faster, add workers.
+- **Acknowledged one by one.** If a worker dies holding a message, it comes back for another worker: in SQS when its
+  **visibility timeout** runs out (30 seconds by default, up to 12 hours), in RabbitMQ when the worker's connection
+  closes without an ack.
+- **No history.** Once acknowledged, it's gone. A worker added tomorrow sees only tomorrow's messages.
+- **Order is loose.** SQS standard queues make "a best-effort attempt" at order, and retried messages come back late.
+
+That's exactly right for **jobs**: "fetch the preview for x7Kp" should be done once, by someone, and then forgotten.
+
+## A log: every event kept, in order, for every reader
+
+A **log** (Apache Kafka, Amazon Kinesis, Redpanda) is an append-only sequence of events. Producers add to the end.
+Nothing is removed when it's read: in Kafka's words, "events are not deleted after consumption", and instead each topic
+keeps events for a configured time (say, 7 days) or size.
+
+- **Readers track their own position.** Each reader remembers an **offset**: "I've processed everything up to event
+  18,422,001". Reading is cheap and doesn't change the log.
+- **Many independent readers.** The click counter, fraud detection and the warehouse loader each have their own
+  offset and go at their own pace. A new reader can start from the beginning of what's retained.
+- **Replay.** Found a bug in the click counter? Fix it, reset its offset to yesterday, and recount.
+- **Ordered, per partition.** A topic is split into partitions for scale, and order is kept within each one
+  (<L id="07.04" />).
+
+That's right for **events**: "x7Kp was clicked from Germany at 14:02:11" is a fact that several readers will each use
+differently.
+
+<Arch
+  title="Snip uses both"
+  nodes={[
+    { id: "app", label: "Snip app", kind: "service", x: 0, y: 1 },
+    { id: "log", label: "clicks topic", kind: "queue", sub: "log, 7 days", x: 1.2, y: 0.5 },
+    { id: "count", label: "Click counter", kind: "worker", sub: "own offset", x: 2.4, y: 0 },
+    { id: "fraud", label: "Fraud detection", kind: "worker", sub: "own offset", x: 2.4, y: 1 },
+    { id: "jobs", label: "Job queue", kind: "queue", sub: "previews, mail", x: 1.2, y: 1.7 },
+    { id: "w", label: "Job workers", kind: "worker", sub: "compete", x: 2.4, y: 2 },
+  ]}
+  edges={[
+    { from: "app", to: "log", label: "click" },
+    { from: "log", to: "count" },
+    { from: "log", to: "fraud" },
+    { from: "app", to: "jobs", label: "job" },
+    { from: "jobs", to: "w" },
+  ]}
+  steps={[
+    { caption: "Every redirect appends a click event to the clicks topic, a log kept for seven days.", edges: ["app>log"] },
+    { caption: "The click counter and fraud detection each read every event, each tracking its own offset. Adding the warehouse loader later doesn't affect them.", edges: ["log>count", "log>fraud"] },
+    { caption: "Work that should happen once, like fetching a preview or sending an email, goes on a job queue instead.", edges: ["app>jobs"] },
+    { caption: "Job workers compete for messages; each job is done by one of them and then deleted.", edges: ["jobs>w"] },
+  ]}
+/>
+
+## Side by side
+
+| | Queue (SQS, RabbitMQ) | Log (Kafka, Kinesis) |
+| --- | --- | --- |
+| **After reading** | Deleted once acknowledged | Kept until retention expires |
+| **Readers** | Compete: each message to one worker | Independent groups each see every event |
+| **Progress** | Per message (ack) | Per partition (one offset) |
+| **Replay** | No | Yes, within retention |
+| **Order** | Loose | Strict within a partition |
+| **One slow message** | Others carry on around it | Holds up its partition until handled or skipped |
+| **Scaling readers** | Add workers freely | Up to one active reader per partition, per group |
+| **Best for** | Jobs, tasks, commands | Events, streams, feeding many systems |
+
+The "one slow message" row is the trade-off people miss. Because a log reader's progress is a single number per
+partition, it can't move past an event it hasn't handled, so one bad message can stall everything behind it.
+<L id="07.04" /> covers how to deal with that.
+
+<Analogy>
+  **A to-do list versus a diary.** Items on a shared to-do list are claimed by one person, done, and crossed off; nobody needs them again. A diary is written once and kept; anyone can read it from any page, and each reader keeps their own bookmark. Use the list for tasks and the diary for what happened.
+</Analogy>
+
+## Choosing
+
+- One consumer per message, work to be done, no need for history: **a queue**.
+- Several consumers, or a likely future one, or the need to replay or reprocess: **a log**.
+- Very high event rates (Snip's 100,000 clicks a second): **a log**, because appending sequentially and tracking one
+  offset per partition is far cheaper than acknowledging each message.
+
+Many systems use a log as the backbone and queues at the edges: a consumer reads events from the log and turns the
+ones that need work into jobs.
+
+<SeenInProduction>
+  <Seen
+    company="LinkedIn"
+    system="Apache Kafka"
+    year={2019}
+    href="https://www.linkedin.com/blog/engineering/open-source/apache-kafka-trillion-messages"
+    source="How LinkedIn customizes Apache Kafka for 7 trillion messages per day"
+    found="A log built for many readers became the backbone for a whole company's events."
+  >
+    By 2019, LinkedIn ran over 100 Kafka clusters with more than 4,000 brokers, serving more than 100,000 topics and 7
+    million partitions, and the total number of messages its Kafka deployments handled had passed 7 trillion a day.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip adds a fourth reader of click events, a warehouse loader, and wants it to load the last three days of clicks first. Which design makes that possible?"
+  options={[
+    { text: "A queue with four copies of each message", why: "New copies only start from now; clicks from the past three days were already deleted." },
+    { text: "A log that keeps events for seven days; the new reader starts from an offset three days back", correct: true, why: "A log keeps events after they're read, and each reader has its own offset, so a new reader can begin anywhere within retention without affecting the others." },
+    { text: "A queue with a longer visibility timeout", why: "The visibility timeout controls redelivery of unacknowledged messages, not history." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Using a queue when several systems need the same events.** You'll end up copying messages to many queues and losing history.</li>
+    <li>**Using a log for slow, independent jobs.** One slow job holds up its whole partition; a queue lets the others carry on.</li>
+    <li>**Treating a log as permanent storage by accident.** Retention deletes old events; decide how long you need them.</li>
+    <li>**Forgetting that acknowledging is part of correctness.** When and how you ack decides whether you lose or repeat work (<L id="07.03" />).</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A queue gives each message to one worker and deletes it once acknowledged: right for jobs.</li>
+    <li>A log keeps events in order after they're read; each reader tracks its own offset and can replay: right for events.</li>
+    <li>Queues let one slow message be skipped around; logs keep order but a bad event can stall its partition.</li>
+    <li>Big systems often use a log as the backbone and turn events into jobs at the edges.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between a message queue like SQS and a log like Kafka? When would you use each?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How does a consumer recover after a crash in each?", "Why can't you add unlimited consumers to a Kafka topic?"]}
+>
+  <p>A queue delivers each message to one of the competing consumers and deletes it when acknowledged; if a consumer dies, the message becomes visible again after a timeout. There's no history and ordering is loose, which suits jobs: work to be done once. A log like Kafka appends events to partitions and keeps them for a retention period regardless of reads. Each consumer group tracks an offset per partition, so many independent consumers can read the same events, new ones can start from the past, and you can replay after a bug. Order is guaranteed within a partition.</p>
+  <p>I'd use a queue for tasks like sending emails or resizing images, and a log for event streams that several systems consume, like clicks, orders or change events. The trade-offs: a log's consumer parallelism is capped by partitions and one bad event can block a partition, while a queue can't replay or fan out to new consumers.</p>
+</InterviewCard>

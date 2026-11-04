@@ -20,6 +20,7 @@ import { TailLatencyLab } from "@/components/labs/tail-latency";
 import { BTreeLab } from "@/components/labs/btree";
 import { HashRingLab } from "@/components/labs/hash-ring";
 import { EvictionLab } from "@/components/labs/eviction";
+import { DeliveryLab } from "@/components/labs/delivery";
 
 /** Fenced code blocks (```ts … ```) get the same highlighted, scrollable frame as <Code>. */
 function Pre({ children }: { children?: ReactNode }) {
@@ -64,6 +65,7 @@ const components: MDXComponents = {
   BTreeLab,
   HashRingLab,
   EvictionLab,
+  DeliveryLab,
 };
 
 export function useMDXComponents(): MDXComponents {

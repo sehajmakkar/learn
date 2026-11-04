@@ -1,0 +1,196 @@
+export const meta = {
+  summary: "Changing the database and publishing an event can't be made atomic across two systems. The outbox pattern writes the event into the database in the same transaction; a relay or change data capture publishes it afterwards. Tested code and the trade-offs.",
+  uses: ["07.05", "07.03", "04.06", "04.04", "04.07"],
+  usedIn: ["07.08", "07.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.05" />: this is the same trick, used for events. Change data capture reads the write-ahead log from
+  <L id="04.06" />, through the replication machinery of <L id="04.07" />.
+</BeforeYouStart>
+
+## The problem: the dual write
+
+Snip publishes a `link.created` event to Kafka for the preview, webhook and search services (<L id="07.01" />). The
+obvious code writes to two systems in a row:
+
+<Sequence
+  title="Two writes, and a crash between them"
+  walk
+  participants={[{ id: "app", label: "Snip app" }, { id: "pg", label: "Postgres" }, { id: "k", label: "Kafka" }]}
+  messages={[
+    { from: "app", to: "pg", label: "INSERT x7Kp; COMMIT", explain: "The link is saved." },
+    { from: "app", to: "k", label: "publish link.created", fail: true, explain: "The app is killed by a deploy, or Kafka times out. The event is never published." },
+    { note: "x7Kp exists, but no preview, no webhook, no search entry, ever", over: ["pg", "k"] },
+  ]}
+/>
+
+Reversing the order is no better: publish first, and if the insert then fails, every service reacts to a link that
+doesn't exist. Retrying helps with timeouts but not with a process that died. This is the **dual write problem**:
+there's no transaction that spans Postgres and Kafka, so any code that writes to both can leave them disagreeing.
+
+## The outbox
+
+The fix is to make it a single write. Alongside its normal tables, the database gets an **outbox** table, and the
+event is inserted into it **in the same transaction** as the change:
+
+```sql
+CREATE TABLE outbox (
+  id           bigserial   PRIMARY KEY,
+  topic        text        NOT NULL,
+  key          text        NOT NULL,
+  payload      jsonb       NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz
+);
+CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
+
+BEGIN;
+INSERT INTO links (code, long_url, owner_id) VALUES ('x7Kp', 'https://shop.example/spring', 4821);
+INSERT INTO outbox (topic, key, payload)
+  VALUES ('link-events', 'x7Kp', '{"type": "link.created", "code": "x7Kp", "owner": 4821}');
+COMMIT;
+```
+
+Either both rows commit or neither does. Then a separate **relay** copies committed outbox rows to Kafka. The
+microservices.io description of the pattern is honest about the catch: the relay "might publish a message more than
+once".
+
+## Relay 1: polling the table
+
+```ts
+export async function relayOnce(db: pg.Pool, publish: (topic: string, key: string, event: object) => Promise<void>) {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT id, topic, key, payload FROM outbox
+        WHERE published_at IS NULL
+        ORDER BY id LIMIT 100
+        FOR UPDATE SKIP LOCKED`,
+    );
+    for (const r of rows) await publish(r.topic, r.key, { ...r.payload, eventId: r.id }); // may repeat after a crash
+    await client.query("UPDATE outbox SET published_at = now() WHERE id = ANY($1)", [rows.map((r) => r.id)]);
+    await client.query("COMMIT");
+    return rows.length;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+Tested against Postgres with 250 links:
+
+- A transaction that inserted a link and its outbox row, then rolled back, left **neither**.
+- A relay that crashed partway through a batch of 100 republished that batch after restarting: 300 sends, **250
+  distinct events**. Every event arrived; some arrived twice.
+- Three relays running at once, without crashes, published each of the 250 events once, thanks to `SKIP LOCKED`.
+
+So consumers must deduplicate, using the `eventId` the relay adds (<L id="07.03" />). Mark old rows published and
+delete them after a few days, or the table grows for ever.
+
+**The ordering catch.** `bigserial` IDs are handed out when rows are inserted, but transactions commit in their own
+order. Transaction A takes ID 10, transaction B takes ID 11 and commits first; a relay polling at that moment sees 11
+but not 10, publishes 11, and publishes 10 on its next pass. For one key this is rare, since Snip's writes to one link
+are seconds apart, but consumers that care should compare a version number on the entity rather than trust arrival
+order.
+
+## Relay 2: change data capture
+
+Postgres already writes every committed change, in commit order, to its write-ahead log (<L id="04.06" />), and
+**logical decoding** can stream those changes out as rows. **Change data capture** (CDC) tools such as Debezium
+connect like a replica, through a replication slot, and turn each committed change into an event. Point one at the
+outbox table and it publishes every new outbox row, in commit order, without any polling. Debezium ships an "outbox
+event router" for exactly this.
+
+| | Polling relay | CDC (log-based) |
+| --- | --- | --- |
+| **Latency** | The poll interval | Close to real time |
+| **Load on the database** | A query every poll | Reads the log stream; no queries on the table |
+| **Order** | By ID, with the commit-order catch | Commit order |
+| **Running it** | A small loop in your app | A connector service and a replication slot to monitor |
+| **Duplicates** | After a relay crash | After a connector restart |
+
+CDC can also capture changes to ordinary tables, with no outbox at all. That's how the cache invalidator in
+<L id="06.04" /> learns about every edit, whoever made it. The outbox is still better for events other services
+depend on: it publishes a deliberate, stable event shape, not your internal table layout, which you'll want to change.
+
+A replication slot keeps the WAL until the connector has read it. If the connector stops for a day, the WAL piles up
+on the primary's disk. Monitor slot lag the way you'd monitor replica lag.
+
+<Analogy>
+  **The post tray on a desk.** You don't run to the post box halfway through writing a letter. You finish the paperwork, and put the letter in the out-tray as part of the same job. Someone empties the tray regularly. If they're interrupted they might post a letter twice, but a letter you've written never goes missing.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="microservices.io"
+    system="Transactional outbox"
+    year="Pattern"
+    href="https://microservices.io/patterns/data/transactional-outbox.html"
+    source="Pattern: Transactional outbox (Chris Richardson)"
+    found="Store the message in the database as part of the business transaction; a separate process sends it."
+  >
+    The pattern states the problem as how to atomically update the database and send messages to a message broker,
+    and the solution as storing the message in the database as part of the transaction that updates the business
+    entities, with a separate message relay sending stored messages to the broker. It notes that the relay might
+    publish a message more than once, so consumers must handle duplicates.
+  </Seen>
+  <Seen
+    company="Debezium"
+    system="Outbox event router and Postgres connector"
+    year="Docs"
+    href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html"
+    source="Outbox Event Router (Debezium documentation)"
+    found="A CDC connector that captures outbox rows and routes each to a topic by aggregate type."
+  >
+    To implement the outbox pattern with Debezium, you configure a connector to capture changes to an outbox table and
+    apply its outbox event router. The expected table has an `id`, which consumers can use to drop duplicates, an
+    `aggregatetype` used to choose the topic, an `aggregateid`, a `type` and a `payload`. Debezium's
+    [PostgreSQL connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html) uses Postgres's
+    logical decoding and the streaming replication protocol, creating its replication slot if it doesn't exist.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's service updates the links table and then publishes to Kafka. To avoid losing events, a developer wraps both in a database transaction: BEGIN; INSERT; publish; COMMIT. Does that fix the dual write?"
+  options={[
+    { text: "Yes: the publish is now inside the transaction", why: "Kafka isn't part of Postgres's transaction. If COMMIT fails after the publish, the event is out and the link isn't." },
+    { text: "No: if the commit fails after publishing, services react to a link that was rolled back. Write the event to an outbox table instead", correct: true, why: "Only writes to the database are covered by its transaction. Putting the event in an outbox row makes it one write; a relay publishes it after the commit." },
+    { text: "Yes, as long as Kafka's exactly-once setting is on", why: "Kafka's transactions cover Kafka, not Postgres. The two still commit separately." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Publishing inside or after the transaction and hoping.** Any two-system write can be split by a crash.</li>
+    <li>**Consumers that assume each event arrives once.** Relays republish after crashes. Deduplicate by event ID.</li>
+    <li>**Never cleaning the outbox.** Delete published rows after a few days.</li>
+    <li>**Forgetting the replication slot.** A stopped CDC connector makes WAL pile up on the primary.</li>
+    <li>**Publishing your table layout.** CDC on internal tables couples consumers to your schema; publish deliberate events.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Writing to the database and a broker in sequence can always be split by a crash: the dual write problem.</li>
+    <li>The outbox makes it one write: the event goes in a table, in the same transaction as the change.</li>
+    <li>A polling relay is simple; CDC streams from the WAL in commit order with less load. Both can republish.</li>
+    <li>Consumers deduplicate by event ID, the outbox is cleaned up, and replication slots are monitored.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you reliably publish an event when you update the database?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What's the difference between polling the outbox and using CDC?", "How do consumers handle duplicates?"]}
+>
+  <p>The naive approach writes to the database and then to the broker, but a crash or failure between them leaves the two out of sync, and there's no transaction spanning both. The transactional outbox fixes this: in the same database transaction as the business change, insert the event into an outbox table. A relay then reads committed outbox rows and publishes them, marking them as sent.</p>
+  <p>The relay can poll the table, which is simple but adds latency and has ordering subtleties because IDs aren't assigned in commit order, or use change data capture, such as Debezium reading the write-ahead log through logical decoding, which gives commit order and low latency. Either way delivery is at least once, so each event carries a unique ID and consumers deduplicate on it. I'd also clean up old outbox rows and monitor the replication slot if using CDC.</p>
+</InterviewCard>

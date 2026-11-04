@@ -1,0 +1,182 @@
+export const meta = {
+  summary: "One thing happens and many must hear about it: several services, thousands of followers' feeds, or every screen watching a link. Pub/sub, fan-out on write versus on read, and pushing to live connections, with what each costs.",
+  uses: ["07.02", "07.04", "03.05", "04.12", "05.02"],
+  usedIn: ["12.03", "12.08", "15.07", "15.08"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.02" />. Live updates use WebSockets from <L id="03.05" />, and fan-out on write is the denormalisation of
+  <L id="04.12" /> done by workers.
+</BeforeYouStart>
+
+## The problem: one event, many receivers
+
+Three new Snip features all start from one event and end at many places:
+
+- **Several services** must react to `link.created`: previews, webhooks, search (<L id="07.01" />).
+- **Team feeds.** On the team plan, each member's dashboard shows "recent links from your team". A team can have 5
+  members or, for one large customer, 40,000.
+- **Live counters.** An agency's dashboard shows a link's clicks ticking up in real time. During a launch, 2,000 people
+  watch the same viral link while it gets 50,000 clicks a second.
+
+Each is a kind of **fan-out**: one input becoming many outputs. They need different tools.
+
+## 1. Many services: publish once, subscribe many
+
+Don't make the link service call each interested service; it would need to know them all, and a slow one would slow it
+down. Publish one event and let each service subscribe.
+
+- **With a log** (<L id="07.02" />), each service is its own consumer group on the `link-events` topic, reading every
+  event at its own pace.
+- **With queues**, a topic copies each message into one queue per subscriber. Amazon's version is SNS in front of SQS:
+  publish to an SNS topic, and each subscribed SQS queue receives its own copy, consumed and retried independently.
+
+Either way, adding a fourth service means adding a subscriber, with no change to the publisher, and one service being
+down or slow doesn't hold back the others: its own queue or offset simply falls behind.
+
+## 2. Many people's feeds: on write or on read
+
+When Ana creates a link, how does it get into her teammates' "recent team links"?
+
+**Fan-out on write (push).** A worker copies the new link into a feed list for each teammate as soon as it's created.
+Reading a feed is then one quick lookup of a precomputed list, the <Term t="denormalisation">denormalised</Term> shape
+of <L id="04.12" />.
+
+**Fan-out on read (pull).** Store nothing extra. When someone opens their dashboard, query "the newest links from
+everyone on my team" and merge them.
+
+| | On write | On read |
+| --- | --- | --- |
+| **Cost of creating a link** | One write per team member | One write |
+| **Cost of opening the feed** | One lookup | A query across every teammate's links |
+| **Good when** | Feeds are read far more often than written; groups are small or medium | Groups are huge, or most feeds are rarely read |
+| **Breaks when** | One author has a huge audience: 40,000 writes per link | Reads are frequent and the merge is expensive |
+
+The usual answer is **hybrid**: push to most teams, but for the few huge ones, don't fan out; merge their recent
+links in at read time. It's the same "celebrity" special case as hot keys (<L id="05.02" />), and it's how large
+social feeds are built (<L id="12.03" />).
+
+## 3. Many live screens: aggregate, then push
+
+The live counter is fan-out to **connections**: 2,000 browsers hold <Term t="websocket">WebSocket</Term> connections
+(<L id="03.05" />), spread over many gateway servers, all subscribed to `x7Kp`.
+
+Pushing every click to every screen would be 50,000 × 2,000 = 100 million messages a second, for a number no human
+can read that fast. So Snip **aggregates first**: one process per link sums its clicks for a second and publishes a
+single `x7Kp: 1,204,331` update. Then it fans out in two levels:
+
+1. The update goes to each **gateway server** that has at least one subscriber to `x7Kp`: perhaps 20 servers.
+2. Each gateway sends it down each of its own subscribed connections.
+
+That's 20 messages between servers and 2,000 to browsers, once a second. Two rules keep it healthy:
+
+- **Each receiver gets its own buffer.** A browser on a slow phone network mustn't slow the others. Give each
+  connection a small outgoing buffer, and if it fills, drop the old updates, since only the latest count matters.
+- **Coalesce updates.** If three updates are waiting for one slow connection, send only the newest. Numbers that
+  replace each other don't need to arrive one by one.
+
+<Analogy>
+  **A company announcement.** The CEO doesn't phone 40,000 staff. The announcement goes to each office manager, who tells their own floor (two levels of fan-out). For a small team, the manager might print a copy for each desk (fan-out on write); for the whole company, it's pinned to the noticeboard for people to read when they look (fan-out on read).
+</Analogy>
+
+## Snip at the end of Module 07
+
+<Arch
+  title="Snip's background work"
+  nodes={[
+    { id: "app", label: "Snip app", kind: "service", x: 0, y: 1 },
+    { id: "pg", label: "Postgres", kind: "db", sub: "outbox + jobs", x: 1.2, y: 2 },
+    { id: "clicks", label: "clicks topic", kind: "queue", sub: "32 partitions", x: 1.2, y: 0 },
+    { id: "events", label: "link-events", kind: "queue", sub: "via the outbox", x: 2.4, y: 2 },
+    { id: "count", label: "Click counter", kind: "worker", sub: "offset in Postgres", x: 2.4, y: 0 },
+    { id: "live", label: "Live counts", kind: "service", sub: "1 update/s", x: 3.6, y: 0 },
+    { id: "w", label: "Job workers", kind: "worker", sub: "SKIP LOCKED", x: 3.6, y: 2 },
+  ]}
+  edges={[
+    { from: "app", to: "clicks", label: "click" },
+    { from: "app", to: "pg", label: "link + event" },
+    { from: "clicks", to: "count" },
+    { from: "count", to: "live", label: "per second" },
+    { from: "pg", to: "events", label: "relay" },
+    { from: "events", to: "w", label: "jobs" },
+  ]}
+  steps={[
+    { caption: "Every redirect appends a click event to the clicks topic, keyed by code across 32 partitions (07.02, 07.04).", edges: ["app>clicks"] },
+    { caption: "The click counter applies batches and stores its offset in the same Postgres transaction as the counts, so redelivered batches are skipped (07.03).", edges: ["clicks>count"] },
+    { caption: "Per-second totals fan out to gateway servers and on to every dashboard watching the link (07.09).", edges: ["count>live"] },
+    { caption: "Creating a link writes the link and a link.created event to the outbox in one transaction (07.06).", edges: ["app>pg"] },
+    { caption: "A relay publishes outbox events; services subscribe and turn them into jobs: previews, QR codes, webhooks with retries and backoff, scheduled reports (07.05, 07.07). Custom domains run as an orchestrated saga (07.08).", edges: ["pg>events", "events>w"] },
+  ]}
+/>
+
+Nothing a user waits for now depends on a slow or outside system, every event is published exactly when its data
+commits, and every consumer is safe to run twice. Module 08 turns to what all of this has been quietly relying on:
+machines and networks that fail in partial, confusing ways (<L id="08.01" />).
+
+<SeenInProduction>
+  <Seen
+    company="Slack"
+    system="Real-time messaging"
+    year={2023}
+    href="https://slack.engineering/real-time-messaging/"
+    source="Real-time Messaging (Slack Engineering)"
+    found="Two-level fan-out: a server per channel sends each message to every gateway with subscribers, and each gateway to its own connections."
+  >
+    Slack's channel servers each own a subset of channels, assigned by consistent hashing. Clients connect to gateway
+    servers, which hold their WebSocket subscriptions. When a channel server receives a message, it sends it to every
+    gateway server across the world that is subscribed to that channel, and each gateway sends it to every connected
+    client subscribed to that channel. Slack says the system serves tens of millions of connected clients and delivers
+    messages across the world in 500 ms.
+  </Seen>
+  <Seen
+    company="Amazon"
+    system="SNS to SQS fan-out"
+    year="Docs"
+    href="https://docs.aws.amazon.com/sns/latest/dg/sns-sqs-as-subscriber.html"
+    source="Fanout Amazon SNS notifications to Amazon SQS queues for asynchronous processing"
+    found="Publish once to a topic; each subscribed queue gets its own copy to process at its own pace."
+  >
+    When an SQS queue is subscribed to an SNS topic, every message published to the topic is sent to the queue. With
+    several queues subscribed, one publish reaches each of them, and each service consumes and retries from its own
+    queue independently of the others.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's team feed uses fan-out on write. A 40,000-member customer's bot creates 100 links a minute. What happens, and what's the fix?"
+  options={[
+    { text: "Nothing special: each link is one write", why: "With fan-out on write, each link is copied into 40,000 feeds: 4 million feed writes a minute from one bot." },
+    { text: "4 million feed writes a minute; don't fan out for very large teams, and merge their links at read time instead", correct: true, why: "A hybrid keeps push for normal teams, where it makes reads cheap, and switches to pull for the rare huge audience, where pushing costs far more than it saves." },
+    { text: "Add more partitions to the link-events topic", why: "That spreads the events, but every one still turns into 40,000 writes." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Calling each interested service directly.** Publish once and let them subscribe, so they're decoupled and independent.</li>
+    <li>**Fan-out on write for every audience size.** The largest audiences make it explode. Go hybrid.</li>
+    <li>**Pushing raw events to screens.** Aggregate first; people can't read 50,000 updates a second.</li>
+    <li>**One shared buffer for all receivers.** A slow receiver then slows everyone. Buffer per receiver, and drop stale updates.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>To many services: publish once, one subscription (consumer group or queue) per service.</li>
+    <li>To many feeds: push on write for normal audiences, pull on read for huge ones.</li>
+    <li>To many screens: aggregate, then fan out in two levels (servers, then connections).</li>
+    <li>Give each receiver its own buffer, and coalesce updates that replace each other.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Fan-out on write or fan-out on read for a news feed? How do you handle users with millions of followers?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How would you push new posts to users who are online right now?", "What happens when a follower's feed cache is cold?"]}
+>
+  <p>Fan-out on write copies each new post into every follower's precomputed feed when it's created, so reading a feed is a cheap lookup, at the cost of many writes per post. Fan-out on read stores the post once and builds the feed at read time by querying the people a user follows and merging, which makes writes cheap and reads expensive. Feeds are read far more than posts are written, so push is usually the default.</p>
+  <p>Accounts with millions of followers would turn one post into millions of writes, so I'd use a hybrid: push for normal accounts, and for the few very large ones, skip fan-out and merge their recent posts into the feed at read time. For users currently online, a separate real-time path pushes a notification through the gateway servers holding their WebSocket connections, with per-connection buffers so slow clients don't hold anyone up.</p>
+</InterviewCard>

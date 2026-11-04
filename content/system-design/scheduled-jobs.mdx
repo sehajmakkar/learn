@@ -1,0 +1,163 @@
+export const meta = {
+  summary: "Work that should happen later or on a timetable: 'retry in ten minutes', 'expire this link on Friday', 'send the report every Monday'. How to store future work, run a schedule on many servers without running it many times, and what to do about missed runs and time zones.",
+  uses: ["07.05", "07.03", "05.06"],
+  usedIn: ["07.08", "15.11"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.05" />: its `run_at` column already does most of the work. Duplicates come from <L id="07.03" />, and
+  clocks from <L id="05.06" />.
+</BeforeYouStart>
+
+## The problem: three kinds of "later"
+
+Snip's paid plan has features that happen at a time rather than in response to a request:
+
+| Kind | Snip example | Shape |
+| --- | --- | --- |
+| **Delay** | Retry a failed webhook in 10 minutes | One job, a short time from now |
+| **At a time** | A campaign link expires on Friday at 18:00 | One job, possibly months away |
+| **Recurring** | Email each owner a weekly report on Monday at 09:00, their time | A schedule that creates jobs |
+
+The first instinct, a cron job on one server, works until that server is replaced, or there are two of them.
+
+## Delays and one-off times: store them as data
+
+The Postgres queue from <L id="07.05" /> already supports this: a job with `run_at` in the future isn't claimed until
+then, and the partial index keeps such jobs cheap to skip.
+
+```sql
+-- Retry the webhook in 10 minutes
+INSERT INTO jobs (queue, payload, run_at)
+VALUES ('webhooks', '{"code": "x7Kp", "event": "link.created"}', now() + interval '10 minutes');
+```
+
+Hosted queues have limits here. Amazon SQS can delay a message by at most **15 minutes**, either for the whole queue
+or per message, and suggests EventBridge Scheduler for anything longer. So a job that should run in three days needs
+a store that can hold future work, such as a database table, a scheduler service, or a sorted set in Redis scored by
+run time.
+
+**Don't make correctness depend on the job.** Snip's link expiry looks like a scheduled job ("on Friday at 18:00,
+disable x7Kp"), but jobs run late, and a late expiry job would let a dead campaign link work for an hour. So the
+redirect itself checks `expires_at` on every request, using the copy in the cache. The scheduled job only tidies up:
+removing the link from the cache, notifying the owner. A job that's late now costs a little tidiness, not
+correctness.
+
+## Recurring schedules on many servers
+
+The weekly report should run once a week. Snip runs its scheduler code on all three worker servers, for resilience,
+and each one wakes up on Monday at 09:00 and enqueues the report job. Now there are three reports.
+
+Options:
+
+- **One designated scheduler**, with a leader election so another takes over if it dies. Works, but leader election
+  is its own topic (<L id="08.07" />).
+- **Let every scheduler try, and let the database pick one.** Each schedule slot is a row with a primary key on
+  (name, time). Every instance tries to insert it; exactly one succeeds and enqueues the job, in the same transaction:
+
+```ts
+export async function tick(db: pg.Pool, name: string, slot: Date, payload: object) {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const won = await client.query(
+      "INSERT INTO scheduled_runs (name, slot) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING name",
+      [name, slot],
+    );
+    if (won.rowCount === 1) {
+      await client.query("INSERT INTO jobs (queue, payload) VALUES ($1, $2)", [name, payload]);
+    }
+    await client.query("COMMIT");
+    return won.rowCount === 1;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+Tested with five scheduler instances ticking for the same slot at once: exactly one won, and exactly one job was
+queued. Because the slot is a fixed time (Monday 09:00), not "now", instances whose clocks differ by a few seconds
+still compete for the same row.
+
+## Missed runs
+
+If every scheduler is down from Sunday night to Tuesday, Monday's report slot passes. When they come back, should it
+run? Decide per schedule:
+
+- **Catch up**: run the missed slot now. Right for billing, cleanup and anything that must happen for each period.
+- **Skip**: only run the next one. Right for "send the current dashboard snapshot", where a late copy is useless.
+- **Catch up, but only the latest**: if ten slots were missed, run one, not ten.
+
+Recording slots in a table, as above, makes this easy: on startup, look for slots between the last recorded one and
+now.
+
+## Time zones
+
+"Monday at 09:00" means 09:00 in the owner's time zone, and that moves against UTC when clocks change for daylight
+saving. Store the schedule as a local time plus a named zone (`Europe/London`), not as a fixed UTC offset, and work out
+each next run in that zone. In zones that change their clocks, some local times happen twice a year and some don't
+happen at all, so don't schedule at 01:30 or 02:30 local time.
+
+<Analogy>
+  **A hotel's wake-up calls.** Requests are written in a book by room and time, not memorised by one receptionist. Whoever's on shift checks the book and makes the calls due; ticking each call off stops a second receptionist making it again. And if the book says 07:00, it means 07:00 in the hotel's time, whatever the guest's phone thinks.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Dropbox"
+    system="Async Task Framework (ATF)"
+    year={2020}
+    href="https://dropbox.tech/infrastructure/asynchronous-task-scheduling-at-dropbox"
+    source="How we designed Dropbox ATF: an async task framework"
+    found="Store scheduled tasks durably, poll for the ones that are due, and guarantee at least once."
+  >
+    Dropbox's ATF lets engineers schedule tasks to run asynchronously. Tasks are kept in a task store; a
+    store consumer periodically polls it for tasks that are ready and pushes them onto queues for execution, with
+    timeouts for tasks that aren't claimed or stop sending heartbeats, and exponential backoff for retriable failures.
+    The system guarantees a task runs at least once after being scheduled. At the time of writing it served about
+    9,000 scheduled tasks a second for 28 engineering teams, and it supported only one-time tasks, with recurring
+    tasks listed as a future extension.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's link expiry relies only on a scheduled job that disables each link at its expires_at. The job queue falls 40 minutes behind during a busy afternoon. What do users see, and what's the better design?"
+  options={[
+    { text: "Nothing changes: the job still runs eventually", why: "It runs eventually, but for 40 minutes expired links keep redirecting." },
+    { text: "Expired links work for up to 40 minutes; check expires_at in the redirect itself and use the job only for tidying up", correct: true, why: "Time-based rules should be checked where they matter. Then a late job only delays side effects like cache cleanup and notifications." },
+    { text: "Run the expiry job every second instead", why: "Running it more often doesn't help when the queue itself is behind." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Cron on every server.** Each one runs the job. Use one leader, or let a unique row pick the winner.</li>
+    <li>**Correctness that depends on a job being on time.** Check deadlines where they're enforced; use jobs for side effects.</li>
+    <li>**Storing schedules as UTC offsets.** Daylight saving moves them. Store a local time and a named zone.</li>
+    <li>**No policy for missed runs.** Decide per schedule: catch up, skip, or run once for many.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Delays and one-off times are just jobs with a future run time; hosted queues may cap the delay (SQS: 15 minutes).</li>
+    <li>Enforce deadlines at read time; scheduled jobs handle the side effects.</li>
+    <li>Run recurring schedules on several servers safely by letting a unique (name, slot) row pick one winner.</li>
+    <li>Decide what happens to missed runs, and schedule in named time zones.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a system to run scheduled jobs reliably across many servers.", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How do you stop a job running twice?", "What happens to runs missed during an outage?"]}
+>
+  <p>I'd store schedules and future jobs as data: a schedules table with a cron expression and time zone, and a jobs table with a run-at time. Several scheduler instances compute due slots and try to insert a row keyed by schedule and slot time; a unique constraint means exactly one succeeds and enqueues the job in the same transaction. Workers claim due jobs with SKIP LOCKED, with leases and retries, so execution is at least once and handlers are idempotent.</p>
+  <p>For missed runs, the scheduler compares the last recorded slot with now on startup and applies a per-schedule policy: catch up every slot, run only the latest, or skip. Schedules are stored in local time with a named zone to handle daylight saving. And anything that must happen exactly on time, like an expiry, is also enforced at read time, so a late job only delays side effects.</p>
+</InterviewCard>

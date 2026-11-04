@@ -94,7 +94,7 @@ so a slow failover degrades latency instead of taking the database down.
 ## More than one region
 
 If Snip serves from Virginia and Frankfurt, each region gets **its own cache**, filled from its own database replica,
-because a cache read across an ocean costs more than a local database read. The hard part is invalidation: an edit in
+because a cache read across an ocean costs more than a local database read. The hard part is <Term t="cache-invalidation">invalidation</Term>: an edit in
 Virginia must delete the entry in Frankfurt's cache too, and not before Frankfurt's database replica has the new row,
 or a miss there will refill the old value. Driving deletes from each region's own replication stream solves both: a
 region deletes a key when its database applies the change (<L id="06.04" />).

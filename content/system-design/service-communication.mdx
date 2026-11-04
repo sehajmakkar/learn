@@ -43,7 +43,7 @@ There are two basic ways for one service to involve another:
 - **Synchronous request–response** (HTTP, gRPC): call and wait for the answer. Simple to reason about, and the only
   option when you need the answer to continue. But the caller is now only as available and as fast as everything it
   calls.
-- **Asynchronous messages** (a <Term t="message-queue">queue</Term> or event log, <L id="02.06" />): publish "link x7Kp was deleted" and carry on.
+- **Asynchronous messages** (a <Term t="message-queue">queue</Term> or <Term t="event-log">event log</Term>, <L id="02.06" />): publish "link x7Kp was deleted" and carry on.
   Whoever cares (stats, search, billing) reacts in their own time. The publisher doesn't depend on them being up, at
   the cost of results arriving later.
 

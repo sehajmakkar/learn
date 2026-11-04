@@ -1,0 +1,144 @@
+export const meta = {
+  summary: "What belongs in the request a user waits for, and what can happen after. How to decide, the difference between a job and an event, and what a queue really does to overload: turns it into delay.",
+  uses: ["02.06", "03.11", "03.12", "01.05"],
+  usedIn: ["07.02", "07.05", "07.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.06" />, where Snip first moved click counting onto a queue. This lesson generalises it. It also uses
+  load shedding from <L id="03.11" /> and tail latency from <L id="03.12" />.
+</BeforeYouStart>
+
+## The problem: creating a link got slow
+
+When Snip launched, creating a link was one `INSERT`. Then the paid plan added features, and each one was bolted on
+to the same request. Today, `POST /links` does all of this before it answers:
+
+| Step | Typical time | Fails when |
+| --- | --- | --- |
+| Insert the link | 5 ms | The database is down |
+| Check the URL against the safety service (<L id="02.06" />) | 200 ms, sometimes 2 s | The service is down |
+| Fetch the page's title and image for a preview | 300 ms to 5 s | The site is slow or blocks bots |
+| Render a QR code image and upload it | 80 ms | Object storage is slow |
+| Call the owner's webhook ("a link was created") | Whatever their server takes | Their server is down |
+| Update the search index for the dashboard | 30 ms | The index is being rebuilt |
+
+The p99 for creating a link is now over 5 seconds, and any one of five other systems being down makes it fail. The
+owner wanted a short code. Everything else is something that should happen **because** a link was created, not
+something the owner needs before they can carry on.
+
+## Deciding what stays in the request
+
+Ask of each step: **does the user need its result to continue?**
+
+- **Yes, and it must be correct now** → do it in the request. The insert stays: without it there's no link.
+- **No, but it must eventually happen** → move it to the background, reliably: the preview, the QR code, the index.
+- **No, and it's someone else's system** → definitely background: the webhook. Never let a customer's slow server
+  slow down your <Term t="api">API</Term>.
+- **It decides whether the request is allowed** → think hard. The safety check could block the request, but Snip
+  decided in <L id="02.06" /> that a few seconds of exposure beats making every owner wait.
+
+After the move, `POST /links` does the insert and records that background work is needed, and answers in about 10 ms.
+The work happens a moment later, and the dashboard shows "preview loading" until it's done.
+
+## Jobs and events
+
+There are two ways to describe the background work, and the difference shapes the rest of this module.
+
+- **A job** (a command) says *do this*: "fetch the preview for x7Kp". It has one intended worker, and once it's done
+  it can be forgotten. Job queues are built for this (<L id="07.05" />).
+- **An event** says *this happened*: "link x7Kp was created". It has no idea who cares. The preview worker, the QR
+  worker, the webhook sender and the search indexer can each react to it, and next year's new feature can too, without
+  changing the code that creates links. Logs are built for this (<L id="07.02" />).
+
+Events decouple the producer from its consumers; jobs make the intended work explicit. Snip uses both: link creation
+publishes one `link.created` event, and the services that care turn it into their own jobs.
+
+## A queue turns overload into delay
+
+A queue doesn't make work cheaper. Workers still have to do every bit of it. What it changes is **when**. If links
+arrive faster than workers can fetch previews, the queue grows instead of requests failing. That's usually what you
+want for a burst, and a trap for a lasting overload.
+
+**Little's law** connects the numbers: the average number of items waiting equals the arrival rate times the average
+wait. If previews arrive at 350 a second and each sits in the queue for 2 seconds on average, about 700 are waiting at
+any moment. Turn it round: a backlog of 70,000 at 350 a second means a new preview waits **200 seconds**. Queue length
+alone tells you little; queue length divided by the drain rate tells you how late the work is.
+
+So watch two numbers for every queue:
+
+- **Age of the oldest message**: how late the work is. This is the one to alert on, because it's what users feel.
+- **Depth**: how many messages are waiting. Useful for scaling workers, alarming only when it keeps growing.
+
+And give every queue a limit. A queue that grows without bound eventually runs out of memory or disk, and then it
+can't accept anything at all, turning a slow consumer into an outage for the producer. When the limit is hit, shed or
+delay the least important work (<L id="03.11" />).
+
+<Analogy>
+  **A post office's sorting room.** The counter clerk takes your parcel and gives you a receipt in seconds; sorting and delivery happen later, out of sight. If parcels arrive faster than they're sorted, the pile grows and delivery slows, but the counter keeps working. Only if the sorting room fills completely does the counter have to stop taking parcels.
+</Analogy>
+
+## What you give up
+
+- **Results arrive later**, so the product has to show work in progress ("preview loading").
+- **Failures happen where nobody is watching.** A request that fails shows the user an error; a background job that
+  fails needs retries, alerts and a place for messages that keep failing (<L id="07.03" />).
+- **Duplicates and ordering** become your problem (<L id="07.03" />, <L id="07.04" />).
+- **Tracing** a single action across a request and five background steps needs a shared ID passed along with every
+  message.
+
+<SeenInProduction>
+  <Seen
+    company="Slack"
+    system="Job queue"
+    year={2017}
+    href="https://slack.engineering/scaling-slacks-job-queue/"
+    source="Scaling Slack's Job Queue (Slack Engineering, updated 2020)"
+    found="Background work at huge scale, and an outage when the queue itself filled up and couldn't accept new jobs."
+  >
+    Slack runs work that's too slow for a web request as asynchronous jobs. On its busiest days the system processes over 1.4 billion jobs, at a peak of 33,000 a second. It
+    originally kept jobs in Redis, polled by pools of workers. During an outage, a slowdown in the database made jobs
+    run slower, Redis reached its maximum memory, and it could no longer enqueue new jobs. Slack's fix was to add
+    Kafka in front of Redis rather than replace Redis: a stateless service, Kafkagate, enqueues jobs to Kafka, and
+    another, JQRelay, relays them from Kafka to the Redis cluster the workers read.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's preview queue holds 90,000 messages and drains 300 a second. The dashboard says 'preview loading' for new links. Roughly how long will a new link wait for its preview?"
+  options={[
+    { text: "About 90 seconds", why: "That would be 1,000 a second. Divide the backlog by the drain rate." },
+    { text: "About 5 minutes", correct: true, why: "90,000 ÷ 300 is 300 seconds. That's why the age of the oldest message is the number to alert on, not the depth." },
+    { text: "It depends only on how fast one preview fetch is", why: "Each fetch might take a second, but a new message waits behind everything already queued." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Calling other people's systems inside your request.** Webhooks, emails and third-party APIs belong in the background.</li>
+    <li>**Unbounded queues.** A queue that can grow for ever eventually fails to accept anything. Set limits and decide what to shed.</li>
+    <li>**Alerting on depth.** Depth means little on its own; the age of the oldest message is what users feel.</li>
+    <li>**Moving work that decides the answer.** If the response depends on it, it can't be done later.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Keep in the request only what the user needs to continue; move the rest to the background.</li>
+    <li>A job says "do this" to one worker; an event says "this happened" to anyone who cares.</li>
+    <li>Queues turn bursts into delay, not into less work. Little's law: backlog ÷ drain rate = how late the work is.</li>
+    <li>Watch the oldest message's age, bound every queue, and plan for failures nobody sees directly.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "When would you process work asynchronously instead of in the request?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How do you tell the user the work isn't done yet?", "What metrics would you watch on the queue?"]}
+>
+  <p>When the user doesn't need the result to continue, when the work is slow or unreliable, or when it calls systems I don't control, like webhooks, email or third-party APIs. The request does the minimum (save the record, record that work is needed) and returns; workers do the rest from a queue, so a burst becomes a delay instead of errors and a failing dependency doesn't fail the request.</p>
+  <p>The costs are that results arrive later, so the UI needs a pending state; failures happen out of sight, so I need retries, dead-letter handling and alerts; and I have to handle duplicates and ordering. I'd alert on the age of the oldest message rather than queue depth, and bound the queue so a slow consumer can't take the producer down.</p>
+</InterviewCard>
