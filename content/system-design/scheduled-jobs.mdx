@@ -50,7 +50,7 @@ and each one wakes up on Monday at 09:00 and enqueues the report job. Now there 
 
 Options:
 
-- **One designated scheduler**, with a leader election so another takes over if it dies. Works, but leader election
+- **One designated scheduler**, with a <Term t="leader-election">leader election</Term> so another takes over if it dies. Works, but leader election
   is its own topic (<L id="08.07" />).
 - **Let every scheduler try, and let the database pick one.** Each schedule slot is a row with a primary key on
   (name, time). Every instance tries to insert it; exactly one succeeds and enqueues the job, in the same transaction:

@@ -1,0 +1,151 @@
+export const meta = {
+  summary: "Making exactly one instance of a job active at a time: leases that expire unless renewed, built on a consensus store like etcd. Why a leader can't always know it has stopped being one, and how to keep that from causing damage.",
+  uses: ["08.06", "08.01", "05.06", "07.07"],
+  usedIn: ["08.08"],
+};
+
+<BeforeYouStart>
+  Read <L id="08.06" />: leases live in a <Term t="consensus">consensus</Term> store. Clock behaviour from <L id="05.06" /> matters here, and the
+  scheduler that needed a leader was in <L id="07.07" />.
+</BeforeYouStart>
+
+## The problem: exactly one, but not zero
+
+Several Snip jobs must run in **exactly one** place at a time:
+
+- The certificate renewer, which renews TLS certificates for custom domains before they expire. Two renewers at once
+  could hit the certificate authority's <Term t="rate-limit">rate limits</Term> or overwrite each other's work.
+- The live-count aggregator for a viral link (<L id="07.09" />): two would double the numbers.
+- The weekly report scheduler (<L id="07.07" />), if it isn't using the database trick.
+
+Each runs on three servers for resilience. One should be active, the **leader**, and if it dies another should take
+over within seconds. Picking one is easy. Making sure there's **never more than one**, while never being stuck with
+**none**, is the hard part.
+
+## Leases
+
+A **lease** is a lock with an expiry. The leader holds it only as long as it keeps renewing it. If it crashes, it
+stops renewing, the lease expires, and another instance can take it. No one has to detect the crash; time does it.
+
+In etcd, a client is granted a lease with a time to live, attaches a key to it ("`/leaders/cert-renewer` = server-2"),
+and keeps it alive with a stream of keep-alive messages. In etcd's words, a lease expires if the cluster doesn't
+receive a keep-alive within the TTL, and when a lease expires or is revoked, all keys attached to it are deleted. The
+election is then just: whoever creates the key first, with a transaction that only succeeds if the key doesn't exist,
+is the leader. The others watch the key and try again when it disappears.
+
+Because etcd runs <Term t="raft">Raft</Term> (<L id="08.06" />), only one client can hold the key at a time, as far as etcd is concerned.
+
+Kubernetes works the same way. Its control-plane components, such as the controller manager and the scheduler, run
+several copies for high availability, but only one should be active; they coordinate through Lease objects, which are
+also how each node's kubelet sends its heartbeat.
+
+<Sequence
+  title="The leader dies; its lease expires; another takes over"
+  walk
+  participants={[{ id: "s1", label: "Renewer 1 (leader)" }, { id: "etcd", label: "etcd" }, { id: "s2", label: "Renewer 2" }]}
+  messages={[
+    { from: "s1", to: "etcd", label: "keep-alive (TTL 10 s)", explain: "The leader renews its lease every few seconds." },
+    { from: "s1", to: "etcd", label: "keep-alive", fail: true, explain: "Renewer 1 crashes. No more keep-alives." },
+    { note: "10 s pass with no keep-alive: the lease expires and the leader key is deleted", over: ["etcd", "s2"] },
+    { from: "etcd", to: "s2", label: "watch: key deleted", reply: true, explain: "Renewer 2 was watching the key, and sees it go." },
+    { from: "s2", to: "etcd", label: "create key if absent", explain: "It creates the leader key with its own lease. It's the leader now." },
+  ]}
+/>
+
+## The catch: a leader that doesn't know it's been replaced
+
+Leases fix crashed leaders. They don't fix **paused** ones. Suppose Renewer 1 checks "I still hold the lease", then
+the process freezes for 15 seconds: a long garbage-collection pause, the virtual machine being suspended, a slow disk.
+Meanwhile its 10-second lease expires and Renewer 2 becomes leader. Then Renewer 1 wakes up and carries on with the
+work it had already decided to do, believing it's still leader. For a moment there are two.
+
+Nothing in Renewer 1 can prevent this, because the pause can happen between any two lines of code, including between
+"check the lease" and "do the work". Ways to limit the damage:
+
+- **Stop early.** A leader stops acting some margin before its lease expires (say at 7 seconds of a 10-second lease),
+  measured on a **monotonic clock**, never wall-clock time (<L id="05.06" />).
+- **Make the work safe to repeat.** If both renewers request a certificate, the result should be one valid certificate.
+- **Let the resource reject the old leader.** Each new leader gets a higher number, and whatever it writes to checks
+  it. That's a **<Term t="fencing-token">fencing token</Term>**, and it's the only complete answer (<L id="08.08" />).
+
+## Choosing the TTL
+
+| Shorter lease (2 s) | Longer lease (30 s) |
+| --- | --- |
+| Fast takeover after a crash | Slow takeover: up to 30 s with no leader |
+| Leaders lose it during brief network blips or pauses | Rides out short blips |
+| Frequent keep-alives | Fewer keep-alives |
+
+Snip uses 10 seconds for the certificate renewer, where a minute without a leader doesn't matter, and fencing tokens on
+its writes.
+
+<Analogy>
+  **A meeting room booked in 30-minute slots.** Your booking holds the room only if you extend it before it runs out. If you leave, the booking lapses and the next group walks in. But if you dozed off and wake after it lapsed, you may carry on talking as if the room were still yours, unaware someone else now has it. That's why the screen outside the door, not your watch, is what counts.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="Chubby"
+    year={2006}
+    href="https://static.googleusercontent.com/media/research.google.com/en//archive/chubby-osdi06.pdf"
+    source="The Chubby lock service for loosely-coupled distributed systems (Mike Burrows, OSDI 2006)"
+    found="A coarse-grained lock service, built on consensus, that other systems use to elect their masters."
+  >
+    Chubby provides coarse-grained locking and reliable, low-volume storage for loosely coupled distributed systems.
+    The Google File System uses a Chubby lock to appoint its master server, and Bigtable uses Chubby to elect a master,
+    to let the master discover the servers it controls, and to let clients find the master. Chubby favours locks held
+    for long periods, not fine-grained ones, which impose far less load on the lock service.
+  </Seen>
+  <Seen
+    company="etcd"
+    system="Leases"
+    year="Docs"
+    href="https://etcd.io/docs/v3.5/learning/api/"
+    source="etcd API: Lease API"
+    found="A lease detects liveness: keys attached to it vanish when the holder stops renewing."
+  >
+    etcd describes leases as a mechanism for detecting client liveness. The cluster grants a lease with a time to
+    live; a lease expires if the cluster doesn't receive a keep-alive within that period, and when it expires or is
+    revoked, all keys attached to it are deleted. Keep-alives are sent over a bidirectional stream.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's renewer checks its etcd lease, sees it's valid, then calls the certificate authority, which takes 20 seconds. The lease TTL is 10 seconds and keep-alives run on the same thread, which is blocked during the call. What can happen?"
+  options={[
+    { text: "Nothing: it checked the lease before starting", why: "The check was valid at that moment. During the 20-second call no keep-alives are sent, so the lease expires." },
+    { text: "The lease expires mid-call, another renewer becomes leader, and both act at once", correct: true, why: "Keep-alives must run independently of the work, the work should be bounded well within the TTL, and writes should carry a fencing token so the stale leader is rejected." },
+    { text: "etcd extends the lease because the call is still running", why: "etcd only knows about keep-alives. It has no idea what the client is doing." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Assuming a lease check stays true.** A pause can come right after it. Fence the writes.</li>
+    <li>**Measuring lease time with the wall clock.** Clock jumps can stretch or shrink it. Use a monotonic clock.</li>
+    <li>**Keep-alives blocked by the work.** Renew on a separate path, and keep work units well under the TTL.</li>
+    <li>**Rolling your own election on a non-consensus store.** Use etcd, ZooKeeper, Consul or Kubernetes Leases.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Leader election picks one active instance; a lease makes leadership expire unless renewed.</li>
+    <li>Build it on a consensus store: create a key tied to your lease if it doesn't exist, and watch it otherwise.</li>
+    <li>A paused leader can act after its lease has expired; stop early, make work repeatable, and use fencing tokens.</li>
+    <li>The TTL trades takeover speed against false failovers.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you make sure only one instance of a background job runs at a time across several servers?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["What happens if the leader pauses for longer than its lease?", "How do you choose the lease duration?"]}
+>
+  <p>Use leader election on a consensus-backed store like etcd, ZooKeeper, Consul or Kubernetes Leases. Each instance tries to create a leader key bound to a lease with a TTL; the one that succeeds is the leader and keeps the lease alive with heartbeats, while the others watch the key and try again when it's deleted. If the leader crashes, its lease expires and another takes over automatically.</p>
+  <p>The subtle failure is a leader that pauses, for garbage collection or a VM suspension, past its lease expiry and then keeps acting. It can't detect that itself, so I'd have it stop work well before expiry using a monotonic clock, make the work idempotent, and above all have each leadership term carry an increasing fencing token that the downstream resource checks, rejecting writes from older tokens. The TTL is a trade-off between failover speed and false failovers from brief network blips.</p>
+</InterviewCard>

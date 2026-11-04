@@ -1,0 +1,201 @@
+export const meta = {
+  summary: "Three ways to replicate: one leader, several leaders, or none. How leaderless systems use read and write quorums (R + W > N), what that does and doesn't guarantee, and how replicas catch up with hinted handoff, read repair and anti-entropy.",
+  uses: ["04.07", "08.02", "08.03", "05.03", "05.06"],
+  usedIn: ["08.05", "08.06", "15.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.07" /> for single-leader replication, and <L id="08.02" /> for what "stale" means. Replicas are placed
+  on a hash ring (<L id="05.03" />).
+</BeforeYouStart>
+
+## The problem: storing every click, in two regions, always writable
+
+Snip keeps a full history of clicks for its analytics plan: billions of small rows, written constantly from both
+regions. The requirements are unusual: **writes must never be refused**, even if a node or a region is unreachable,
+and a click that's a few seconds late to appear is fine. A single leader is the wrong shape: every write would have to
+reach one place.
+
+## Three shapes of replication
+
+| | Single leader | Multi-leader | Leaderless |
+| --- | --- | --- | --- |
+| **Who accepts writes** | One node | One node per region (or per site) | Any replica |
+| **Conflicts** | None: one order | Concurrent writes in two places conflict | Concurrent writes conflict |
+| **A node or region down** | Failover needed for writes | Other leaders carry on | Carries on if enough replicas answer |
+| **Typical** | Postgres, MySQL (<L id="04.07" />) | Multi-region setups, offline-first apps | Dynamo, Cassandra, Riak |
+
+Multi-leader and leaderless both accept writes in more than one place, so both must resolve conflicts, using versions,
+last-write-wins or merging (<L id="08.05" />). Snip's click history is append-only (each click is a new row), so
+conflicts never arise there, which is a big reason leaderless suits it.
+
+## Quorums
+
+In a leaderless store, each key lives on **N** replicas. A write is sent to all N and counts as done once **W** have
+acknowledged it. A read asks the replicas and waits for **R** answers, returning the newest version among them.
+
+If **R + W > N**, every set of R replicas overlaps every set of W replicas in at least one node, so a read always hears
+from at least one replica that has the latest acknowledged write. Werner Vogels's description is exact: if W + R > N,
+"the write set and the read set always overlap"; if not, reads can go to nodes that haven't received the update.
+
+## Try it
+
+<Lab
+  id="sd-08-04-quorum"
+  title="Overlap or miss"
+  tasks={[
+    "With N = 5, W = 3, R = 3, write v2. Does the worst-case read find it? Why must it?",
+    "Lower R to 2 and write again. What does the worst-case read return now?",
+    "Set W = 1, R = 5. Writes are fast; what happens to reads when one replica goes down?",
+    "With N = 5, W = 3, R = 3, take two replicas down. Do writes and reads still work? What about three?",
+  ]}
+>
+  <QuorumLab preset={{ n: 5, w: 3, r: 3 }} />
+</Lab>
+
+The lab shows the trade. W and R decide both consistency and availability: a write survives N − W replicas being down,
+a read survives N − R. Common settings:
+
+- **N = 3, W = 2, R = 2**: the usual balance. Dynamo's paper gives (3, 2, 2) as the common configuration across its
+  instances.
+- **W = N, R = 1**: fast reads, but one replica down blocks every write.
+- **W = 1, R = 1**: fastest and most available, with no overlap: reads can easily be stale.
+
+Cassandra calls these **consistency levels**: `ONE`, `QUORUM` (a majority of replicas), `LOCAL_QUORUM` (a majority in
+the local datacenter, avoiding cross-region waits), `ALL`. Snip writes click history at `LOCAL_QUORUM` with three
+replicas per region, so a write needs two local replicas and never waits for the Atlantic.
+
+## What quorums don't promise
+
+R + W > N is weaker than it sounds:
+
+- **It isn't <Term t="linearizable">linearizable</Term>.** A write in progress may be on some replicas but not others, so two reads at the same
+  moment can disagree. Abadi notes that even with R + W > N these systems "cannot achieve full consistency".
+- **Concurrent writes still conflict.** Two writes to the same key, each reaching W replicas, leave replicas with
+  different values. Something has to decide (<L id="08.05" />), and last-write-wins by timestamp silently drops one
+  (<L id="05.06" />).
+- **Sloppy quorums weaken it further.** If the key's home replicas are unreachable, some systems write to other nodes
+  temporarily to stay available, which means a "quorum" of writes may not overlap the replicas a read asks.
+
+## How replicas catch up
+
+Replicas miss writes while down or slow. Three mechanisms bring them back in line:
+
+- **Hinted handoff.** A node that accepts a write on behalf of an unreachable replica keeps a "hint" and delivers the
+  write when that replica returns.
+- **Read repair.** A read that sees replicas disagree writes the newest value back to the stale ones.
+- **Anti-entropy.** A background process compares replicas and copies what's missing. Cassandra's repair has replicas
+  build hash trees (Merkle trees) over their data, so they can find the differing ranges without comparing every row.
+
+Here's a quorum read with read repair. It asks every replica, uses the first R answers, returns the newest version,
+and quietly updates any replica in that quorum that was behind:
+
+```ts
+type Versioned = { value: string; version: number };
+interface Replica {
+  get(key: string): Promise<Versioned | null>;
+  put(key: string, v: Versioned): Promise<void>;
+}
+
+/** Ask every replica, use the first R answers, return the newest, and repair stale replicas in the background. */
+export async function quorumRead(replicas: Replica[], key: string, r: number): Promise<Versioned | null> {
+  const answers: { replica: Replica; v: Versioned | null }[] = [];
+  await new Promise<void>((resolve, reject) => {
+    let failed = 0;
+    for (const replica of replicas) {
+      replica.get(key).then(
+        (v) => {
+          answers.push({ replica, v });
+          if (answers.length === r) resolve();
+        },
+        () => {
+          if (++failed > replicas.length - r) reject(new Error(`fewer than ${r} replicas answered`));
+        },
+      );
+    }
+  });
+  const quorum = answers.slice(0, r);
+  const newest = quorum.reduce<Versioned | null>((best, a) => (a.v && (!best || a.v.version > best.version) ? a.v : best), null);
+  if (newest) {
+    for (const a of quorum) if (!a.v || a.v.version < newest.version) void a.replica.put(key, newest); // read repair
+  }
+  return newest;
+}
+```
+
+Tested with three simulated replicas, one up to date and two stale, the read returned the newest version and repaired
+the stale replica in its quorum; the slowest replica, outside the quorum, stayed stale until anti-entropy would reach
+it. With two of three replicas failing, the read failed instead of returning a possibly stale answer.
+
+<Analogy>
+  **Asking colleagues what time the meeting moved to.** If the organiser told at least three of five people (W) and you ask any three (R), at least one of the people you ask was told. Ask only two, and you might ask the two who weren't. When you find someone with the old time, you correct them as you go: that's read repair.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Dynamo"
+    year={2007}
+    href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
+    source="Dynamo: Amazon's Highly Available Key-value Store (SOSP 2007)"
+    found="Tunable N, R and W, with (3, 2, 2) as the common choice, plus sloppy quorums and hinted handoff for availability."
+  >
+    Dynamo lets each instance tune N, R and W, noting that R + W > N gives a quorum-like system, and the paper gives
+    (3, 2, 2) as the common configuration used by several instances. To stay writable during failures it uses a sloppy
+    quorum with hinted handoff, and it tracks causality between versions of an object with vector clocks, returning
+    conflicting versions to the application to reconcile.
+  </Seen>
+  <Seen
+    company="Apache Cassandra"
+    system="Tunable consistency"
+    year="Docs"
+    href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html"
+    source="Dynamo (Apache Cassandra documentation)"
+    found="Dynamo's R + W > N, exposed as per-request consistency levels."
+  >
+    Cassandra describes its consistency levels as a version of Dynamo's R + W > N mechanism. ONE needs a single
+    replica, QUORUM a majority (n/2 + 1) of replicas, LOCAL_QUORUM a majority in the coordinator's datacenter, and ALL
+    every replica. When W + R exceeds the replication factor, acknowledged writes are visible to later reads. Replicas
+    converge through hinted handoff, read repair, and anti-entropy repair, in which replicas compute Merkle trees over
+    their data.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A Cassandra table has 3 replicas. Writes use ONE and reads use ONE for speed. Users sometimes don't see a click they just made. What's the cheapest change that guarantees they will?"
+  options={[
+    { text: "Use QUORUM for both reads and writes", correct: true, why: "2 + 2 > 3, so every read overlaps the latest acknowledged write. Each side waits for two replicas instead of one." },
+    { text: "Add more replicas", why: "More replicas with W = 1 and R = 1 make overlap less likely, not more." },
+    { text: "Use ALL for writes and ONE for reads", why: "That also overlaps (3 + 1 > 3), but one replica down then blocks every write." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Assuming R + W > N means linearizable.** In-flight writes and concurrent writers still produce disagreement.</li>
+    <li>**Last-write-wins on data that matters.** Concurrent writes are silently dropped. Use versions or merges.</li>
+    <li>**Cross-region quorums for every request.** Use local quorums and replicate between regions asynchronously.</li>
+    <li>**Never running repair.** Without anti-entropy, rarely read data drifts apart for ever.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Single leader avoids conflicts; multi-leader and leaderless accept writes in many places and must resolve them.</li>
+    <li>Leaderless quorums: write to W of N, read from R; R + W > N makes read and write sets overlap.</li>
+    <li>Choose W and R for both consistency and availability; overlap isn't linearizability, and concurrent writes still conflict.</li>
+    <li>Replicas converge through hinted handoff, read repair and anti-entropy.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do quorum reads and writes work in a leaderless database like Cassandra or Dynamo?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why isn't R + W > N enough for linearizability?", "How do replicas that missed writes catch up?"]}
+>
+  <p>Each key is stored on N replicas. A write goes to all of them and succeeds once W acknowledge; a read queries replicas and waits for R responses, returning the newest version by timestamp or version number. If R + W > N, any read set overlaps any write set, so a read sees at least one copy of the latest acknowledged write. Typical is N = 3 with W = R = 2, which tolerates one replica down for both reads and writes.</p>
+  <p>It's not linearizable: during a write some replicas have the new value and some don't, so concurrent reads can disagree, and concurrent writes to the same key create conflicts that need versions, vector clocks or last-write-wins. Sloppy quorums weaken overlap further. Replicas converge through hinted handoff, read repair when a read sees stale replicas, and periodic anti-entropy using Merkle trees.</p>
+</InterviewCard>

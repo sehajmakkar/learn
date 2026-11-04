@@ -1,0 +1,198 @@
+export const meta = {
+  summary: "How a group of machines agrees on one sequence of decisions even while some of them fail: majorities, terms, leader election and log replication in Raft, explained without the proofs, with the two rules that make it safe in code.",
+  uses: ["08.01", "08.02", "08.04", "04.06"],
+  usedIn: ["08.07", "08.08", "08.11"],
+};
+
+<BeforeYouStart>
+  Read <L id="08.01" /> (nodes fail and messages get lost) and <L id="08.02" /> (<Term t="linearizable">linearizability</Term>). Raft replicates a
+  log, much like the write-ahead log of <L id="04.06" />.
+</BeforeYouStart>
+
+## The problem: one shard map, three copies, no disagreement
+
+Snip's shard router (<L id="05.01" />) reads a map: logical shard 41 is on Postgres 9. During a <Term t="rebalancing">rebalance</Term>
+(<L id="05.04" />) the map changes. If one router believes shard 41 moved and another doesn't, writes for the same
+links go to two machines. The map must be stored on several machines so it survives failures, and yet every reader
+must see **the same sequence of changes**, as if there were one copy.
+
+That's the **consensus** problem: several machines agreeing on a value, or a sequence of values, while some of them
+crash and messages are delayed or lost. Snip doesn't build it; it stores the map in etcd, which runs **Raft**. But
+knowing how Raft works explains what these systems can and can't do.
+
+## Majorities
+
+Raft, like other consensus algorithms, makes progress whenever a **majority** of its servers is available. Any two
+majorities of the same group share at least one member, so two decisions made by two different majorities can't both
+go unnoticed: someone was in both.
+
+| Servers | Majority | Failures tolerated |
+| --- | --- | --- |
+| 3 | 2 | 1 |
+| 4 | 3 | 1 |
+| 5 | 3 | 2 |
+| 7 | 4 | 3 |
+
+A fourth server adds no tolerance over three, which is why clusters have odd sizes. etcd's guidance is 3 or 5
+members, and probably no more than 7, since every write must reach a majority and more members means more waiting.
+
+## Terms and leaders
+
+Raft divides time into **terms**, numbered 1, 2, 3 … Each term has at most one leader. The leader handles every
+request and tells the others what to do; followers just follow. This makes Raft much simpler to reason about than
+designs where anyone can propose.
+
+**<Term t="leader-election">Leader election</Term>.** Followers expect regular heartbeats from the leader. If one hears nothing for its **election
+timeout**, chosen at random from a range such as 150–300 ms, it becomes a candidate: it starts a new term, votes for
+itself and asks the others for votes. A server grants at most one vote per term, and wins with a majority. The
+randomness makes it likely that one server times out first and wins before others start competing.
+
+<Sequence
+  title="The leader crashes; a new one is elected"
+  walk
+  participants={[{ id: "a", label: "Server A (leader, term 4)" }, { id: "b", label: "Server B" }, { id: "c", label: "Server C" }]}
+  messages={[
+    { from: "a", to: "b", label: "heartbeat, term 4", explain: "The leader sends heartbeats so followers know it's alive." },
+    { from: "a", to: "c", label: "heartbeat, term 4", fail: true, explain: "Then server A crashes." },
+    { note: "B's random election timeout (190 ms) runs out first", over: ["b", "c"] },
+    { from: "b", to: "c", label: "RequestVote, term 5", explain: "B starts term 5, votes for itself and asks C. Its log is at least as up to date as C's." },
+    { from: "c", to: "b", label: "vote granted", reply: true, explain: "C hasn't voted in term 5, so it votes for B. Two of three is a majority: B leads term 5." },
+  ]}
+/>
+
+## Log replication
+
+Clients send commands to the leader ("move shard 41 to Postgres 9"). The leader appends each to its log, sends it to
+the followers, and once a **majority** have stored it, the entry is **committed**: it will never be lost or changed,
+and the leader applies it and answers the client. Followers apply committed entries in the same order, so every copy
+of the shard map goes through the same states.
+
+## The two rules that make it safe
+
+Most of Raft's safety comes down to two checks, sketched here:
+
+```ts
+type Entry = { term: number; command: string };
+type Node = { currentTerm: number; votedFor: string | null; log: Entry[] };
+
+const lastTerm = (log: Entry[]) => (log.length ? log[log.length - 1].term : 0);
+
+/** RequestVote: grant at most one vote per term, and only to a candidate whose log is at least as up to date. */
+export function handleRequestVote(me: Node, term: number, candidate: string, candLastIndex: number, candLastTerm: number) {
+  if (term < me.currentTerm) return false;
+  if (term > me.currentTerm) {
+    me.currentTerm = term;
+    me.votedFor = null;
+  }
+  const upToDate =
+    candLastTerm > lastTerm(me.log) || (candLastTerm === lastTerm(me.log) && candLastIndex >= me.log.length);
+  if ((me.votedFor === null || me.votedFor === candidate) && upToDate) {
+    me.votedFor = candidate;
+    return true;
+  }
+  return false;
+}
+
+/** AppendEntries: accept only if our log has the leader's previous entry; then overwrite anything that conflicts. */
+export function handleAppendEntries(me: Node, term: number, prevIndex: number, prevTerm: number, entries: Entry[]) {
+  if (term < me.currentTerm) return false;
+  me.currentTerm = term;
+  if (prevIndex > 0 && (me.log.length < prevIndex || me.log[prevIndex - 1].term !== prevTerm)) return false;
+  me.log = [...me.log.slice(0, prevIndex), ...entries];
+  return true;
+}
+```
+
+1. **Only up-to-date candidates win.** A server refuses its vote to a candidate whose log is behind its own (an older
+   last term, or the same term but shorter). Since a committed entry is on a majority, and a winner needs a majority's
+   votes, any new leader must already have every committed entry. Tested: a voter with a term-3 entry refused a
+   candidate whose last entry was from term 2, even though that candidate's log was longer.
+2. **Logs must match before appending.** The leader sends the index and term of the entry just before the new ones.
+   A follower whose log doesn't have that entry rejects the request, and the leader retries further back until they
+   match; then the follower overwrites its conflicting tail. Tested: a follower with stale term-2 entries rejected a
+   mismatched append, then accepted one from the matching point and ended with the leader's log.
+
+Real Raft also persists `currentTerm`, `votedFor` and the log to disk before answering, handles membership changes,
+and compacts the log with snapshots. Use a tested implementation; these sketches are for understanding.
+
+## What consensus costs
+
+- **A majority round trip per write.** Spread a 5-node cluster over three regions and every write waits for a
+  cross-region acknowledgement.
+- **No progress without a majority.** A 3-node cluster with 2 nodes down is read-only at best. That's the C choice in
+  CAP (<L id="08.03" />), made deliberately.
+- **Small data, not big.** Consensus systems such as etcd, ZooKeeper and Consul hold configuration, leader leases and
+  locks, not your main data. Systems that need consensus over big data (CockroachDB, Spanner) split it into many small
+  replicated groups.
+
+<Analogy>
+  **A committee that keeps minutes.** One chair proposes each item and it's recorded once most members have written it in their own minutes. If the chair falls ill, the members elect a new one for a new session, but only someone whose minutes are complete can be elected, so nothing agreed is ever lost. A member who missed a meeting copies the minutes from the chair, starting from the last item they agree on.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Stanford University"
+    system="Raft"
+    year={2014}
+    href="https://raft.github.io/raft.pdf"
+    source="In Search of an Understandable Consensus Algorithm (Diego Ongaro and John Ousterhout)"
+    found="A consensus algorithm designed first to be understood, by separating leader election, log replication and safety."
+  >
+    Raft manages a replicated log, produces a result equivalent to multi-Paxos and is as efficient, but is structured
+    to be easier to understand. In a user study with 43 students at two universities, 33 answered questions about Raft
+    better than questions about Paxos after learning both. The paper guarantees that at most one leader is elected in
+    a term, and uses randomized election timeouts, chosen from a fixed interval such as 150–300 ms, to resolve split
+    votes quickly.
+  </Seen>
+  <Seen
+    company="etcd"
+    system="Cluster sizing"
+    year="Docs"
+    href="https://etcd.io/docs/v3.5/faq/"
+    source="etcd FAQ"
+    found="Odd-sized clusters of 3 or 5; more members cost write latency without adding much."
+  >
+    etcd recommends an odd number of members: for n members, quorum is (n/2)+1, so an odd-size cluster tolerates the
+    same number of failures as an even one with fewer nodes; a 5-member cluster tolerates two failures. It says a
+    cluster should probably have no more than seven members, noting that Google's Chubby suggests running five.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A 5-server Raft cluster loses 2 servers in one region. Then a third server crashes. What happens to writes?"
+  options={[
+    { text: "They continue on the remaining two servers", why: "Two of five isn't a majority, so nothing can be committed." },
+    { text: "After the third failure, writes stop until a majority (3) is back", correct: true, why: "With 3 of 5 up, a majority remains and writes continue. With 2, no entry can reach a majority, so the cluster refuses writes rather than risk two histories." },
+    { text: "The cluster elects two leaders, one per side", why: "A leader needs a majority's votes, and two disjoint majorities can't exist, so at most one leader per term." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Even-sized clusters.** Four servers tolerate one failure, like three, while costing more and waiting for more.</li>
+    <li>**Writing your own consensus.** Use etcd, ZooKeeper, Consul or your database's built-in Raft.</li>
+    <li>**Storing big data in a consensus system.** Keep it to small, critical state: configuration, leases, locks.</li>
+    <li>**Spreading members so a majority needs the slowest link.** Place members so a majority can talk quickly.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Consensus gets several machines to agree on one sequence of decisions despite failures; it needs a majority.</li>
+    <li>Raft: terms with at most one leader, elected with randomized timeouts; entries commit once a majority has them.</li>
+    <li>Safety rests on voting only for up-to-date candidates and appending only to logs that match.</li>
+    <li>Use 3 or 5 members, a proven implementation, and keep consensus for small, critical state.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Explain how Raft works at a high level.", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why does a cluster need an odd number of nodes?", "What happens during a network partition?"]}
+>
+  <p>Raft keeps a replicated log consistent across a group of servers. Time is divided into terms, each with at most one leader. Followers that stop hearing heartbeats wait a randomized election timeout, become candidates, increment the term and request votes; each server votes once per term and only for candidates whose log is at least as up to date as its own, and a majority elects the leader. The leader appends client commands to its log and replicates them; once a majority has an entry it's committed and applied in order everywhere.</p>
+  <p>The voting rule guarantees a new leader has every committed entry, and the append consistency check makes followers' logs converge to the leader's. Because everything needs a majority, a cluster of 2f + 1 tolerates f failures, which is why sizes are odd. In a partition, only the side with a majority can elect a leader and commit; the minority side stops accepting writes.</p>
+</InterviewCard>

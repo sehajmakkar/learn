@@ -1,0 +1,179 @@
+export const meta = {
+  summary: "Committing one change across several databases: two-phase commit, tried for real with Postgres's PREPARE TRANSACTION, why a crashed coordinator leaves locks held, how distributed databases make it safe with consensus, and when a saga is the better tool.",
+  uses: ["07.08", "08.06", "05.01", "04.04", "07.06"],
+  usedIn: ["16.02"],
+};
+
+<BeforeYouStart>
+  Read <L id="07.08" /> for <Term t="saga">sagas</Term> and <L id="08.06" /> for <Term t="consensus">consensus</Term>. The example is the cross-shard problem from
+  <L id="05.01" />, and the atomicity being stretched is a database <Term t="transaction">transaction</Term>'s
+  (<L id="04.04" />).
+</BeforeYouStart>
+
+## The problem: moving a link between owners
+
+An agency hands a campaign link over to its client: `x7Kp` moves from owner 4821 to owner 9310. Since Snip sharded
+(<L id="05.01" />), each owner's list of links lives on the owner's shard, and these two owners are on different
+Postgres machines. The move is two writes in two databases:
+
+- Delete `(4821, x7Kp)` from owner shard A.
+- Insert `(9310, x7Kp)` into owner shard B.
+
+Do one without the other and the link either vanishes from both dashboards or appears in both. Each database can make
+its own write atomic, but not the pair.
+
+## Two-phase commit
+
+**Two-phase commit** (2PC) adds a **coordinator** that runs the transaction on every participant and then commits in
+two rounds:
+
+1. **Prepare.** The coordinator asks each participant to get ready to commit. A participant that says yes has made its
+   changes durable, holds its locks, and **promises it can commit if told to**, even after a crash. It may no longer
+   decide to abort on its own.
+2. **Commit.** If every participant voted yes, the coordinator records the decision and tells each to commit. If any
+   voted no, it tells all to roll back.
+
+Postgres supports the participant side directly. `PREPARE TRANSACTION` stores the transaction's state on disk, and
+`COMMIT PREPARED` or `ROLLBACK PREPARED` finishes it later, even from another session:
+
+```sql
+-- On owner shard A
+BEGIN;
+DELETE FROM links_by_owner WHERE owner_id = 4821 AND code = 'x7Kp';
+PREPARE TRANSACTION 'move-x7Kp-a';
+
+-- On owner shard B
+BEGIN;
+INSERT INTO links_by_owner (owner_id, code) VALUES (9310, 'x7Kp');
+PREPARE TRANSACTION 'move-x7Kp-b';
+
+-- Both prepared: the coordinator records "commit", then
+COMMIT PREPARED 'move-x7Kp-a';   -- on A
+COMMIT PREPARED 'move-x7Kp-b';   -- on B
+```
+
+Tested on PostgreSQL 16 with two databases (prepared transactions are off by default; `max_prepared_transactions` must
+be raised and needs a restart): both transactions showed up in `pg_prepared_xacts`, and after the commits shard A had
+no row for owner 4821 and shard B had `(9310, x7Kp)`.
+
+## The weakness: a coordinator that disappears
+
+Between prepare and commit, every participant is **in doubt**. It has promised to commit if told to, so it can't roll
+back on its own, and it can't commit without the decision. If the coordinator crashes at that moment, the participants
+**wait**, holding their locks, until it comes back.
+
+That was the second test: a transaction prepared on shard B and then left alone, as if the coordinator had died. An
+ordinary update to the same row then waited on the prepared transaction's lock until it hit a 2-second lock timeout,
+and the prepared transaction stayed in `pg_prepared_xacts` until someone ran `ROLLBACK PREPARED`. Postgres's own
+documentation warns that leaving transactions prepared for long interferes with VACUUM, and that they keep holding
+whatever locks they took.
+
+So classic 2PC is a **blocking** protocol, and it adds a round trip and holds locks across both phases. Making it
+practical means making the coordinator itself fault-tolerant.
+
+## How distributed databases make it safe
+
+Databases that run transactions across many machines, such as Spanner and CockroachDB, use the same two-phase idea,
+but each participant, and the record of the decision, is itself a **replicated group running consensus**
+(<L id="08.06" />). A coordinator machine can die, and the decision is still on a majority of replicas, so another
+can finish the job.
+
+CockroachDB, for example, keeps a **transaction record** in the range where the first write happened, and writes
+**intents**, provisional values that also act as exclusive locks, replicated through Raft. Its commit protocol,
+Parallel Commits, stages the record and checks that all the intents are in place, then resolves them asynchronously.
+From the application's point of view it's just a transaction.
+
+## 2PC or saga?
+
+| | Two-phase commit | Saga (<L id="07.08" />) |
+| --- | --- | --- |
+| **Isolation** | Atomic: nobody sees half the change | Intermediate states are visible |
+| **Undo** | Rollback, before commit | Compensating actions, after the fact |
+| **Locks** | Held across both phases on every participant | Each step commits and releases at once |
+| **Participants** | Must all support prepare (databases, some queues) | Anything with an API: payment providers, email, other companies |
+| **Failure of the coordinator** | Participants block (unless it's made fault-tolerant) | Saga resumes from its log |
+| **Good for** | Short transactions across your own databases | Long, multi-service business processes |
+
+In the end, Snip's link handover needs neither. The source of truth is the link's own row on its link shard, where
+`owner_id` changes in one ordinary local transaction. The owner lists are derived copies (<L id="05.01" />), updated
+from a `link.transferred` event through the outbox (<L id="07.06" />), and may lag a second behind. Often the best
+answer to "do I need 2PC?" is to arrange the data so that one database holds the truth and the rest follows. Where a
+change truly must be atomic across machines, use a database that provides distributed transactions rather than
+hand-rolling 2PC over separate shards.
+
+The custom-domain setup (<L id="07.08" />), which involves a payment provider, a certificate authority and a CDN,
+can't use 2PC at all: those services don't offer a "prepare" step, and holding locks for a day while DNS changes would
+be absurd. That's a saga.
+
+<Analogy>
+  **A wedding ceremony.** The officiant asks each person "do you?" (prepare); once both say yes, neither can back out quietly. Only then is the marriage pronounced (commit). If the officiant faints after both said yes but before the pronouncement, the couple is stuck at the altar, unable to leave and not yet married, until someone who heard both answers finishes the job.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="PostgreSQL"
+    system="PREPARE TRANSACTION"
+    year="Docs"
+    href="https://www.postgresql.org/docs/current/sql-prepare-transaction.html"
+    source="PREPARE TRANSACTION (PostgreSQL documentation)"
+    found="The participant side of 2PC, with a clear warning about leaving transactions prepared."
+  >
+    PREPARE TRANSACTION prepares the current transaction for two-phase commit, after which its state is fully stored
+    on disk. Its purpose is to let an external transaction manager perform atomic global transactions across multiple
+    databases or other transactional resources. The documentation warns that it's unwise to leave transactions
+    prepared for long, since that interferes with VACUUM, and that a prepared transaction continues to hold its locks.
+    The feature is disabled by default: max_prepared_transactions defaults to zero.
+  </Seen>
+  <Seen
+    company="Cockroach Labs"
+    system="CockroachDB transaction layer"
+    year="Docs"
+    href="https://www.cockroachlabs.com/docs/stable/architecture/transaction-layer"
+    source="Transaction Layer (CockroachDB documentation)"
+    found="Distributed transactions with a replicated transaction record and replicated write intents, so no single coordinator failure blocks them."
+  >
+    CockroachDB achieves correctness with a distributed, atomic commit protocol called Parallel Commits. A transaction
+    record is stored in the range where the first write occurs, with states such as PENDING, STAGING, COMMITTED and
+    ABORTED. Write intents are replicated via <Term t="raft">Raft</Term> and act as a combination of a provisional value and an exclusive
+    lock. Committing sets the record to STAGING and checks the pending intents, and cleanup happens asynchronously.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="During a 2PC transaction, the coordinator crashes after both participants voted yes but before sending the decision. What happens to the participants?"
+  options={[
+    { text: "They time out and roll back", why: "A participant that voted yes has promised to commit if told to. Rolling back on its own could contradict a commit decision the coordinator already recorded." },
+    { text: "They wait in doubt, holding their locks, until the coordinator recovers or an operator resolves them", correct: true, why: "That's 2PC's blocking problem. Distributed databases avoid it by storing the decision in a consensus-replicated record that any node can read." },
+    { text: "They commit, since both voted yes", why: "They don't know the other voted yes, and the coordinator might have decided to abort for another reason." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Hand-rolled 2PC across services.** Most services can't prepare, and a crashed coordinator blocks everyone. Use a saga.</li>
+    <li>**Leaving prepared transactions behind.** They hold locks and block VACUUM. Monitor `pg_prepared_xacts` and resolve stragglers.</li>
+    <li>**Long transactions under 2PC.** Locks are held across both phases. Keep them short.</li>
+    <li>**Forgetting the coordinator's log.** Without a durable record of the decision, recovery can't finish the job.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>2PC: prepare on every participant (a binding promise), then commit everywhere, or roll back if anyone said no.</li>
+    <li>Between the phases participants are in doubt; a crashed coordinator leaves them blocked, holding locks.</li>
+    <li>Distributed databases make it safe by replicating the decision and the participants with consensus.</li>
+    <li>Use atomic commit for short transactions across your own databases, and sagas for long processes across services.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Explain two-phase commit. Why is it rarely used between microservices?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What happens if the coordinator crashes after the prepare phase?", "How do systems like Spanner make distributed transactions practical?"]}
+>
+  <p>Two-phase commit gives atomicity across several participants. In the prepare phase the coordinator asks each participant to make its changes durable and promise to commit; in the commit phase, if all voted yes, it records the decision and tells everyone to commit, otherwise to abort. It's atomic and isolated: no one sees a half-done change.</p>
+  <p>Its weakness is blocking: after voting yes a participant can't decide alone, so if the coordinator fails it holds locks until the coordinator recovers. It also adds latency and requires every participant to support prepare, which external APIs and most services don't. Between microservices, especially long-running business processes, sagas with compensations are the usual choice. Distributed databases like Spanner and CockroachDB do use two-phase-style commits internally, but with the coordinator's state and each participant replicated via consensus, so a single machine failure doesn't block anything.</p>
+</InterviewCard>

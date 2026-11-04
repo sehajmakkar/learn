@@ -1,0 +1,197 @@
+export const meta = {
+  summary: "Stopping one failing dependency from taking everything down with it. Circuit breakers fail fast while a dependency is sick and test it before trusting it again; bulkheads give each dependency its own resources so one can't use up the rest. Tested code.",
+  uses: ["03.09", "03.11", "08.01", "03.12"],
+  usedIn: ["16.02"],
+};
+
+<BeforeYouStart>
+  <L id="03.09" /> introduced circuit breakers in a paragraph; this is the full version. It builds on load shedding
+  (<L id="03.11" />) and on slow-is-worse-than-dead from <L id="08.01" />.
+</BeforeYouStart>
+
+## The problem: a slow safety service stops redirects
+
+Snip's link-creation API calls the outside URL-safety service (<L id="02.06" />) on a background worker, but the
+paid plan added a synchronous "check before saving" option. One afternoon the safety service slows from 200 ms to 30
+seconds per request. Each app server has a pool of 50 outbound HTTP connections, shared by every dependency. Within a
+minute, all 50 are stuck waiting on the safety service. Now calls to the payment provider and to the internal links
+service also wait for a connection. **Redirects, which never touch the safety service, start
+failing.**
+
+A failure in one dependency has spread to everything, through a shared resource. Two patterns stop that.
+
+## Circuit breakers: stop calling what's broken
+
+A **circuit breaker** wraps calls to one dependency and counts failures. Martin Fowler's description has three states:
+
+- **Closed** (normal): calls go through. Failures are counted.
+- **Open**: after a threshold of failures, the breaker trips and every call fails immediately, without touching the
+  dependency, for a cool-down period.
+- **Half-open**: after the cool-down, a trial call goes through. If it succeeds, the breaker closes; if it fails, it
+  opens again for another cool-down.
+
+```ts
+type BreakerState = "closed" | "open" | "half-open";
+
+export class CircuitBreaker {
+  state: BreakerState = "closed";
+  private failures = 0;
+  private openedAt = 0;
+
+  constructor(
+    private readonly threshold = 5, // consecutive failures that trip it
+    private readonly coolDownMs = 30_000, // how long to fail fast before trying again
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "open") {
+      if (this.now() - this.openedAt < this.coolDownMs) throw new Error("circuit open: failing fast");
+      this.state = "half-open"; // let one trial call through
+    }
+    try {
+      const result = await fn();
+      this.state = "closed";
+      this.failures = 0;
+      return result;
+    } catch (err) {
+      this.failures++;
+      if (this.state === "half-open" || this.failures >= this.threshold) {
+        this.state = "open";
+        this.openedAt = this.now();
+      }
+      throw err;
+    }
+  }
+}
+```
+
+Tested with a threshold of 3 and a 1-second cool-down: three failing calls opened the breaker, the next two failed
+fast without calling the dependency, a call at 500 ms still failed fast, a trial at 1.2 s failed and reopened it, and a
+trial after the next cool-down succeeded and closed it. (This sketch lets every call through while half-open; real
+libraries admit only one or a few trial calls.)
+
+What a breaker buys:
+
+- **The caller stops wasting time and connections** on a dependency that's down, and its own users get a fast error
+  (or a fallback) instead of a 30-second wait.
+- **The dependency gets room to recover** instead of being hammered by retries.
+
+What to do when it's open: a **fallback**. Snip's "check before saving" falls back to saving the link and queuing the
+check, as it did before the paid feature existed. A breaker without a sensible fallback just turns slow errors into
+fast ones, which is still an improvement.
+
+Tune it on real numbers: trip on a failure **rate** over a window (say, over 50% of the last 20 calls, counting
+timeouts as failures), not on one bad call; keep the cool-down short enough that recovery is noticed quickly.
+
+## Bulkheads: don't share what one failure can exhaust
+
+A ship's hull is divided into watertight compartments, so a breach floods one section rather than sinking the ship.
+The **bulkhead pattern** does the same with resources: give each dependency its **own pool** of connections, threads
+or concurrency slots, so one that hangs can exhaust only its own.
+
+Snip splits each app server's outbound connections:
+
+| Dependency | Pool | If it hangs |
+| --- | --- | --- |
+| Links service (redirects) | 30 connections | Redirects suffer, nothing else |
+| Payment provider | 10 | Upgrades fail; redirects fine |
+| URL-safety service | 5 | Checks queue or fail fast; redirects fine |
+| Everything else | 5 | Contained |
+
+With bulkheads, the safety service's slowdown fills only its 5 connections. Further calls to it wait briefly for a
+slot and then fail fast, the breaker trips, and redirects never notice. The same idea applies at every level:
+separate worker pools for different queues (<L id="07.05" />), separate database connection pools for the API and for
+batch jobs, separate clusters for the free and paid plans.
+
+<Analogy>
+  **A house's fuse box.** Each circuit has its own fuse (bulkheads), so a fault in the kitchen doesn't cut the lights upstairs. And a fuse that blows stops current flowing into the fault at once (the breaker), until someone checks it and resets it.
+</Analogy>
+
+## Where they fit
+
+Timeouts first (<L id="03.09" />), then bulkheads to contain, then breakers to fail fast and give the dependency a
+rest, then load shedding at the front door (<L id="03.11" />). Each one is a new mode of behaviour, so test it: break a
+dependency on purpose in staging and watch the breaker open and the fallback work.
+
+<SeenInProduction>
+  <Seen
+    company="Martin Fowler"
+    system="Circuit breaker"
+    year={2014}
+    href="https://martinfowler.com/bliki/CircuitBreaker.html"
+    source="CircuitBreaker (martinfowler.com)"
+    found="Trip after a threshold of failures, return errors without calling the dependency, and use half-open trials to recover."
+  >
+    Fowler explains that remote calls can hang until a timeout, and that many callers on an unresponsive supplier can
+    run out of critical resources, leading to cascading failures across systems. The breaker calls the protected code
+    while closed; once failures reach a threshold it trips, and further calls return an error without the protected
+    call being made. A half-open state lets a real call through as a trial to see if the problem is fixed, resetting
+    the breaker to closed if it succeeds.
+  </Seen>
+  <Seen
+    company="Netflix"
+    system="Hystrix"
+    year="Archived"
+    href="https://github.com/Netflix/Hystrix"
+    source="Hystrix (Netflix on GitHub)"
+    found="The library that popularised breakers and isolation is now in maintenance mode; Netflix points to resilience4j."
+  >
+    Hystrix is a latency and fault tolerance library designed to isolate points of access to remote systems and
+    third-party libraries and stop cascading failure, with fallbacks, failing fast, and thread and semaphore isolation
+    with circuit breakers. Its README says it is no longer in active development and is in maintenance mode, and
+    recommends open, active projects such as resilience4j for new work.
+  </Seen>
+  <Seen
+    company="Microsoft"
+    system="Bulkhead pattern"
+    year="Docs"
+    href="https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead"
+    source="Bulkhead pattern (Azure Architecture Center)"
+    found="Isolate elements into pools so one failing doesn't stop the others, such as a connection pool per downstream service."
+  >
+    The pattern isolates elements of an application into pools so that if one fails, the others continue to work,
+    named after a ship's hull, where only the damaged section fills with water. One example: a consumer that calls
+    several services can be given a connection pool for each, so a service that starts failing affects only its own
+    pool.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip adds a circuit breaker around the payment provider, but all outbound calls still share one 50-connection pool. The provider hangs. What still goes wrong?"
+  options={[
+    { text: "Nothing: the breaker opens and calls fail fast", why: "The breaker only opens after failures are counted, and timeouts take time. Meanwhile hung calls hold connections from the shared pool." },
+    { text: "Before the breaker trips, hung payment calls can fill the shared pool and block other dependencies; give payments its own pool", correct: true, why: "Breakers limit how long you keep calling a broken dependency; bulkheads limit how much of your capacity it can hold while you find out. You need both." },
+    { text: "The breaker will block the other dependencies too", why: "A breaker wraps one dependency. The shared pool is what spreads the failure." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**One shared pool for every dependency.** One hang exhausts it for all. Give each dependency its own.</li>
+    <li>**Breakers with no fallback plan.** Decide what users get when it's open: cached data, a queued action, a clear error.</li>
+    <li>**Tripping on single failures.** Use a failure rate over a window, with timeouts counted as failures.</li>
+    <li>**Never testing the open state.** Break the dependency on purpose and watch what users see.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Failures spread through shared resources: a slow dependency holds connections everything else needs.</li>
+    <li>A circuit breaker fails fast while a dependency is sick (open), then tests it (half-open) before trusting it (closed).</li>
+    <li>Bulkheads give each dependency its own pool, so one failure can only exhaust its own share.</li>
+    <li>Pair breakers with fallbacks, tune them on failure rates, and test the failure path.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you stop a failing downstream service from bringing down your service?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Explain the circuit breaker's states.", "What's a bulkhead, and why do you need it as well as a breaker?"]}
+>
+  <p>Start with timeouts on every call so nothing waits indefinitely. Then bulkheads: separate connection pools, thread pools or concurrency limits per dependency, so a hanging dependency can only exhaust its own resources and the rest of the service keeps working. Then circuit breakers: count failures and timeouts per dependency, and once the failure rate crosses a threshold, open the circuit so calls fail immediately; after a cool-down, half-open lets a trial call through and closes the circuit if it succeeds.</p>
+  <p>When the circuit is open I'd serve a fallback: cached data, a degraded feature, or queuing the work for later. Breakers also give the dependency room to recover instead of being hammered with retries. And I'd test this by deliberately breaking dependencies in staging, because these code paths otherwise only run during incidents.</p>
+</InterviewCard>

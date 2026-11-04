@@ -83,7 +83,7 @@ Two other designs exist, with harder trade-offs, covered in Part 2's distributed
 
 - **Multi-leader:** several nodes accept writes (often one per region) and exchange changes. Writes are local and
   fast; concurrent writes to the same data conflict and must be resolved.
-- **Leaderless:** clients write to several replicas and read from several, using quorums (<L id="08.04" />).
+- **Leaderless:** clients write to several replicas and read from several, using <Term t="quorum">quorums</Term> (<L id="08.04" />).
 
 <SeenInProduction>
   <Seen

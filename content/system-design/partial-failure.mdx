@@ -1,0 +1,128 @@
+export const meta = {
+  summary: "On one machine, things work or crash. Across a network, some parts fail while others carry on, messages vanish, and a slow reply looks exactly like a dead server. Why that changes how you design, and the habits that cope with it.",
+  uses: ["03.08", "03.09", "07.03", "01.03"],
+  usedIn: ["08.02", "08.07", "08.09", "08.10"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.08" /> and <L id="03.09" />: calls across a network, timeouts and retries. The "did it happen?"
+  question was the heart of <L id="07.03" />; here it's the general case.
+</BeforeYouStart>
+
+## The problem: did it happen or not?
+
+Snip's admin tool blocks a phishing link by calling the links service: `POST /links/x7Kp/block`. The call times out
+after two seconds. The admin wants to know one thing: **is the link blocked?**
+
+There's no way to tell from the timeout. The request may never have arrived. It may have arrived and the service
+crashed before acting. It may have blocked the link and the reply was lost. Or the service is just slow, and it will
+block the link a second from now. A program on one machine never has this problem: a function call returns or throws.
+A call across a network has a third outcome, **unknown**.
+
+## Eight places for one call to go wrong
+
+Amazon's Jacob Gabrielson lists the steps every request and reply goes through, at a minimum: post the request,
+deliver it, validate it, update the server's state, post the reply, deliver it, validate it, update the client's
+state. Each can fail on its own, and for most of them the client sees the same thing: no answer. As the article puts
+it, the result of any network operation can be unknown, "in which case the request may have succeeded, failed, or
+received but not processed".
+
+| What actually happened | What the caller sees |
+| --- | --- |
+| The request was lost | Timeout |
+| The server crashed before acting | Timeout |
+| The server acted, then the reply was lost | Timeout |
+| The server is slow (overloaded, paused for garbage collection) | Timeout, then maybe a late success |
+| The network is split; the server is fine for everyone else | Timeout, from this side only |
+
+## Partial failure
+
+In a distributed system, some parts fail while others keep working. That's **partial failure**, and it comes in more
+forms than "crashed":
+
+- **Crash**: the process stops. The easy case, if you can tell.
+- **Omission**: messages are dropped, in one direction or both.
+- **Slowness**: the node works, just too slowly to be useful. Often called a *gray failure*, because health checks
+  pass while users suffer.
+- **Partition**: the network splits, and each side thinks the other died.
+- **Wrong clocks**: the node works, but its idea of the time is off (<L id="05.06" />).
+
+The hard truth is that **a slow node and a dead node look the same** from outside. A timeout is a guess: "it's been
+long enough that I'll act as if it's gone". Guess too soon and you fail over from a healthy node; too late and users
+wait.
+
+<Analogy>
+  **Sending a letter that matters.** You post a cheque and hear nothing. Was it lost in the post, sitting unopened, cashed with no reply, or is the reply on its way? Sending a second cheque risks paying twice; doing nothing risks never paying. The only safe moves are to make repeats harmless (write "replaces cheque 1041") or to ask, using a reference you both know.
+</Analogy>
+
+## Habits that cope
+
+1. **Assume unknown, and make retries safe.** Every call that changes something gets an idempotency key or is
+   naturally repeatable (<L id="03.10" />, <L id="07.03" />). Then "unknown" has a simple answer: try again.
+2. **Ask, don't assume.** After a timeout, the admin tool can read the link's status before retrying, or show
+   "blocking…" until a later check confirms.
+3. **Time out everything**, with limits based on measured latency, not hope (<L id="03.09" />).
+4. **Expect slow, not just dead.** Watch latency percentiles, not just up/down health checks, and stop sending work
+   to a node that's slow (<L id="08.09" />).
+5. **Don't let one failure spread.** Bound queues, isolate resources and shed load (<L id="03.11" />), so a sick
+   dependency doesn't take everything with it.
+6. **Test the failures.** Kill processes, drop packets, add delay and pause nodes in testing. A system tested only
+   on a healthy network has never been tested for the conditions it will meet.
+
+The rest of this module builds on this: how to agree on anything (<L id="08.06" />), who's in charge
+(<L id="08.07" />), and what "consistent" can even mean (<L id="08.02" />) when any message might be lost or late.
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Distributed systems at AWS"
+    year={2019}
+    href="https://builder.aws.com/content/3F08f7GPFiZMCgXD8gny6OjxR0Z/challenges-with-distributed-systems"
+    source="Challenges with distributed systems (Jacob Gabrielson, Amazon Builders' Library)"
+    found="Every network call has eight steps that can each fail, and its result can always be unknown."
+  >
+    The article lists the same eight steps for every request and reply, and calls their failure forms "the eight
+    failure modes of the apocalypse". A timeout means the result is unknown: it may or may not have happened, and the
+    client must handle that correctly. It also notes how this multiplies testing: a test plan of 10 scenarios becomes
+    200 once each network call is tested for five possible outcomes.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's billing service calls the payment provider to charge £5, and the call times out. What should it do?"
+  options={[
+    { text: "Retry the charge right away", why: "If the first charge went through and only the reply was lost, a plain retry charges twice." },
+    { text: "Retry with the same idempotency key, or look up the payment's status first", correct: true, why: "The outcome is unknown. An idempotency key lets the provider recognise the repeat, and a status check answers the question directly." },
+    { text: "Assume it failed and tell the user", why: "It may have succeeded. Telling the user it failed invites them to pay again." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Treating a timeout as a failure.** It means unknown. Make repeats safe, or check before acting.</li>
+    <li>**Health checks that only test "alive".** Slow nodes pass them. Watch latency too.</li>
+    <li>**Timeouts tuned once and forgotten.** Too short fails over healthy nodes; too long makes users wait.</li>
+    <li>**Testing only the happy network.** Inject delays, drops and pauses before production does.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A network call can succeed, fail, or end unknown; a timeout can't tell you which.</li>
+    <li>Parts fail independently: crashes, lost messages, slowness, partitions, bad clocks.</li>
+    <li>Slow and dead look the same from outside; a timeout is a guess.</li>
+    <li>Make retries safe, ask when unsure, time out everything, watch for slowness, contain failures, and test them.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What makes distributed systems harder than programs on one machine?", level: "Mid", frequency: 2, importance: "Must-know", kind: "Concept" }}
+  followUps={["How can you tell a slow node from a dead one?", "How do you handle a request that timed out?"]}
+>
+  <p>Partial failure. On one machine a call either returns or the whole process crashes; across a network some components fail while others keep running, messages can be lost, delayed or duplicated, clocks disagree, and the network can partition. Above all, a request that times out has an unknown outcome: it may not have arrived, may have been processed with the reply lost, or may still be running.</p>
+  <p>You can't reliably distinguish a slow node from a dead one, so timeouts are guesses. The practical response is to make operations idempotent so retries are safe, use timeouts everywhere, query state when unsure, monitor latency and not just liveness, isolate failures so they don't cascade, and test with injected faults like packet loss, delays and process pauses.</p>
+</InterviewCard>

@@ -1,0 +1,155 @@
+export const meta = {
+  summary: "'Consistent' means a dozen different things. The useful ladder, from linearizable down to eventual, what each promises a user in plain terms, which ones survive a network partition, and how to pick per feature.",
+  uses: ["08.01", "04.07", "01.03", "06.04"],
+  usedIn: ["08.03", "08.04", "08.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="08.01" /> and <L id="04.07" /> (replication lag). "Consistency" in <L id="01.03" /> was the everyday
+  meaning; this lesson makes it precise.
+</BeforeYouStart>
+
+## The problem: Snip in two regions
+
+Snip now serves Europe from Frankfurt and the Americas from Virginia. Each region has replicas of the links database,
+and changes are copied between them in about 100 ms, usually. An owner in Berlin edits `x7Kp` to point at the summer
+sale, then opens the dashboard, which happens to read from a replica that hasn't caught up. Their edit has vanished.
+They refresh, land on a different replica, and it's back. Refresh again: gone.
+
+Every replicated system answers the question "what can a reader see after a write?" The answers are called
+**consistency models**, and choosing one per feature is a design decision, not a database setting you leave at the
+default.
+
+## The ladder
+
+From strongest to weakest, with what each means for Snip's users:
+
+| Model | The promise | Snip example |
+| --- | --- | --- |
+| **Linearizable** | The system behaves as if there were one copy: once a write completes, every later read, anywhere, sees it | Claiming a custom short code: two owners must never both get `summer` |
+| **Sequential** | Everyone sees all operations in the same order, though maybe late | (Rarely chosen on its own) |
+| **Causal** | If one change could have caused another, everyone sees them in that order | A reply to a comment never appears before the comment |
+| **Read your writes** | You always see your own changes | The Berlin owner sees their edit at once |
+| **Monotonic reads** | Once you've seen a value, you never see an older one | The edit doesn't flicker in and out on refresh |
+| **Eventual** | If writes stop, all replicas eventually agree | Click counts in the dashboard |
+
+The first two are about **all readers**; read-your-writes and monotonic reads are **session guarantees**, about what one
+user sees. Eventual consistency, in Werner Vogels's definition, guarantees only that if no new updates are made,
+"eventually all accesses will return the last updated value", which says nothing about what you see in the meantime.
+
+## What survives a partition
+
+Stronger models need replicas to coordinate, and coordination needs the network. Jepsen's summary of the models is
+blunt:
+
+- **Linearizable and sequential** cannot stay available on both sides of a <Term t="network-partition">network split</Term>. One side has to refuse.
+- **Causal and read-your-writes** are *sticky available*: they keep working during a split as long as each client keeps
+  talking to the same replica.
+- **Monotonic reads and eventual consistency** can be *totally available*: any reachable replica can answer.
+
+That's the real trade behind the <Term t="cap-theorem">CAP theorem</Term> (<L id="08.03" />), and it's also a latency trade: even with no
+partition, a linearizable read across regions waits for a cross-region round trip, around 100 ms between Frankfurt
+and Virginia.
+
+## Getting the session guarantees cheaply
+
+Most of what users notice is fixed by the two session guarantees, without making the whole system linearizable:
+
+- **Read your writes**: after an owner writes, send their reads to the primary (or to a replica that has caught up to
+  their write's position) for a few seconds. Snip stores "last write at log position 1,840,221" in the owner's session;
+  a replica serves them only if it's applied at least that far (<L id="04.07" />).
+- **Monotonic reads**: pin each user to one replica (by hashing their ID), so refreshes don't bounce between replicas
+  with different lag.
+
+<Sequence
+  title="Without monotonic reads: an edit flickers"
+  walk
+  participants={[{ id: "u", label: "Owner in Berlin" }, { id: "r1", label: "Replica 1 (caught up)" }, { id: "r2", label: "Replica 2 (300 ms behind)" }]}
+  messages={[
+    { from: "u", to: "r1", label: "GET x7Kp", explain: "The first read goes to a replica that has the edit." },
+    { from: "r1", to: "u", label: "summer sale", reply: true, explain: "The owner sees their new destination." },
+    { from: "u", to: "r2", label: "GET x7Kp", explain: "The refresh is load-balanced to a different replica, still behind." },
+    { from: "r2", to: "u", label: "spring sale", reply: true, fail: true, explain: "Time appears to go backwards: the old destination is back. Pinning the user to one replica stops this." },
+  ]}
+/>
+
+## Choosing per feature
+
+Strong consistency is expensive, so spend it where a wrong answer is costly:
+
+- **Uniqueness, money, permissions**: linearizable. Snip claims custom codes with a single leader for that key (or
+  <Term t="consensus">consensus</Term>, <L id="08.06" />), and accepts that claiming a code fails during a partition.
+- **A user's own data**: read your writes and monotonic reads.
+- **Counters, feeds, analytics**: eventual, with staleness you've agreed (<L id="06.04" />).
+
+<Analogy>
+  **A shared family calendar.** Linearizable is one paper calendar on the fridge: everyone sees the same thing, but you have to be in the kitchen to use it. Eventual is everyone's phone syncing whenever it gets signal. Read-your-writes is your own phone always showing what you just added; monotonic reads is it never un-showing something.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Jepsen"
+    system="Consistency models"
+    year="Reference"
+    href="https://jepsen.io/consistency/models"
+    source="Consistency Models (Jepsen)"
+    found="A map of consistency models, with which ones can stay available during a network partition."
+  >
+    Jepsen arranges models in a hierarchy: for single objects, linearizable implies sequential, which implies causal,
+    which in turn implies the weaker session guarantees such as read your writes and monotonic reads. It defines a
+    linearizable system as one where every operation appears to take place atomically, in an order consistent with
+    real time, and notes that models at or stronger than sequential cannot be totally available, while read your writes
+    and causal consistency can be sticky available.
+  </Seen>
+  <Seen
+    company="Amazon"
+    system="S3"
+    year="Docs"
+    href="https://aws.amazon.com/s3/consistency/"
+    source="Amazon S3 Strong Consistency"
+    found="Strong read-after-write consistency at enormous scale, with no extra cost or speed penalty."
+  >
+    S3 now provides strong read-after-write consistency for all GET, PUT and LIST operations and for changes to object
+    tags, ACLs and metadata: after a successful write, overwrite or delete, any later read gets the latest version.
+    The page says this comes without changes to performance or availability, and at no additional cost.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip lets owners claim custom codes like snip.link/summer. Two owners in different regions claim 'summer' at the same moment. Which model does the claim need?"
+  options={[
+    { text: "Eventual: the regions will agree in the end", why: "They'll agree that one of them owns it, after both were told they did. That's the bug." },
+    { text: "Linearizable, for that operation", correct: true, why: "Uniqueness needs a single order of claims that everyone respects, as if there were one copy. Snip routes claims for a code to one place and accepts that claims can fail during a partition." },
+    { text: "Read your writes", why: "That only guarantees each owner sees their own claim, which is exactly how both would think they'd won." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**"Consistent" without saying which model.** Name the guarantee: linearizable, read-your-writes, eventual.</li>
+    <li>**Strong consistency everywhere.** It costs latency and availability. Use it for uniqueness, money and permissions.</li>
+    <li>**Ignoring session guarantees.** Most user-visible weirdness is missing read-your-writes or monotonic reads, which are cheap.</li>
+    <li>**Eventual with no bound.** Agree how stale is acceptable, and measure it.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Consistency models say what readers may see after writes; pick one per feature.</li>
+    <li>Linearizable acts like one copy; causal keeps cause before effect; session guarantees protect each user's view; eventual promises only convergence.</li>
+    <li>Linearizable and sequential can't stay available on both sides of a partition; causal and session guarantees can, with sticky clients.</li>
+    <li>Get read-your-writes and monotonic reads cheaply with session tokens and replica pinning; reserve linearizability for uniqueness and money.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Explain strong versus eventual consistency. What's in between?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How would you give a user read-your-writes on a replicated database?", "Which consistency would you choose for a like counter, and why?"]}
+>
+  <p>Strong consistency, precisely linearizability, means the system behaves as if there's a single copy: once a write completes, every subsequent read anywhere sees it. Eventual consistency only promises that replicas converge if writes stop; meanwhile reads can return old values. In between are causal consistency, which preserves cause-and-effect order, and session guarantees: read-your-writes, so a user always sees their own changes, and monotonic reads, so they never see time go backwards.</p>
+  <p>Stronger models require coordination, so they cost latency and can't stay available on both sides of a partition. I'd choose per feature: linearizable for uniqueness, payments and permissions; read-your-writes and monotonic reads for a user's own data, implemented by routing to the primary after a write or tracking the user's last write position and pinning them to a replica; and eventual for counters and feeds with an agreed staleness bound.</p>
+</InterviewCard>

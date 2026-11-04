@@ -1,0 +1,153 @@
+export const meta = {
+  summary: "How hundreds of machines keep track of which of them are alive without a central list or all-to-all heartbeats. Gossip spreads news in a handful of rounds; SWIM-style probing detects failures with constant load per member.",
+  uses: ["08.01", "05.03", "06.06"],
+  usedIn: ["15.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="08.01" />: failure detection is guessing. Membership is what a hash ring needs to know which nodes exist
+  (<L id="05.03" />, <L id="06.06" />).
+</BeforeYouStart>
+
+## The problem: who's alive?
+
+Snip's live click counts (<L id="07.09" />) run on 400 gateway servers across two regions. Each needs to know which
+of the others are alive, to route subscriptions and spread load. Servers come and go all day with deploys and
+autoscaling, and some fail without saying goodbye.
+
+Two obvious designs struggle:
+
+- **A central registry** that everyone heartbeats to. Simple, and fine for many systems (it's what etcd or Consul's
+  servers can do), but it's another critical service, and a partition from it makes healthy servers look dead.
+- **Everyone heartbeats everyone.** 400 servers each pinging 399 others every second is about 160,000 messages a
+  second, growing with the square of the cluster size. The SWIM paper opens with exactly this problem: traditional
+  heartbeating protocols "impose network loads that grow quadratically with group size", or detect failures slowly or
+  wrongly.
+
+## Gossip: tell a few, who tell a few
+
+In a **gossip** (or epidemic) protocol, each node periodically picks a few random peers and shares what it knows:
+"server 117 joined", "server 42 looks dead". Those peers pass it on in their next round, and so on. News spreads like
+a rumour: the number of nodes that know roughly multiplies each round.
+
+Simulated with each node telling 3 random peers per round (averaged over 30 runs):
+
+| Nodes | Rounds until everyone knows |
+| --- | --- |
+| 100 | about 6 |
+| 1,000 | about 8 |
+| 10,000 | about 10 |
+| 100,000 | about 13 |
+
+The rounds grow with the **logarithm** of the cluster size: ten times the nodes costs only two or three more rounds.
+Each node sends the same few messages per round however big the cluster gets. And there's no single point of
+failure: news routes around dead nodes on its own.
+
+The price is that it's **eventually consistent** (<L id="08.02" />): for a few rounds, different nodes have different
+views of the membership. Systems built on gossip must tolerate that, for example by retrying a request on another node
+if the first turns out to be gone.
+
+## Detecting failures: SWIM
+
+SWIM (Scalable Weakly-consistent Infection-style Membership) separates the two jobs:
+
+**Failure detection, by probing.** Every period, each node pings **one** random member. If it gets no reply in time,
+it doesn't declare the member dead; it asks **k** other members to ping it on its behalf (`ping-req`). Only if none of
+them gets a reply is the member **suspected**. This indirect check filters out problems that are only between two
+nodes, such as one congested link.
+
+**Suspicion before death.** A suspected member isn't removed at once. The suspicion is gossiped, and the member has a
+short time to refute it ("I'm alive, incarnation 8"). Only if it doesn't is it declared dead. This cuts false
+failures from a node that was briefly slow.
+
+**Dissemination, by piggybacking.** Membership news (joins, suspicions, deaths) isn't sent separately; it rides along
+on the ping and ack messages already being sent, infection-style.
+
+The result, from the paper: the expected time to first detect a failure and the expected message load per member
+**don't vary with group size**.
+
+<Analogy>
+  **News in a village.** The council doesn't phone every household. Each person mentions it to a couple of neighbours over the fence, who mention it to theirs, and by evening everyone knows. If you haven't seen old Mr Jones for a day, you don't announce he's died; you ask two of his neighbours to knock, and give him a chance to answer.
+</Analogy>
+
+## Where you'll meet it
+
+- **Consul** uses a gossip protocol (Serf) for membership and failure detection among all its agents, in a LAN pool per
+  datacenter and a WAN pool between datacenters, alongside <Term t="raft">Raft</Term> among its servers for data that needs <Term t="consensus">consensus</Term>
+  (<L id="08.06" />).
+- HashiCorp's **memberlist** library, which Serf builds on, implements SWIM with extensions, including Lifeguard, which
+  makes it more robust when a member is slow at processing messages.
+- Many Dynamo-style databases and cache clusters gossip membership and ring layout between nodes, so any node can
+  route a request (<L id="08.04" />).
+
+A common pattern combines both: **gossip for who's alive** (large, changing, eventually consistent), **consensus for
+who's in charge and what the configuration is** (small, critical, must agree).
+
+<SeenInProduction>
+  <Seen
+    company="Cornell University"
+    system="SWIM"
+    year={2002}
+    href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf"
+    source="SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol (Das, Gupta and Motivala)"
+    found="Probe one random member per period, ask others to confirm before suspecting, and piggyback updates: load and detection time stay constant as the group grows."
+  >
+    The paper is motivated by the unscalability of traditional heartbeating, whose network load grows quadratically
+    with group size. SWIM separates failure detection from spreading membership updates. Members are monitored by
+    periodic randomized probing, so that both the expected time to first detect a failure and the expected message
+    load per member don't vary with group size. Membership changes are spread by piggybacking on ping messages and
+    acknowledgements, an infection-style (epidemic or gossip) dissemination.
+  </Seen>
+  <Seen
+    company="HashiCorp"
+    system="Consul and memberlist"
+    year="Docs"
+    href="https://developer.hashicorp.com/consul/docs/architecture/gossip"
+    source="Gossip (Consul documentation)"
+    found="Gossip for membership and failure detection across every agent; Raft only among the servers."
+  >
+    Consul uses Serf, a gossip protocol, to manage membership and broadcast messages to the cluster. A LAN gossip pool
+    covers all nodes in a datacenter and distributes failure detection throughout it, and a WAN pool connects
+    datacenters. The underlying [memberlist](https://github.com/hashicorp/memberlist) library is based on SWIM, extended
+    with changes including Lifeguard to cope with members that are slow at processing messages.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's gateway fleet grows from 400 to 4,000 servers using SWIM-style gossip. Roughly what happens to each server's membership traffic and to the time for news to reach everyone?"
+  options={[
+    { text: "Traffic per server grows tenfold; news takes ten times longer", why: "That's all-to-all heartbeating. Gossip keeps per-member load flat." },
+    { text: "Traffic per server stays about the same; news takes a few more rounds", correct: true, why: "Each server still probes one member per period and piggybacks updates. Spreading takes rounds proportional to the logarithm of the size, so ten times the servers adds only a couple of rounds." },
+    { text: "Traffic stays the same, but news never reaches everyone", why: "Gossip reaches everyone with high probability within a few extra rounds." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**All-to-all heartbeats in large clusters.** Load grows with the square of the size. Gossip instead.</li>
+    <li>**Declaring death on one missed ping.** Ask others to probe, and allow a suspicion period to refute.</li>
+    <li>**Expecting every node to agree on membership at every moment.** Gossip converges; design for brief disagreement.</li>
+    <li>**Using gossip for decisions that must agree.** Leaders, locks and configuration need consensus.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Membership means knowing which nodes are alive; central registries and all-to-all heartbeats struggle at scale.</li>
+    <li>Gossip spreads news to everyone in a number of rounds that grows with the logarithm of cluster size.</li>
+    <li>SWIM probes one random member per period, confirms through others, suspects before declaring death, and piggybacks updates.</li>
+    <li>Use gossip for who's alive and consensus for who's in charge.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do nodes in a large cluster detect failures and keep track of membership?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why not have every node heartbeat every other node?", "How do you avoid declaring a slow node dead?"]}
+>
+  <p>All-to-all heartbeats cost messages that grow with the square of the cluster size, and a central registry is a bottleneck and single point of failure. Instead, gossip: each node periodically exchanges membership information with a few random peers, so news reaches everyone in a number of rounds logarithmic in cluster size, with constant load per node and no central component.</p>
+  <p>For failure detection, SWIM has each node ping one random member per period; if there's no ack, it asks k other members to ping indirectly, which filters out problems on a single link. A member that still doesn't answer is marked suspect and gossiped as such, and it can refute the suspicion before being declared dead. Updates piggyback on the pings. The view is eventually consistent, so anything that needs agreement, like leadership, still goes through consensus.</p>
+</InterviewCard>

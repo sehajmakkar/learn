@@ -1,0 +1,160 @@
+export const meta = {
+  summary: "What the CAP theorem actually says, why 'pick two of three' misleads, and PACELC: the trade-off between latency and consistency that you pay every day, not just during partitions. Snip's choices, operation by operation.",
+  uses: ["08.02", "08.01", "01.06"],
+  usedIn: ["08.04", "08.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="08.02" />: CAP is about one of those models, <Term t="linearizable">linearizability</Term>. <L id="08.01" /> explains what a partition
+  is.
+</BeforeYouStart>
+
+## The problem: the cable between regions is cut
+
+A fibre fault cuts the link between Snip's Frankfurt and Virginia regions for twenty minutes. Both regions are up, and
+users on each side can reach their own. An owner in Berlin edits `x7Kp`; Frankfurt can't tell Virginia. Snip has to
+choose, right now:
+
+- **Accept the edit** in Frankfurt. Virginia keeps redirecting to the old destination until the link heals: available,
+  but not consistent.
+- **Refuse the edit** until Virginia can be told. Everyone sees the same thing, but Berlin owners get errors for twenty
+  minutes: consistent, but not available.
+
+That forced choice is the CAP theorem.
+
+## What CAP says, precisely
+
+The everyday version, "consistency, availability, partition tolerance: pick two", causes most of the confusion. Martin
+Kleppmann's reading of the formal version is the useful one:
+
+- **C** means **linearizable** (<L id="08.02" />), not "consistent" in any looser sense.
+- **A** means every request to a non-failing node gets a non-error response, eventually.
+- **P** isn't really a choice. Networks partition whether you like it or not.
+
+So CAP says: **when the network is partitioned, a system can't be both linearizable and fully available.** That's it.
+Eric Brewer, who stated the conjecture, wrote twelve years later that the "2 of 3" formulation "was always misleading",
+and that since partitions are rare there's little reason to give up C or A when the system isn't partitioned.
+
+Three consequences people miss:
+
+- **The choice is per operation, not per database.** Snip can stay available for redirects and refuse code claims in
+  the same partition.
+- **Most systems are neither "CP" nor "AP".** A single-leader database with async replicas isn't linearizable (replicas
+  lag) and isn't available on the minority side of a split. Kleppmann's point is that these labels describe almost
+  nothing real; describe the actual guarantees instead.
+- **It says nothing about the 99.9% of the time with no partition.** That's where PACELC comes in.
+
+## PACELC: the trade-off you pay every day
+
+Daniel Abadi's extension adds the case that matters most often:
+
+**If there is a Partition**, choose **Availability or Consistency**; **Else**, choose **Latency or Consistency**.
+
+Even with a healthy network, keeping replicas consistent means waiting for them. A linearizable write in Snip waits
+for the other region to confirm, about 100 ms across the Atlantic. Answering from the local replica is fast but may be
+stale. Every replicated system makes this trade on every request, which is why it shapes designs far more than
+partitions do.
+
+| System (default settings) | During a partition | Normally | PACELC |
+| --- | --- | --- | --- |
+| Dynamo, Cassandra, Riak | Availability | Latency | PA/EL |
+| VoltDB/H-Store, Megastore | Consistency | Consistency | PC/EC |
+| BigTable, HBase | Consistency | Consistency | PC/EC |
+
+Systems with tunable settings move along this: raising read and write <Term t="quorum">quorums</Term> in Cassandra buys consistency with
+latency (<L id="08.04" />).
+
+## Snip, operation by operation
+
+| Operation | Partition (PA or PC) | Normally (EL or EC) | Why |
+| --- | --- | --- | --- |
+| Redirect | A: answer from the local region | L: local cache and replica | A redirect to a minutes-old destination beats an error |
+| Edit a destination | A: accept locally, reconcile later | L: async copy to the other region | Edits are rare and per-owner; last edit wins, with versions (<L id="05.06" />) |
+| Claim a custom code | C: refuse in the minority region | C: route to the code's home region | Two owners must never both get `summer` |
+| Charge for Pro | C | C | Money |
+
+<Analogy>
+  **Two branches of a bank during a phone outage.** A customer at one branch wants to withdraw. The branch can pay out (available) and risk the account being emptied at the other branch too, or refuse until the line is back (consistent). And even on a normal day, phoning the other branch before every withdrawal is slower than trusting the local ledger: that everyday trade is the "else" in PACELC.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Eric Brewer"
+    system="CAP, revisited"
+    year={2012}
+    href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/"
+    source="CAP Twelve Years Later: How the 'Rules' Have Changed (IEEE Computer, republished by InfoQ)"
+    found="The author of CAP calls 'two of three' misleading: the C-or-A choice is about partitions, and can be made at fine granularity."
+  >
+    Brewer writes that the "2 of 3" formulation was always misleading because it oversimplified the tensions between
+    the properties, and that CAP prohibits only a small part of the design space: perfect availability and consistency
+    in the presence of partitions, which are rare. Designers still choose between consistency and availability when
+    partitions are present, and the choice can happen many times within one system, at very fine granularity.
+  </Seen>
+  <Seen
+    company="Daniel Abadi"
+    system="PACELC"
+    year={2012}
+    href="https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf"
+    source="Consistency Tradeoffs in Modern Distributed Database System Design (IEEE Computer, February 2012)"
+    found="The latency-versus-consistency trade-off applies all the time, not just during partitions."
+  >
+    Abadi rewrites CAP as PACELC: if there is a partition, how does the system trade off availability and consistency;
+    else, in normal operation, how does it trade off latency and consistency. The default versions of Dynamo,
+    Cassandra and Riak are PA/EL, giving up consistency both for availability and for lower latency, though their
+    settings let users change the trade by raising R + W. Fully ACID systems such as VoltDB/H-Store and Megastore are
+    PC/EC, as are BigTable and HBase.
+  </Seen>
+  <Seen
+    company="Martin Kleppmann"
+    system="CAP definitions"
+    year={2015}
+    href="https://martin.kleppmann.com/2015/05/11/please-stop-calling-databases-cp-or-ap.html"
+    source="Please stop calling databases CP or AP"
+    found="CAP's C is linearizability and its A is strict; many real systems are neither CP nor AP."
+  >
+    Kleppmann points out that consistency in CAP actually means linearizability, and availability means every request
+    received by a non-failing node must get a non-error response. By those definitions many systems are neither
+    consistent nor available under CAP, so the labels say little; he argues for describing the actual guarantees
+    instead.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="An interviewer asks: 'Is your Postgres primary with two async read replicas CP or AP?' What's the best answer?"
+  options={[
+    { text: "CP, because Postgres is a consistent database", why: "Reads from async replicas can be stale, so it isn't linearizable." },
+    { text: "AP, because replicas keep serving reads", why: "Writes on the minority side of a partition fail, so it isn't CAP-available either." },
+    { text: "Neither, strictly: describe the guarantees instead, such as linearizable writes on the primary, stale reads on replicas, and writes unavailable without the primary", correct: true, why: "CAP's definitions are strict. Most real systems fit neither label, and saying exactly what each operation guarantees is more useful." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**"Pick two of three."** P isn't optional; the choice is C or A, during partitions only.</li>
+    <li>**Labelling whole databases CP or AP.** Choices are per operation, and most systems fit neither label.</li>
+    <li>**Ignoring the everyday trade.** Latency versus consistency (PACELC's "else") matters far more often than partitions.</li>
+    <li>**Using "consistency" loosely.** CAP's C is linearizability, not ACID's C.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>CAP: during a network partition, a system can't be both linearizable and fully available.</li>
+    <li>"Two of three" misleads: partitions aren't optional, they're rare, and the choice is per operation.</li>
+    <li>PACELC adds the everyday trade: without a partition, consistency still costs latency.</li>
+    <li>Describe real guarantees per operation instead of labelling systems CP or AP.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Explain the CAP theorem. What's commonly misunderstood about it?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What does PACELC add?", "Give an example of choosing differently for two operations in one system."]}
+>
+  <p>CAP says that when a network partition occurs, a distributed system must choose between consistency, meaning linearizability, and availability, meaning every request to a working node gets a non-error response. The common misunderstanding is "pick two of three": partitions aren't something you can opt out of, so the real choice is C or A while partitioned, and when there's no partition you can have both.</p>
+  <p>Two more nuances: the choice can be made per operation, and many systems are neither strictly CP nor AP. PACELC extends CAP: if partitioned, choose availability or consistency; else choose latency or consistency, because keeping replicas in sync costs round trips even when the network is fine. For a URL shortener I'd keep redirects available and low-latency from local replicas, but make custom-code claims and payments consistent, refusing them in a minority partition.</p>
+</InterviewCard>

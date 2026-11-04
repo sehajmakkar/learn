@@ -1,0 +1,189 @@
+export const meta = {
+  summary: "Ordering events without trusting wall clocks: the happened-before relation, Lamport clocks for a consistent order, vector clocks to detect concurrent writes, and hybrid logical clocks that stay close to real time. Tested code for each.",
+  uses: ["05.06", "08.04", "08.02"],
+  usedIn: ["08.06", "08.11"],
+};
+
+<BeforeYouStart>
+  Read <L id="05.06" />: it showed how clock skew loses writes under last-write-wins, and named the remedies. This
+  lesson builds them. Concurrent writes come from the multi-leader and leaderless stores of <L id="08.04" />.
+</BeforeYouStart>
+
+## The problem: which edit came first?
+
+Snip's team plan lets several people edit a link's note. Ana in Berlin and Ben in New York both open the note "Spring
+campaign" and change it within the same second: Ana to "Spring campaign, EU only", Ben to "Spring campaign, ends
+31 May". Each region accepts its edit and replicates it to the other.
+
+Which one wins? Comparing wall-clock timestamps picks whichever server's clock happened to read later, which
+<L id="05.06" /> showed can be wrong by milliseconds or more. But the deeper problem is that **neither edit came
+first.** Ana didn't see Ben's edit and Ben didn't see Ana's. They're **concurrent**, and the honest answer is "both";
+the system should notice that, rather than silently drop one.
+
+## Happened-before
+
+Leslie Lamport's 1978 paper gave the vocabulary. Event A **happened before** event B if:
+
+- they're on the same process and A came first, or
+- A is sending a message and B is receiving it, or
+- there's a chain of those from A to B.
+
+If neither happened before the other, they're **concurrent**: no information could have passed from one to the other.
+Lamport stressed that this is only a **partial** order, and that problems often arise because people aren't fully
+aware of that. Ana's and Ben's edits are concurrent.
+
+## Lamport clocks: a consistent order
+
+A **Lamport clock** is a counter on each node, with two rules from the paper: increment it between events, and when a
+message arrives, set your counter higher than both your own value and the timestamp the message carries.
+
+```ts
+export class LamportClock {
+  time = 0;
+  tick() {
+    return ++this.time; // a local event, or sending a message
+  }
+  receive(remote: number) {
+    this.time = Math.max(this.time, remote) + 1;
+    return this.time;
+  }
+}
+```
+
+This guarantees: if A happened before B, then A's timestamp is smaller than B's. Break ties by node ID, and you get a
+**total order** that every node agrees on, which respects causality. It's what lets replicas apply operations in the
+same order.
+
+What it can't do is the reverse. If A's timestamp is smaller, A may have happened before B, or they may be
+concurrent. A Lamport clock can't tell you that two edits conflicted.
+
+## Vector clocks: spotting concurrency
+
+A **vector clock** keeps one counter **per node**. Each node increments its own entry on a change, and a merge takes
+the maximum of each entry. Comparing two vectors gives one of four answers:
+
+```ts
+type VC = Record<string, number>;
+
+export const vcTick = (vc: VC, node: string): VC => ({ ...vc, [node]: (vc[node] ?? 0) + 1 });
+
+export const vcMerge = (a: VC, b: VC, node: string): VC => {
+  const out: VC = { ...a };
+  for (const [n, c] of Object.entries(b)) out[n] = Math.max(out[n] ?? 0, c);
+  return vcTick(out, node);
+};
+
+/** "before", "after", "equal" or "concurrent". */
+export function vcCompare(a: VC, b: VC) {
+  let less = false;
+  let more = false;
+  for (const n of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if ((a[n] ?? 0) < (b[n] ?? 0)) less = true;
+    if ((a[n] ?? 0) > (b[n] ?? 0)) more = true;
+  }
+  return less && more ? "concurrent" : less ? "before" : more ? "after" : "equal";
+}
+```
+
+Run on the note: the original version is `{eu: 1}`; Ana's edit becomes `{eu: 2}` and Ben's `{eu: 1, us: 1}`. Comparing
+the original with Ana's gives `before`; Ana's with Ben's gives **`concurrent`**; and a version that merges both gives
+`after` either. So the store can keep **both** versions (often called *siblings*) and let the app or a person resolve
+them, here by showing Ana and Ben a conflict, or by merging the two notes.
+
+The cost is size: one entry per node that has written the key. Systems trim old entries or use refinements such as
+**dotted version vectors**, which Riak recommends over plain vector clocks.
+
+<Analogy>
+  **Two people editing printed copies of a document.** Version numbers per person ("Ana's 2nd draft, based on Ben's 1st") let you tell whether one copy already includes the other's changes. If each has changes the other hasn't seen, you know to sit down and merge, instead of letting whoever printed last win.
+</Analogy>
+
+## Hybrid logical clocks: logical, but close to real time
+
+Logical clocks order events but have nothing to do with real time, so you can't ask "what was the value at 14:00?".
+Wall clocks relate to real time but don't respect causality. A **hybrid logical clock** (HLC) combines them: it
+follows the physical clock when it can and adds a logical counter when events happen faster than the clock ticks or
+arrive "from the future". The 2014 paper that introduced it shows the value stays close to NTP time and fits in a
+64-bit timestamp, while still capturing causality like a Lamport clock.
+
+CockroachDB uses HLC timestamps for transactions. It also relies on a configured **maximum clock offset**: reads treat
+values within that window as uncertain and may restart, and a node whose clock drifts beyond the limit shuts itself
+down rather than risk violating consistency.
+
+## What to use when
+
+| Need | Use |
+| --- | --- |
+| A single agreed order of operations, respecting cause and effect | Lamport clock, ties broken by node ID |
+| Detect that two writes conflicted | Vector clocks or dotted version vectors |
+| Timestamps that sort causally and read like real time | Hybrid logical clocks |
+| Real-time ordering across the world, with bounded uncertainty | Special hardware (TrueTime, <L id="05.06" />) |
+| Just ordering writes to one row | A version number checked on write (<L id="05.06" />) |
+
+<SeenInProduction>
+  <Seen
+    company="Leslie Lamport"
+    system="Logical clocks"
+    year={1978}
+    href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf"
+    source="Time, Clocks, and the Ordering of Events in a Distributed System (Communications of the ACM)"
+    found="Order events by what could have influenced what, not by clocks; it's only a partial order."
+  >
+    The paper defines "happened before" as a partial ordering of events and warns that problems often arise because
+    people aren't fully aware of that. It gives two implementation rules for logical clocks: each process increments
+    its clock between successive events, and a message carries its send timestamp, so the receiver sets its clock
+    greater than its present value and greater than that timestamp. These clocks can then be used to totally order
+    events.
+  </Seen>
+  <Seen
+    company="Riak"
+    system="Causal context"
+    year="Docs"
+    href="https://docs.riak.com/riak/kv/latest/learn/concepts/causal-context/index.html"
+    source="Causal Context (Riak KV documentation)"
+    found="Detect concurrent writes with vector clocks or dotted version vectors, keep siblings, and let the application resolve them."
+  >
+    Riak tracks causality with vector clocks or dotted version vectors, and strongly recommends the latter. When
+    concurrent writes conflict and siblings are allowed, Riak keeps sibling values for the object, and the application
+    needs a strategy for resolving them; the alternative is simple timestamp resolution to decide which value wins. The
+    documentation recommends keeping siblings enabled in general.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Two replicas hold versions of a note with vector clocks {eu: 3, us: 1} and {eu: 2, us: 2}. What's the relationship?"
+  options={[
+    { text: "The first is newer: 3 > 2", why: "It's ahead on eu but behind on us. Neither includes the other." },
+    { text: "Concurrent: each has a change the other hasn't seen, so both must be kept or merged", correct: true, why: "One vector is ahead on one node and behind on another. That's the signature of concurrent writes." },
+    { text: "Equal: the totals are both 4", why: "Vector clocks compare entry by entry, not by sum." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Ordering by wall-clock timestamps across machines.** Skew can reverse the order. Use logical or hybrid clocks.</li>
+    <li>**Expecting Lamport clocks to detect conflicts.** They give an order, not concurrency. Use vector clocks for that.</li>
+    <li>**Silently resolving concurrent writes.** Last-write-wins drops data; decide on purpose whether to keep siblings or merge.</li>
+    <li>**Unbounded vector clocks.** Entries grow with writers; trim them or use dotted version vectors.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Happened-before is a partial order: some events are concurrent, with no order at all.</li>
+    <li>Lamport clocks give a total order that respects causality, but can't detect concurrency.</li>
+    <li>Vector clocks detect concurrent writes, so systems can keep both and resolve them.</li>
+    <li>Hybrid logical clocks track causality while staying close to real time, if clock offset is bounded.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What are Lamport clocks and vector clocks, and when would you use each?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why not just use timestamps from each server?", "How do you resolve a conflict once you've detected it?"]}
+>
+  <p>A Lamport clock is a single counter per node, incremented on each event and set past any received timestamp. It guarantees that if A happened before B, A's timestamp is smaller, so with node ID as a tie-breaker it gives a total order consistent with causality. But a smaller timestamp doesn't mean A happened before B; they might be concurrent.</p>
+  <p>A vector clock keeps a counter per node. Comparing two vectors tells you whether one version descends from the other or whether they're concurrent, which is what multi-leader and leaderless stores need to detect conflicting writes and keep both versions for the application to merge. I'd use Lamport clocks to order operations, vector clocks or dotted version vectors to detect conflicts, and hybrid logical clocks when timestamps also need to be close to real time. Wall-clock timestamps alone are unsafe because of skew.</p>
+</InterviewCard>

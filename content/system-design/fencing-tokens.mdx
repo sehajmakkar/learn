@@ -1,0 +1,162 @@
+export const meta = {
+  summary: "A distributed lock is a lease, so it can expire while its holder is still working. Locks for efficiency versus locks for correctness, why a Redis lock is fine for the first, and how fencing tokens make the second safe. Tested SQL.",
+  uses: ["08.07", "08.06", "04.04"],
+  usedIn: ["08.11", "15.11"],
+};
+
+<BeforeYouStart>
+  Read <L id="08.07" />: a distributed lock is a <Term t="lease">lease</Term>, with the same paused-holder problem. The fix uses a conditional
+  update inside a <Term t="transaction">transaction</Term> (<L id="04.04" />).
+</BeforeYouStart>
+
+## The problem: two renewers, one certificate
+
+Snip renews the TLS certificate for `go.shop.example` under a lock: take the lock, request a certificate, store it,
+release. One evening, renewer A takes the lock, starts its request, and is paused by a long garbage collection. Its
+lock expires. Renewer B takes the lock, gets a fresh certificate and stores it. Then A wakes up and stores the
+certificate **it** requested, an older one, overwriting B's. A believes it holds the lock; it has no way to know
+otherwise.
+
+## First ask: what is the lock for?
+
+Martin Kleppmann's essay on distributed locking separates two purposes:
+
+- **Efficiency**: the lock avoids doing the same work twice. If it fails occasionally, some work is repeated: a wasted
+  certificate request, a duplicate email. Annoying, not dangerous.
+- **Correctness**: the lock stops processes stepping on each other's toes. If it fails, data is corrupted: an old
+  certificate replaces a new one, money moves twice.
+
+For **efficiency**, a simple lock is fine. A common one is a single Redis key set with "only if absent" and an expiry:
+`SET lock:cert:go.shop.example <random-id> NX PX 30000`, released only by the holder (checking the random ID, so you
+don't delete someone else's lock). If Redis loses the key, two workers occasionally both renew; acceptable.
+
+For **correctness**, no lock alone is enough, however carefully built, because of the paused holder above. The
+resource being protected has to help.
+
+## Fencing tokens
+
+Each time the lock service grants the lock, it hands out a **fencing token**: a number that only ever increases. The
+holder sends its token with every write, and the **storage** remembers the highest token it has seen and rejects
+anything older.
+
+<Sequence
+  title="The paused holder's write is rejected"
+  walk
+  participants={[{ id: "a", label: "Renewer A" }, { id: "lock", label: "Lock service" }, { id: "b", label: "Renewer B" }, { id: "db", label: "Certificates table" }]}
+  messages={[
+    { from: "lock", to: "a", label: "lock granted, token 33", reply: true, explain: "A takes the lock with token 33 and starts requesting a certificate." },
+    { note: "A is paused for 40 s; its lock expires", over: ["a", "lock"] },
+    { from: "lock", to: "b", label: "lock granted, token 34", reply: true, explain: "B takes the expired lock and gets a higher token." },
+    { from: "b", to: "db", label: "store cert, token 34", explain: "The table records 34 as the highest token seen for this domain." },
+    { from: "a", to: "db", label: "store cert, token 33", fail: true, explain: "A wakes and writes with token 33. 33 is lower than 34, so the write is rejected. A's stale certificate never lands." },
+  ]}
+/>
+
+In Postgres, the check is a condition on the update:
+
+```sql
+CREATE TABLE certificates (
+  domain text   PRIMARY KEY,
+  cert   text,
+  fence  bigint NOT NULL DEFAULT 0  -- highest fencing token that has written here
+);
+
+-- Renewer B, token 34
+UPDATE certificates SET cert = $2, fence = 34
+ WHERE domain = 'go.shop.example' AND fence < 34;
+
+-- Renewer A wakes up with token 33: matches no row, so it changes nothing
+UPDATE certificates SET cert = $2, fence = 33
+ WHERE domain = 'go.shop.example' AND fence < 33;
+```
+
+Tested against Postgres: B's update set the certificate and fence 34; A's late update with token 33 updated **zero
+rows**, and the table kept B's certificate. The writer checks the row count and, seeing zero, knows it has lost the
+lock.
+
+Where do tokens come from? From the <Term t="consensus">consensus</Term> store that grants the lock. etcd and ZooKeeper both give every change a
+number that only increases (etcd's revision, ZooKeeper's zxid), which works as a token. Google's Chubby calls the same
+idea a **sequencer**: a lock holder passes it to servers, which check it before acting.
+
+## Why not just a stronger lock?
+
+Redlock, an algorithm that takes a lock on a majority of five independent Redis nodes, is often suggested for
+correctness. Kleppmann's critique is twofold: it doesn't produce fencing tokens, so the paused-holder problem remains,
+and it assumes that delays, pauses and clock drift are all small compared with the lock's time to live, which a
+long garbage-collection pause or a clock jump breaks. Redis's creator wrote a rebuttal, and the debate is worth
+reading; the practical lesson that came out of it is the one above. If correctness depends on the lock, fence the
+writes; if it doesn't, a simple lock will do.
+
+<Analogy>
+  **Numbered tickets at a counter.** The clerk serves whoever holds the current number and won't go back to an earlier one. If you nod off and wake holding ticket 33 after 34 has been called, the clerk simply refuses you. The clerk doesn't need to know you fell asleep; the number tells them.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Martin Kleppmann"
+    system="Distributed locking"
+    year={2016}
+    href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"
+    source="How to do distributed locking"
+    found="Locks for efficiency can be simple; locks for correctness need fencing tokens checked by the storage."
+  >
+    Kleppmann distinguishes locks taken for efficiency, to avoid doing the same work twice, from locks taken for
+    correctness. He describes a client paused for longer than its lease, which then makes an unsafe change because it
+    doesn't realise the lock has expired, and proposes fencing tokens: a number that increases with each grant, where
+    the storage server rejects a write carrying a lower token than one it has already processed. He criticises Redlock
+    for lacking a way to generate fencing tokens and for assuming delays, pauses and drift are small relative to the
+    lock's time to live. The post links a rebuttal by Redlock's author.
+  </Seen>
+  <Seen
+    company="Google"
+    system="Chubby sequencers"
+    year={2006}
+    href="https://static.googleusercontent.com/media/research.google.com/en//archive/chubby-osdi06.pdf"
+    source="The Chubby lock service for loosely-coupled distributed systems (OSDI 2006)"
+    found="The same idea under another name: servers check a lock sequencer before acting, and a lock-delay covers servers that don't."
+  >
+    Chubby's locks are advisory, and the resources they protect are often other services. A lock holder can pass a
+    sequencer to those servers, which check that it's still valid before acting on a request. For servers that don't
+    support sequencers, Chubby offers an imperfect fallback: when a lock is freed because its holder failed, no other
+    client can claim it for a lock-delay period, up to a bound of one minute.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip uses a Redis lock so only one worker sends each owner's weekly report email. Occasionally an owner gets two. Should Snip switch to Redlock with five Redis nodes?"
+  options={[
+    { text: "Yes: five nodes make the lock reliable", why: "Redlock still can't stop a paused holder from acting after its lock expires." },
+    { text: "No: this lock is for efficiency, and an occasional duplicate is acceptable; if it weren't, send with an idempotency key rather than relying on the lock", correct: true, why: "For efficiency locks, a simple lock is fine. Where duplicates truly matter, make the action itself idempotent or fenced, since no lock alone can guarantee it." },
+    { text: "Yes, and lengthen the lock to an hour", why: "A longer lock delays takeover after a crash and still doesn't prevent the pause problem." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Using a lock alone for correctness.** A holder can pause past expiry. Fence the writes.</li>
+    <li>**Deleting a lock you don't own.** Release only if the stored value is your random ID.</li>
+    <li>**Fencing tokens nobody checks.** The storage must reject lower tokens, or they do nothing.</li>
+    <li>**Heavy machinery for efficiency locks.** If a rare duplicate is harmless, a single Redis key is enough.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A distributed lock is a lease: its holder can be paused past expiry and keep acting.</li>
+    <li>Locks for efficiency can be simple and occasionally fail; locks for correctness can't rely on the lock alone.</li>
+    <li>Fencing tokens increase with each grant; the storage rejects writes with older tokens.</li>
+    <li>Take tokens from a consensus store (etcd revisions, ZooKeeper zxids), and check them in the write's condition.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you implement a distributed lock? What can go wrong?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What's a fencing token?", "Is Redlock safe?"]}
+>
+  <p>First I'd ask what the lock protects. For efficiency, avoiding duplicate work, a single Redis key with SET NX and an expiry, holding a random value that's checked on release, is enough; an occasional double run is acceptable. For correctness, a lock alone can't be safe, because any lock in a distributed system is a lease: the holder can pause for garbage collection or lose the network past expiry and then act while someone else holds the lock.</p>
+  <p>The fix is fencing: the lock service, ideally a consensus store like etcd or ZooKeeper, issues a monotonically increasing token with each grant, the holder includes it in every write, and the storage rejects writes with a token lower than the highest it has seen, for example with UPDATE … WHERE fence &lt; $token. Redlock doesn't provide fencing tokens and relies on timing assumptions, so I wouldn't use it for correctness.</p>
+</InterviewCard>
