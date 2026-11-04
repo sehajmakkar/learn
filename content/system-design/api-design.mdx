@@ -87,7 +87,7 @@ GET /links?limit=50&cursor=eyJjcmVhdGVkX2F0Ijo…
 ```
 
 The cursor encodes where the last page ended (say, the last link's creation time and code), so the server asks for
-"the next 50 after this one" using an index. It's fast at any depth and stable when items are added. You lose
+"the next 50 after this one" using an <Term t="index">index</Term>. It's fast at any depth and stable when items are added. You lose
 "jump to page 7", which most APIs don't need. Snip uses cursors; <L id="05.07" /> shows the query behind them.
 
 ## Changing the API without breaking anyone

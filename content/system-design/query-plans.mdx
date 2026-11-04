@@ -1,0 +1,125 @@
+export const meta = {
+  summary: "Ask the database how it will run a query, and read the answer: scans, index lookups, joins, and the estimates that send planners the wrong way.",
+  uses: ["04.02"],
+  usedIn: ["04.08"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.02" />. Query plans are where you see whether your <Term t="index">indexes</Term> are actually used.
+</BeforeYouStart>
+
+## The planner decides, not you
+
+SQL says **what** you want, not **how** to get it. For each query, the database's **planner** considers several ways
+to run it (scan the table or use an index? which index? which table first in a join?), estimates the cost of each from
+statistics it keeps about the data, and picks the cheapest. Usually it's right. When a query is slow, the first step
+is to see what it chose.
+
+In Postgres, `EXPLAIN` shows the plan; `EXPLAIN ANALYZE` actually runs the query and adds real timings and row counts.
+(The outputs below are trimmed and illustrative; real ones have more detail.)
+
+## A slow plan, then a fast one
+
+Snip's dashboard query, before the index from <L id="04.02" /> existed:
+
+```text
+EXPLAIN ANALYZE
+SELECT code, long_url FROM links WHERE owner_id = 42 ORDER BY created_at DESC LIMIT 50;
+
+Limit  (actual time=14210.3..14210.4 rows=50)
+  ->  Sort  (cost=…  rows=1840)  (actual rows=50)
+        Sort Key: created_at DESC
+        ->  Seq Scan on links  (rows=1840)  (actual rows=1912)
+              Filter: (owner_id = 42)
+              Rows Removed by Filter: 599998088
+Execution Time: 14210.6 ms
+```
+
+Read plans **from the innermost line outwards**. The bottom node ran first: a `Seq Scan` (<Term t="full-table-scan">sequential scan</Term>: every row
+of `links`), throwing away almost 600 million rows to keep 1,912. Then a `Sort`, then `Limit` took 50. Fourteen
+seconds.
+
+After `CREATE INDEX links_owner_created ON links (owner_id, created_at DESC)`:
+
+```text
+Limit  (actual time=0.04..0.21 rows=50)
+  ->  Index Scan using links_owner_created on links  (actual rows=50)
+        Index Cond: (owner_id = 42)
+Execution Time: 0.25 ms
+```
+
+One `Index Scan`, already in the right order, so no `Sort`, and it stops after 50 rows. Fifty thousand times faster.
+
+## The words you'll see most
+
+| Node | What it does | Good or bad? |
+| --- | --- | --- |
+| **Seq Scan** | Reads the whole table | Fine for small tables or when most rows match; bad for finding a few rows in a big one |
+| **Index Scan** | Walks an index, then fetches each matching row | Good for few rows |
+| **Index Only Scan** | Answers from the index alone (a <Term t="covering-index">covering index</Term>) | Best, when possible |
+| **Bitmap Heap Scan** | Collects matches from an index, then reads their pages in order | Good for a medium number of rows |
+| **Nested Loop** | For each row on one side, look up matches on the other | Great when the outer side is small and the inner is indexed |
+| **Hash Join** | Builds a hash table from one side, probes it with the other | Good for large, unsorted joins |
+| **Sort** | Sorts rows | Costly on many rows; an index in the right order can avoid it |
+
+## Why plans go wrong
+
+Most slow queries come from a handful of causes. The plan usually shows which:
+
+- **No usable index.** A `Seq Scan` with a huge "Rows Removed by Filter". Add an index, in the right column order.
+- **A function on the column.** `WHERE lower(email) = 'ana@example.com'` can't use an index on `email`. Index the
+  expression, or store the value already lowercased.
+- **Bad estimates.** Compare estimated `rows=` with `actual rows=`. If the planner expected 10 rows and got 2
+  million, it chose a plan for the wrong situation. Statistics may be stale (run `ANALYZE`), or two columns may be
+  correlated in a way it can't know.
+- **Not selective enough.** `WHERE plan = 'free'` matches 90% of users; a scan really is cheaper than an index there,
+  and the planner is right to ignore the index.
+- **Deep offsets.** `OFFSET 100000` reads and discards 100,000 rows. Use <Term t="cursor-pagination">cursor pagination</Term> (<L id="03.04" />).
+
+<Analogy>
+  **A sat-nav.** You give it a destination (the query); it picks a route (the plan) from what it knows about roads and traffic (statistics). Usually the route is good. When the map is out of date or it doesn't know about roadworks, it confidently sends you the slow way, and the only way to know is to look at the route it chose.
+</Analogy>
+
+## A habit worth having
+
+For any query on a hot path, run `EXPLAIN ANALYZE` on production-sized data before shipping it, and watch the
+database's slowest-queries log (Postgres's `pg_stat_statements`) afterwards. A query that's fast on a developer's
+10,000-row table can be a full scan on 600 million.
+
+<Quiz
+  question="Snip has an index on users (email). The query SELECT * FROM users WHERE lower(email) = 'ana@example.com' is slow, and EXPLAIN shows a Seq Scan on users. Why isn't the index used?"
+  options={[
+    { text: "The planner's statistics are stale", why: "Stale statistics cause odd plans, but here no statistics could help: the index simply can't answer this predicate." },
+    { text: "The index stores email, not lower(email), so it can't find matches for the lowercased value", correct: true, why: "Wrapping a column in a function hides it from a plain index. Create an index on lower(email), or store emails already lowercased." },
+    { text: "Sequential scans are always faster for single-row lookups", why: "For one row in a large table, an index lookup is far faster. The planner would use one if it could." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Guessing instead of looking.** Run EXPLAIN ANALYZE before adding indexes or rewriting queries.</li>
+    <li>**Testing on tiny data.** Plans change with table size. Use production-sized data for hot queries.</li>
+    <li>**Ignoring estimates.** A big gap between estimated and actual rows is the clue to most strange plans.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>The planner picks how to run each query from cost estimates; EXPLAIN ANALYZE shows its choice and real timings.</li>
+    <li>Read plans inside out. Watch for big Seq Scans, large Sorts and "Rows Removed by Filter".</li>
+    <li>Common causes: missing or misordered indexes, functions on columns, stale statistics, deep offsets.</li>
+    <li>Check hot queries on production-sized data, and watch the slow-query log.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "A query that used to be fast is now slow. How do you investigate?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Scenario" }}
+  followUps={["What do you look for in the plan?", "What if the plan looks fine but the query is still slow?"]}
+>
+  <p>First I'd confirm it's the query and not the system: check database CPU, locks, and whether many queries slowed at once. Then I'd run EXPLAIN ANALYZE on production-like data and read the plan: is it scanning a big table, sorting many rows, or using an unexpected join? I'd compare estimated and actual row counts, since a big mismatch means stale or misleading statistics, and check for functions on indexed columns or a growing OFFSET.</p>
+  <p>Typical fixes are an index in the right column order, rewriting the predicate so it can use an index, refreshing statistics, or changing the access pattern, such as cursor pagination. If the plan is fine, I'd look at lock waits, I/O and cache hit rates.</p>
+</InterviewCard>

@@ -1,0 +1,125 @@
+export const meta = {
+  summary: "How a database lets readers and writers work at once without blocking: keep several versions of each row, show each transaction the right one, and clean up later.",
+  uses: ["04.04", "04.02"],
+  usedIn: ["04.06", "04.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.04" />. <Term t="snapshot-isolation">Snapshot isolation</Term> promised each <Term t="transaction">transaction</Term> a consistent snapshot; this lesson shows how
+  the database keeps that promise.
+</BeforeYouStart>
+
+## The problem: readers and writers at once
+
+Snip's stats workers update `clicks_daily` constantly. At the same moment, an owner's dashboard reads those rows, and
+a nightly report reads the whole table for an hour. If readers had to wait for writers (and writers for readers), a
+long report would freeze counting, and busy counting would stall dashboards.
+
+Most modern databases avoid this with **MVCC**, multi-version concurrency control: **never overwrite a row in place;
+write a new version and keep the old one for whoever still needs it.**
+
+## Versions, step by step
+
+In Postgres, every row version records which transaction created it and which (if any) replaced or deleted it. Here's
+one row of `clicks_daily` as three transactions run:
+
+| Time | What happens | Versions stored for (x7Kp, today) |
+| --- | --- | --- |
+| 1 | Transaction 100 inserts the row with 10 clicks | **v1**: clicks = 10, created by 100 |
+| 2 | Report transaction 105 starts and takes its snapshot | v1 |
+| 3 | Worker transaction 110 adds 5 clicks and commits | v1: 10, replaced by 110 · **v2**: 15, created by 110 |
+| 4 | Dashboard transaction 115 starts and reads the row | v1, v2 |
+| 5 | Report 105 reads the row | v1, v2 |
+
+- The dashboard (115) started after 110 committed, so it sees **v2: 15**.
+- The report (105) took its snapshot before 110 committed, so it still sees **v1: 10**, even though v1 has been
+  replaced. Its view of the whole database stays consistent for its entire hour.
+- Nobody waited for anybody.
+
+The rule each reader applies is simple: **show me the version created by a transaction that had committed when my
+snapshot was taken, and not yet replaced by one that had.**
+
+Writers still conflict with **writers**: two transactions updating the same row at once means one waits for the other,
+or (at stricter <Term t="isolation-level">isolation levels</Term>) one is aborted.
+
+<Analogy>
+  **A shared document with version history.** When you edit, you don't erase the old text; a new version is saved. Someone who opened the document an hour ago keeps reading the version they opened, undisturbed. Eventually old versions nobody has open are tidied away.
+</Analogy>
+
+## The bill: cleaning up
+
+Old versions don't disappear by themselves. Every update leaves a **dead** version behind, and something has to
+remove it once no running transaction could still need it. In Postgres that's **vacuum**, which usually runs
+automatically.
+
+That brings costs you'll meet in practice:
+
+- **Bloat.** A row updated thousands of times a day (like a counter) leaves thousands of dead versions. If vacuum
+  falls behind, tables and <Term t="index">indexes</Term> grow and queries slow down.
+- **Long transactions hold everything back.** Vacuum can't remove any version a running transaction might still see.
+  One forgotten transaction left open for hours stops cleanup across the whole database.
+- **Write amplification.** In Postgres, a new row version can also mean new entries in the table's indexes, so an
+  update to one column can cost writes to every index (<L id="04.02" />).
+
+This is part of why Snip's workers **batch** click counts (<L id="02.06" />): one update per link per batch leaves far
+fewer dead versions than one per click.
+
+## On replicas
+
+A read replica (<L id="04.07" />) applies the primary's changes, including vacuum's cleanup. If a long query on the
+replica still needs a version the primary has cleaned up, the replica must either pause applying changes (and fall
+behind) or cancel the query. Long analytics queries on replicas and fresh replicas pull against each other.
+
+<SeenInProduction>
+  <Seen
+    company="Uber"
+    system="Schemaless on Postgres"
+    year={2016}
+    href="https://www.uber.com/blog/postgres-to-mysql-migration/"
+    source="Why Uber Engineering Switched from Postgres to MySQL"
+    found="Postgres's multi-version storage made updates expensive on heavily indexed tables, and long replica queries conflicted with replication."
+  >
+    Uber's article, based on Postgres 9.2, describes write amplification: an update to a field covered by a single index
+    still had to be propagated into all 12 indexes on the table. It also describes how, on a replica, Postgres pauses
+    applying the <Term t="wal">write-ahead log</Term> while a conflicting query runs, and kills the query if it blocks replication for too
+    long. These were among the reasons Uber moved to MySQL.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A Postgres database's tables keep growing even though row counts are flat, and queries are slowing. Someone finds a transaction that has been open for 30 hours. What's the link?"
+  options={[
+    { text: "None; open transactions don't affect storage", why: "They do under MVCC: vacuum can't remove any old version that a running transaction might still need to see." },
+    { text: "The old transaction stops vacuum from removing dead versions, so tables and indexes bloat", correct: true, why: "Every update since it began left a dead version that can't be cleaned up. End the transaction, let vacuum catch up, and alert on long-running transactions." },
+    { text: "The transaction is holding a lock that blocks inserts", why: "Under MVCC, readers don't block writers. The problem here is cleanup, not locking." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Leaving transactions open.** An idle transaction in an app or a console session can bloat the whole database. Set timeouts and alert on them.</li>
+    <li>**Hammering one row with updates.** Every update makes a dead version. Batch counters, or accumulate elsewhere and write periodically.</li>
+    <li>**Turning off autovacuum to "save resources".** The cleanup still has to happen; skipping it just makes the bill bigger.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>MVCC keeps several versions of each row; each transaction sees the versions that match its snapshot.</li>
+    <li>Readers don't block writers and writers don't block readers; writers to the same row still conflict.</li>
+    <li>Dead versions must be cleaned up (vacuum); long transactions and hot rows make that harder.</li>
+    <li>On replicas, long queries and applying changes pull against each other.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is MVCC, and what problems can it cause?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why do long-running transactions cause trouble?", "How would you design a frequently updated counter on such a database?"]}
+>
+  <p>Multi-version concurrency control keeps multiple versions of each row instead of updating in place. Each transaction reads the versions visible to its snapshot, so readers never block writers or vice versa, which is how snapshot isolation is implemented. Writers to the same row still serialise.</p>
+  <p>The cost is cleanup: every update leaves a dead version that a background process like Postgres's vacuum must remove once nothing can see it. Frequently updated rows and long-running transactions cause bloat, slower queries and, on replicas, conflicts between long queries and replication. Batching updates to hot rows and limiting transaction duration help.</p>
+</InterviewCard>

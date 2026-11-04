@@ -53,7 +53,7 @@ The server remembers each key it has seen, with the response it gave:
 The idea is simple; the edge cases are where implementations go wrong:
 
 - **Record the key and the effect together.** If the link is created but the key isn't recorded (or the reverse), a
-  retry does the wrong thing. Write both in the **same database transaction**.
+  retry does the wrong thing. Write both in the **same database <Term t="transaction">transaction</Term>**.
 - **Same key, different request.** If a client reuses a key with a different body, it's a bug on their side. Store a
   fingerprint of the request with the key, and return an error rather than guessing.
 - **Two attempts at once.** A fast retry can arrive while the first attempt is still running. The first attempt

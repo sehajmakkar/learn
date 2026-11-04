@@ -1,0 +1,139 @@
+export const meta = {
+  summary: "Changing the shape of a 600-million-row table while it serves traffic: which changes lock, how to backfill safely, and the expand-and-contract pattern for renames and moves.",
+  uses: ["04.02", "04.04", "03.04"],
+  usedIn: ["05.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.02" /> for <Term t="index">indexes</Term> and <L id="04.04" /> for <Term t="transaction">transactions</Term>. The idea of safe versus breaking changes
+  from <L id="03.04" /> comes back, this time for databases.
+</BeforeYouStart>
+
+## The problem: the table never stops
+
+Snip wants to rename `links.long_url` to `target_url`, and add a `title` column. On a laptop that's two statements and
+a second. On a 600-million-row table taking thousands of reads a second, the wrong statement can **lock the table**
+while the database rewrites every row, and every redirect waits behind it.
+
+Two things make schema changes risky in production:
+
+- **Locks.** Some changes need an exclusive lock on the table; some rewrite the whole table while holding it.
+- **Old and new code at once.** During a deploy, servers running the previous version and the new version both talk
+  to the same database. Every intermediate state of the schema has to work for both.
+
+## Know which changes are cheap
+
+What locks and what doesn't varies by database and version, so check your database's documentation. The usual
+shape, for Postgres:
+
+| Change | Typically |
+| --- | --- |
+| Add a nullable column, no default | Instant: only the table's description changes |
+| Add an index | Blocks writes for the whole build, unless built `CONCURRENTLY` |
+| Change a column's type | Often rewrites the whole table under an exclusive lock |
+| Add a `NOT NULL` constraint | Scans the table to check every row |
+| Rename a column | Instant for the database, but breaks every running app that uses the old name |
+
+Two habits avoid most outages: build indexes **concurrently**, and set a short **lock timeout** on migration
+sessions. Even an instant change must first acquire its lock; if a long query holds the table, the migration waits,
+and every new query queues behind the waiting migration. A lock timeout makes the migration give up and retry instead
+of freezing the table.
+
+## Expand and contract
+
+A rename looks atomic, but code that reads `long_url` breaks the moment it's gone. The safe method splits the change
+into steps, each compatible with the code before and after it:
+
+<Flow
+  title="Renaming long_url to target_url without downtime"
+  steps={[
+    { label: "Expand", detail: "Add target_url, nullable. Old code ignores it." },
+    { label: "Dual write", detail: "Deploy code that writes both columns." },
+    { label: "Backfill", detail: "Copy old rows' values, in small batches." },
+    { label: "Switch reads", detail: "Deploy code that reads target_url." },
+    { label: "Stop old writes", detail: "Deploy code that writes only target_url." },
+    { label: "Contract", detail: "Drop long_url once nothing uses it." },
+  ]}
+/>
+
+Each step can be deployed, watched and rolled back on its own. It's slower than one `ALTER`, and it's the only way that
+never breaks a running request.
+
+**Backfilling** 600 million rows deserves care of its own: update in batches of a few thousand rows by <Term t="primary-key">primary key</Term>
+range, pause between batches, watch replication lag (<L id="04.07" />), and make the job resumable. One giant
+`UPDATE` would hold locks for hours, bloat the table (<L id="04.05" />) and leave replicas far behind.
+
+The same pattern moves data between **tables** or even **databases**: write to both, backfill, compare, switch reads,
+switch writes, remove the old.
+
+<Analogy>
+  **Renaming a street.** You don't take the old signs down the night the council votes. First, new signs go up next to the old ones; post is delivered to either name; maps update; and only years later, when nobody uses the old name, do the old signs come down.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Stripe"
+    system="Subscriptions data model"
+    year={2017}
+    href="https://stripe.com/blog/online-migrations"
+    source="Online migrations at scale"
+    found="Hundreds of millions of objects were moved to a new table with no downtime by dual writing, then switching reads, then writes."
+  >
+    Stripe moved subscriptions out of customer records into their own table, for hundreds of millions of objects. It
+    used four phases: dual write to the old and new tables, change all reads to the new table, change all writes to
+    only the new table, and remove the old data. Reads were compared during the switch, and no single change touched
+    more than a few hundred lines of code.
+  </Seen>
+  <Seen
+    company="GitHub"
+    system="gh-ost"
+    year={2016}
+    href="https://github.blog/2016-08-01-gh-ost-github-s-online-migration-tool-for-mysql/"
+    source="gh-ost: GitHub's online schema migration tool for MySQL"
+    found="Change a big table by building a copy alongside it, keeping the copy in sync, and swapping them at the end."
+  >
+    GitHub's tool creates a "ghost" table with the new schema, copies rows into it slowly and incrementally, and keeps
+    applying ongoing inserts, updates and deletes by reading MySQL's binary log rather than using triggers. When the
+    tables are in sync it swaps them. GitHub built it because trigger-based tools had caused near or complete lockdowns
+    in production, and some migrations could only run off-peak or at weekends.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A migration runs ALTER TABLE links ADD COLUMN title text (an instant change in Postgres). Yet every query on links hangs for two minutes. What's the most likely cause?"
+  options={[
+    { text: "The ALTER rewrote all 600 million rows", why: "Adding a nullable column with no default doesn't rewrite rows in Postgres." },
+    { text: "The ALTER was waiting for its lock behind a long query, and every new query queued behind the ALTER", correct: true, why: "Even instant changes need a brief exclusive lock. Set a short lock_timeout on migrations so they give up and retry instead of blocking everyone." },
+    { text: "Adding a column always requires downtime", why: "Many schema changes are cheap; the danger is the lock queue, which a lock timeout handles." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Rename or drop in one step.** Running code still uses the old name. Expand, migrate, then contract.</li>
+    <li>**One huge backfill UPDATE.** Batch it, throttle it, watch replica lag, and make it resumable.</li>
+    <li>**Creating an index without CONCURRENTLY.** Writes to the table stop for the whole build.</li>
+    <li>**No lock timeout.** A migration stuck waiting for a lock blocks every query behind it.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Some schema changes lock or rewrite whole tables; know which, and check your database's docs.</li>
+    <li>Build indexes concurrently and give migrations a short lock timeout.</li>
+    <li>Expand and contract: add, dual write, backfill, switch reads, switch writes, remove.</li>
+    <li>Backfill in small, throttled, resumable batches.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you rename a column on a large, busy table without downtime?", level: "Mid", frequency: 2, importance: "Must-know", kind: "Scenario" }}
+  followUps={["How would you backfill hundreds of millions of rows safely?", "What could go wrong between steps?"]}
+>
+  <p>With expand and contract. Add the new column as nullable, which is cheap. Deploy code that writes both columns. Backfill existing rows in small batches by primary key range, throttled and watching replication lag. Deploy code that reads the new column, verify, then code that writes only the new column. Finally drop the old column once nothing references it.</p>
+  <p>Each step is compatible with the code versions running before and after it, so deploys can roll back. Throughout, migrations use a short lock timeout so they can't freeze the table while waiting for a lock.</p>
+</InterviewCard>

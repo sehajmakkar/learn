@@ -1,0 +1,113 @@
+export const meta = {
+  summary: "Storing a fact in a second place on purpose, so a hot read is cheap. Three ways to keep the copy right, and how to tell when it's worth it.",
+  uses: ["04.01", "04.04", "02.06"],
+  usedIn: ["05.02", "07.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.01" />, which said "copy facts only on purpose". This lesson is about the purpose, and the cost.
+</BeforeYouStart>
+
+## The problem: an expensive read on every page
+
+Snip's dashboard lists an owner's links with each one's **total clicks**, and lets them sort by it. In the <Term t="normalisation">normalised</Term>
+model, totals live only in `clicks_daily`: one row per link per day. To sort Ana's 8,000 links by total clicks, the
+database must add up every daily row for all 8,000 links (millions of rows) on every page load.
+
+The answer is the same every time until the next batch of clicks arrives. Computing it again and again is wasted
+work. **Denormalisation** stores the answer:
+
+```sql
+ALTER TABLE links ADD COLUMN total_clicks bigint NOT NULL DEFAULT 0;
+CREATE INDEX links_owner_clicks ON links (owner_id, total_clicks DESC);
+```
+
+Now "Ana's links by clicks" is one <Term t="index">index</Term> range read. The price: the same fact (how many times x7Kp was clicked) is
+stored in two places, and they must agree.
+
+## Three ways to keep the copy right
+
+**1. Update it in the same <Term t="transaction">transaction</Term>.** Whatever writes the source also updates the copy, atomically:
+
+```sql
+BEGIN;
+INSERT INTO clicks_daily (code, day, clicks) VALUES ('x7Kp', '2026-11-04', 1840)
+  ON CONFLICT (code, day) DO UPDATE SET clicks = clicks_daily.clicks + EXCLUDED.clicks;
+UPDATE links SET total_clicks = total_clicks + 1840 WHERE code = 'x7Kp';
+COMMIT;
+```
+
+Always consistent, which is why Snip's stats workers (<L id="02.06" />) do exactly this. It only works when both
+live in the same database, and every write now does more work.
+
+**2. Update it from events, asynchronously.** The source publishes "x7Kp got 1,840 clicks"; a consumer updates the
+copy, maybe in another database or a search index. Works across systems; the copy lags, and the consumer must cope
+with duplicates (<L id="07.03" />).
+
+**3. Recompute it periodically.** A job (or a materialised view) rebuilds the totals every few minutes. Simplest to
+get right, staleness up to the interval, and the rebuild itself costs work.
+
+Whichever you choose, add a **reconciliation** job that recomputes a sample (or all) of the copies from the source now
+and then and reports differences. Copies drift, through bugs, manual fixes or partial failures, and you want to find
+out from a report, not from a customer.
+
+<Analogy>
+  **A bank balance.** The bank could add up every transaction since you opened the account each time you check your balance. Instead it keeps a running balance, updated with every transaction, and the statement (the source of truth) is reconciled against it regularly. The balance is denormalised, and it's what everyone actually looks at.
+</Analogy>
+
+## When it's worth it
+
+Denormalise when **all** of these hold:
+
+- The read is **frequent** or on a **hot path**, and measurably slow or expensive without the copy.
+- The copy can be kept correct with one of the methods above, at a write cost you can afford.
+- You know which copy is the **source of truth** if they ever disagree.
+
+Common, well-worn cases: counters (likes, followers, clicks), the latest item (a conversation's last message for the
+inbox view), names copied onto records for display, and whole read-optimised tables in partition-keyed stores, where
+copying data into one table per query is the normal pattern (<L id="04.10" />).
+
+## Snip at the end of Module 04
+
+Snip's data is now modelled (<L id="04.01" />), indexed for its queries (<L id="04.02" />), protected by transactions
+and the <Term t="wal">write-ahead log</Term>, replicated with a <Term t="synchronous-replication">synchronous standby</Term>, and its hottest derived number is denormalised. One
+Postgres primary handles all of it at today's scale. The next module asks what happens when even the largest single
+primary isn't enough: splitting the data itself (<L id="05.01" />).
+
+<Quiz
+  question="Snip stores total_clicks on each link, updated asynchronously from click events. After an incident, some links show totals lower than the sum of their daily counts. What should the design have included?"
+  options={[
+    { text: "Nothing: async copies are allowed to be wrong", why: "Lagging briefly is expected; staying wrong after an incident isn't. Something should find and fix drift." },
+    { text: "A reconciliation job that recomputes totals from the source of truth and corrects differences", correct: true, why: "Denormalised copies drift through bugs and partial failures. A periodic recompute, against the clearly named source of truth, finds and repairs them." },
+    { text: "Removing the daily counts table so there's only one copy", why: "The daily counts are the detailed source; the total is derived from them. Remove the copy if anything, not the source." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Denormalising before measuring.** Joins and aggregates on indexed data are often fast enough. Copy when a real query is slow.</li>
+    <li>**No named source of truth.** When copies disagree, you need to know which one wins.</li>
+    <li>**No reconciliation.** Every copy drifts eventually; check them on a schedule.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Denormalisation stores a derived fact again so a hot read is cheap.</li>
+    <li>Keep copies right by updating in the same transaction, from events, or by periodic recompute.</li>
+    <li>Name the source of truth, and reconcile copies against it regularly.</li>
+    <li>Worth it for frequent, expensive reads where the write cost is affordable.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you show a like count on posts that are viewed millions of times a day?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you keep the count correct?", "What happens when one post gets thousands of likes a second?"]}
+>
+  <p>Not by counting rows in a likes table on every view. I'd store a denormalised like_count on the post, served from cache, with the likes table as the source of truth. When a like is recorded, the count is updated in the same transaction if both live in one database, or asynchronously from a like event if they don't, accepting brief lag.</p>
+  <p>For very hot posts, updating one row thousands of times a second contends on that row, so I'd batch increments in a queue or split the counter into several rows that are summed on read. A periodic job recomputes counts from the likes table to correct any drift.</p>
+</InterviewCard>

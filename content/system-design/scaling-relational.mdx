@@ -1,0 +1,139 @@
+export const meta = {
+  summary: "The ladder for growing a relational database, cheapest step first: tune queries, pool connections, scale up, offload reads, partition tables, split by feature, and only then shard.",
+  uses: ["04.03", "04.07", "02.02", "02.04"],
+  usedIn: ["05.01", "04.11"],
+};
+
+<BeforeYouStart>
+  This lesson pulls together <L id="02.02" />, <L id="02.04" />, <L id="04.03" /> and <L id="04.07" />. Read those
+  first if the terms are new.
+</BeforeYouStart>
+
+## Climb the ladder one rung at a time
+
+"The database can't keep up" has many possible fixes, and they differ enormously in cost. <Term t="sharding">Sharding</Term> (<L id="05.01" />)
+gets the attention, but it's the most expensive by far: every query, migration and feature has to know about it
+forever. Most databases that "need sharding" need one of the cheaper rungs first.
+
+<Flow
+  title="The scaling ladder"
+  steps={[
+    { label: "Tune", detail: "Slow-query log, query plans, indexes." },
+    { label: "Pool", detail: "Fewer, reused connections." },
+    { label: "Scale up", detail: "Bigger machine." },
+    { label: "Offload reads", detail: "Cache and replicas." },
+    { label: "Partition & archive", detail: "Split big tables; move cold data out." },
+    { label: "Split by feature", detail: "Groups of tables to their own databases." },
+    { label: "Shard", detail: "Split one table's rows across databases." },
+  ]}
+/>
+
+## 1. Tune what you have
+
+The cheapest capacity is the capacity you're wasting. Look at the slowest and most frequent queries
+(<L id="04.03" />): a missing <Term t="index">index</Term>, an N+1 loop issuing 500 queries per page, or a report running every minute
+instead of every hour can be a large share of the load. A few query fixes often buy more headroom than any
+new hardware.
+
+## 2. Pool connections
+
+In Postgres, each client connection is a separate server process with its own memory. Thousands of app processes,
+each holding a few connections, can exhaust the database before any query is slow. A **connection pooler** such as
+PgBouncer sits between them: thousands of app connections share a few dozen real database connections, each handed
+out only for the duration of a <Term t="transaction">transaction</Term>.
+
+## 3. Scale up
+
+A bigger machine: more cores, more memory to cache the working set, faster disks (<L id="02.02" />). No code changes.
+Cloud databases make this a few minutes of downtime or a failover.
+
+## 4. Offload reads
+
+A cache for hot keys and read replicas for the rest (<L id="02.04" />, <L id="04.07" />). This handles read-heavy
+systems like Snip, as long as the reads can tolerate a little lag.
+
+## 5. Partition and archive
+
+Some tables grow without end. Snip's `clicks_daily` gains a row per link per day, forever. **Table partitioning**
+splits one logical table into pieces by a key, usually time:
+
+```sql
+CREATE TABLE clicks_daily (code text, day date, clicks bigint, PRIMARY KEY (code, day))
+  PARTITION BY RANGE (day);
+CREATE TABLE clicks_daily_2026_11 PARTITION OF clicks_daily FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+```
+
+Queries for "the last 30 days" touch only the recent partitions and their small indexes. Deleting a year of old data
+is dropping a partition, not a slow, bloating `DELETE` of a billion rows. Older partitions can be **archived** to
+cheaper storage. It's still one database, so nothing else in the app changes.
+
+## 6. Split by feature
+
+When one database serves everything, separate the parts that don't need to be together: Snip's users and billing in
+one database, links in another, stats in a third. This is **vertical partitioning**: each database gets fewer tables
+and less load, and can be sized and tuned for its job. The cost: no more joins or transactions **across** those
+groups, so split along boundaries where the app rarely needs them.
+
+## 7. Shard
+
+When a single table is too big or too busy for the biggest machine, split its **rows** across many databases by a key.
+That's <L id="05.01" />, and it's where Part 2 continues.
+
+<Analogy>
+  **A growing restaurant kitchen.** First, cook smarter (tune). Then stop every waiter queueing at the pass (pool). Buy a bigger stove (scale up). Prep popular sides in advance (cache). Clear out the walk-in fridge (archive). Give pastry its own kitchen (split by feature). Only when the main kitchen still can't cope do you open a second one with the same menu (shard).
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Figma"
+    system="Postgres on RDS"
+    year={2023}
+    href="https://www.figma.com/blog/how-figma-scaled-to-multiple-databases/"
+    source="The growing pains of database architecture"
+    found="Figma climbed the ladder in order: biggest instance, replicas, a connection pooler, then moving groups of tables to their own databases."
+  >
+    In 2020 Figma kept most of its metadata in a single large Amazon RDS Postgres database, running at up to 65% CPU at
+    peak, with traffic growing about 3x a year. Short-term, it moved to the largest instance available, added read
+    replicas, and added PgBouncer to tame connections numbering in the thousands. Then it partitioned vertically,
+    moving groups of tables to their own databases, starting with two high-traffic tables and reaching 50 by October
+    2022, with about 30 seconds of partial impact per move.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's database runs out of connections at peak, though CPU is at 40% and queries are fast. What's the most likely fix?"
+  options={[
+    { text: "Shard the database", why: "Sharding multiplies the number of databases, not the efficiency of connections, and it's by far the costliest option." },
+    { text: "Add a connection pooler so many app connections share a few database connections", correct: true, why: "The database has capacity; it's spending it on idle connections. A pooler like PgBouncer is cheap and changes no queries." },
+    { text: "Move to a bigger machine", why: "That raises the ceiling a bit, but the app would soon open even more connections. The problem is how connections are used." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Jumping to sharding.** It's permanent complexity. Make sure tuning, pooling, scaling up and offloading reads really aren't enough.</li>
+    <li>**Deleting old data with DELETE.** On huge tables it's slow and leaves bloat. Partition by time and drop partitions.</li>
+    <li>**Splitting where the app needs joins.** Vertical partitioning works along boundaries the app rarely crosses.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Climb the ladder cheapest first: tune, pool, scale up, offload reads, partition and archive, split by feature, shard.</li>
+    <li>Connection poolers let thousands of app connections share a few database connections.</li>
+    <li>Partition ever-growing tables by time; drop old partitions instead of deleting rows.</li>
+    <li>Splitting groups of tables into separate databases costs cross-group joins and transactions.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Your Postgres database is at 90% CPU at peak and growing. What would you do, in order?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Scenario" }}
+  followUps={["How would you know whether reads or writes are the problem?", "When is sharding actually necessary?"]}
+>
+  <p>Start with measurement: pg_stat_statements to find the queries using the most time, and fix those with indexes, query rewrites or caching in the app. Check connection counts and add a pooler if they're high. Scale the instance up for headroom. If load is mostly reads, add a cache for hot keys and read replicas for lag-tolerant queries.</p>
+  <p>For tables that grow forever, partition by time and archive cold partitions. If one database still serves too much, move independent groups of tables to their own databases. I'd shard only when a single table's writes or size exceed what the largest machine can handle, because sharding complicates every query and migration from then on.</p>
+</InterviewCard>

@@ -1,0 +1,142 @@
+export const meta = {
+  summary: "Keeping copies of a database on several servers: synchronous versus asynchronous replication, what lag breaks, and how failover can lose data or create two leaders.",
+  uses: ["04.06", "02.04", "02.02"],
+  usedIn: ["04.08", "08.03"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.06" />: replicas replay the primary's <Term t="wal">write-ahead log</Term>. <L id="02.04" /> introduced read replicas and
+  lag; this lesson goes underneath.
+</BeforeYouStart>
+
+## Leader and followers
+
+The most common setup has one **leader** (primary) that accepts every write, and one or more **followers** (replicas)
+that receive the leader's log and apply it in order. Followers serve reads, stand by to take over, or both. Snip runs
+this from <L id="02.02" /> onwards: a primary, a standby and a read replica.
+
+The big decision is **when the leader says "committed"**:
+
+| | Asynchronous | Synchronous | Semi-synchronous |
+| --- | --- | --- | --- |
+| **Leader waits for** | Only its own disk | Every follower to confirm | At least one follower |
+| **Write latency** | Lowest | Highest: slowest follower sets the pace | One extra round trip |
+| **If the leader dies** | Recent writes may exist only on the dead leader | No committed write is lost | No committed write is lost, if that follower takes over |
+| **If a follower dies** | Nothing changes | Writes stop until it's removed | Writes continue if another follower confirms |
+
+Most production setups are asynchronous, or semi-synchronous with one nearby standby. Snip uses a **synchronous
+standby in the same region** (so a promoted standby has every committed link: "never lose a link") and an
+**asynchronous read replica** (whose lag only affects dashboards).
+
+## Lag, revisited
+
+An asynchronous follower is always a little behind. Usually it's milliseconds; under heavy writes, long queries
+(<L id="04.05" />) or network trouble it can be seconds or minutes. <L id="02.04" /> showed the classic bug, a user
+not seeing their own write, and the fixes: read from the leader right after writing, or fall back to the leader when
+data is missing. Another: a user refreshing twice may hit two replicas with different lag and see data go
+**backwards**. Pinning each user's reads to one replica avoids that.
+
+## Failover
+
+When the leader dies, a follower must be promoted. That takes three decisions, each of which can go wrong:
+
+<Arch
+  title="Failover, step by step"
+  nodes={[
+    { id: "app", label: "Snip app", kind: "service", x: 1, y: 0 },
+    { id: "old", label: "Old primary", kind: "db", sub: "unreachable", x: 0, y: 1 },
+    { id: "standby", label: "Standby", kind: "db", sub: "sync copy", x: 1, y: 1 },
+    { id: "replica", label: "Read replica", kind: "db", sub: "async", x: 2, y: 1 },
+    { id: "mgr", label: "Failover manager", kind: "worker", x: 1, y: 2 },
+  ]}
+  edges={[
+    { from: "mgr", to: "old", label: "health", dashed: true },
+    { from: "mgr", to: "standby", label: "promote" },
+    { from: "app", to: "standby", label: "writes" },
+    { from: "standby", to: "replica", label: "log" },
+  ]}
+  steps={[
+    { caption: "Detect: the failover manager stops hearing from the primary. But is it dead, or just slow, or cut off from the manager only? It waits for several missed checks to avoid flapping.", edges: ["mgr>old"] },
+    { caption: "Choose: it promotes the follower with the most of the log. Here the synchronous standby has every committed write, so nothing is lost.", edges: ["mgr>standby"] },
+    { caption: "Redirect: the app is told (via DNS, a proxy or a config change) to send writes to the new primary.", edges: ["app>standby"] },
+    { caption: "Re-follow: the read replica starts following the new primary. If the old primary comes back, it must rejoin as a follower, never as a second primary.", edges: ["standby>replica"] },
+  ]}
+/>
+
+What can go wrong:
+
+- **Lost writes.** With asynchronous replication, the promoted follower may be missing the last writes the old leader
+  acknowledged. They're gone, or worse, they come back later and conflict.
+- **Split brain.** If the old leader was only cut off, not dead, it may keep accepting writes while the new one does
+  too. Two leaders, two diverging histories. Systems prevent this with **fencing**: making sure the old leader can't
+  accept writes (cutting its access, or rejecting writes tagged with an old "term" number).
+- **Too eager, or too slow.** A short timeout fails over on a brief blip, causing more disruption than it prevents. A
+  long one leaves writes down for minutes.
+
+<Analogy>
+  **A team captain and vice-captain.** If the captain is carried off, the vice-captain takes the armband. Easy, unless the captain was only behind the stand for a minute and comes back still shouting orders. Then the team has two captains giving different instructions, which is worse than none. The armband (fencing) is how everyone knows who's in charge.
+</Analogy>
+
+## Beyond one leader
+
+Two other designs exist, with harder trade-offs, covered in Part 2's distributed systems module:
+
+- **Multi-leader:** several nodes accept writes (often one per region) and exchange changes. Writes are local and
+  fast; concurrent writes to the same data conflict and must be resolved.
+- **Leaderless:** clients write to several replicas and read from several, using quorums (<L id="08.03" />).
+
+<SeenInProduction>
+  <Seen
+    company="GitHub"
+    system="MySQL with Orchestrator"
+    year={2018}
+    href="https://github.blog/2018-10-30-oct21-post-incident-analysis/"
+    source="October 21 post-incident analysis"
+    found="A 43-second network partition triggered a cross-country failover; un-replicated writes on the old primaries made failing back unsafe, and recovery took a day."
+  >
+    A network link between GitHub's US East Coast hub and its primary data centre was lost for 43 seconds. Orchestrator
+    began failing database clusters over to the US West Coast, and applications started writing to the new primaries
+    there. The East Coast servers held a brief period of writes that hadn't been replicated, so GitHub couldn't safely
+    fail back, and East Coast applications suffered from cross-country latency. Choosing data integrity over speed of
+    recovery, GitHub ran degraded for 24 hours and 11 minutes, then changed Orchestrator to stop promoting primaries
+    across regions.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A primary with one asynchronous replica acknowledges a write, then crashes before sending it. The replica is promoted. What happens to that write?"
+  options={[
+    { text: "The new primary has it, because the write was acknowledged", why: "Asynchronous replication acknowledges before followers have the data. The replica never received it." },
+    { text: "It's missing on the new primary, even though the client was told it succeeded", correct: true, why: "That's the price of async replication. Synchronous or semi-synchronous replication to the promoted follower avoids it, at the cost of write latency." },
+    { text: "The replica requests it from the crashed primary", why: "The crashed primary can't answer. If it later returns, its extra writes conflict with what the new primary has done." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Calling async replication "no data loss".** On failover, the last acknowledged writes can vanish. Know which writes can afford that.</li>
+    <li>**Failover without fencing.** A paused or partitioned old leader that wakes up and accepts writes causes split brain.</li>
+    <li>**Never practising.** Run failovers on purpose, in daylight, so the first real one isn't the first one.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>One leader takes writes; followers replay its log and serve reads or stand by.</li>
+    <li>Async is fast but can lose acknowledged writes on failover; sync loses nothing but waits for followers.</li>
+    <li>Failover means detect, choose, redirect, re-follow, and guarding against split brain with fencing.</li>
+    <li>Multi-leader and leaderless designs trade conflicts for local or quorum writes.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Compare synchronous and asynchronous replication. What can go wrong during failover?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What is split brain, and how do you prevent it?", "How would you choose the failover timeout?"]}
+>
+  <p>With synchronous replication the leader waits for followers to confirm before acknowledging a write, so a promoted follower has every committed write, at the cost of higher write latency and writes stalling if a follower is slow. Asynchronous replication acknowledges immediately and ships changes afterwards: fast, but followers lag, and on failover the most recent acknowledged writes can be lost. Semi-synchronous, waiting for one follower, is a common middle ground.</p>
+  <p>Failover risks include losing those recent writes, split brain where the old leader keeps accepting writes after a new one is promoted, which needs fencing, and timeouts that are too short and cause needless failovers or too long and extend the outage.</p>
+</InterviewCard>

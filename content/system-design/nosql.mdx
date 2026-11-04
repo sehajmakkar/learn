@@ -1,0 +1,125 @@
+export const meta = {
+  summary: "Key-value, document, wide-column, graph, search and analytics stores: the shape of data each holds, the queries each is fast at, and what each gives up compared with a relational database.",
+  uses: ["04.01", "04.08"],
+  usedIn: ["04.11", "05.01"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.01" /> for relational modelling. "NoSQL" is easiest to understand as a set of different trade-offs
+  against it.
+</BeforeYouStart>
+
+## "Not only SQL"
+
+Relational databases are general-purpose: any table can be joined to any other, queried by any column, inside
+<Term t="transaction">transactions</Term>. That generality has costs at the extremes, mostly around **scaling writes across many machines** and
+**data that doesn't fit tables well**.
+
+"NoSQL" names a family of databases that each give up some of that generality to be very good at one shape of data and
+one set of queries. The shared idea: **design the data around the queries you'll run**, because the database won't be
+able to answer arbitrary new ones efficiently.
+
+## The families
+
+| Family | Stores | Fast at | Examples |
+| --- | --- | --- | --- |
+| **Key-value** | A value (often opaque) per key | Get and put by exact key, at huge scale | Redis, DynamoDB, Memcached |
+| **Document** | JSON-like documents, nested | Fetching and updating a whole document by ID; queries on its fields | MongoDB, Couchbase, Firestore |
+| **Wide-column** | Rows grouped by a partition key, sorted within it | Very high write rates; reading a range within one partition | Cassandra, ScyllaDB, Bigtable, HBase |
+| **Graph** | Nodes and the edges between them | Following relationships many hops deep | Neo4j, Neptune |
+| **Search** | Inverted <Term t="index">indexes</Term> of text and fields | Full-text search, ranking, filtering by many fields | Elasticsearch, OpenSearch |
+| **Analytics (columnar)** | Columns stored separately, compressed | Scanning and aggregating billions of rows on a few columns | ClickHouse, BigQuery, Redshift |
+
+A note on the last two: search and columnar stores are rarely the **<Term t="source-of-truth">source of truth</Term>**. They're usually fed from the
+main database, for queries it can't do well.
+
+## What a partition key changes
+
+Most NoSQL stores that scale out (key-value and wide-column especially) ask you to choose a **partition key** for
+each table. The store hashes it to decide which machine holds the data (<L id="05.01" />). Then:
+
+- Reads and writes **by partition key** go straight to one machine: fast at any size.
+- Queries **within** one partition (say, "messages in channel 7, newest first") are fast if the data is sorted by a
+  second key inside it.
+- Queries **across** partitions ("all messages containing 'hello'") are slow or impossible. There's no planner to
+  rescue you (<L id="04.03" />).
+
+So you model **one table per query** if you have to, copying data into each shape (<L id="04.12" />), instead of one
+<Term t="normalisation">normalised</Term> model that joins at read time.
+
+## For Snip
+
+| Snip data | Shape and queries | A good fit |
+| --- | --- | --- |
+| Links (code → URL) | Get by exact key, a lot | Relational with a cache today; key-value at enormous scale |
+| Users, plans, billing | Relations, constraints, transactions | Relational |
+| Raw click events | Billions of appends, scanned for charts | Columnar analytics, or wide-column |
+| Link titles and URLs, searchable | Full text | Search index, fed from the main database |
+
+<Analogy>
+  **Specialist tools versus a good multitool.** A multitool (relational) does almost everything well enough. A torque wrench, a pipe cutter or a label printer each does one job far better, and is useless for anything else. Workshops keep the multitool and add specialists for the jobs they do all day.
+</Analogy>
+
+## What you give up
+
+Each family drops some of what relational databases give, and it's worth naming:
+
+- **Joins.** Usually gone or limited. Data you'd join is copied together instead.
+- **Ad hoc queries.** New questions may need new tables or a <Term t="full-table-scan">full scan</Term>.
+- **Transactions across items.** Often limited to one key or one partition, or slower when offered.
+- **Consistency.** Many default to eventually consistent reads (<L id="01.03" />), with stronger options at a cost.
+- **Schema enforcement.** "Schemaless" means the schema lives in your code, and old documents in old shapes live
+  forever unless you migrate them.
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="DynamoDB"
+    year={2022}
+    href="https://www.usenix.org/conference/atc22/presentation/elhemali"
+    source="Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service (USENIX ATC 2022)"
+    found="A key-value store built for predictable latency at any scale handled tens of millions of requests a second at peak."
+  >
+    The paper says that during the 66-hour Amazon Prime Day event in 2021, Amazon systems made trillions of <Term t="api">API</Term> calls to
+    DynamoDB, peaking at 89.2 million requests per second, while seeing high availability and single-digit millisecond
+    performance. The abstract opens with its central promise: consistent performance at any scale.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A chat app stores messages in a wide-column store, partitioned by channel_id and sorted by time. A new feature needs 'all messages by user 42 across every channel'. What's the usual answer?"
+  options={[
+    { text: "Query the messages table with WHERE user_id = 42", why: "user_id isn't the partition key, so this means scanning every partition on every machine." },
+    { text: "Add a second table partitioned by user_id, and write each message to both", correct: true, why: "In partition-keyed stores you design one table per access pattern and copy data into each. It costs storage and double writes, which these stores handle well." },
+    { text: "Add an index on user_id like in a relational database", why: "Some stores offer secondary indexes, but they're usually limited or slow at scale; the standard pattern is a table shaped for the query." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Picking NoSQL for "scale" before knowing the queries.** Its speed depends on modelling for known access patterns.</li>
+    <li>**Using a search index or cache as the source of truth.** Keep the authoritative copy in a store built to keep it.</li>
+    <li>**Forgetting "schemaless" still has a schema.** It's in your code, and old shapes stick around.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>NoSQL families trade relational generality for strength at one data shape and query pattern.</li>
+    <li>Key-value, document, wide-column, graph, search and columnar analytics each fit different work.</li>
+    <li>With a partition key, queries by that key are fast; queries across partitions aren't.</li>
+    <li>You give up joins, ad hoc queries and often multi-item transactions; model one table per query.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "When would you choose a NoSQL database over a relational one?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What does choosing a partition key involve?", "How do you handle a query the data model wasn't designed for?"]}
+>
+  <p>When the access patterns are known and simple, and the scale or shape of the data strains a relational database: very high write throughput that must spread across many machines, simple key lookups at huge scale, time-ordered data within a partition like messages or events, deeply connected data for graph traversal, full-text search, or analytics over billions of rows.</p>
+  <p>I'd keep a relational database for data with rich relationships, constraints and multi-row transactions, like users and billing. NoSQL gives up joins, ad hoc queries and often cross-item transactions, so I'd design tables around specific queries and accept copying data into several shapes.</p>
+</InterviewCard>

@@ -16,6 +16,7 @@ import { Lab } from "@/components/lesson/lab";
 import { EstimateLab } from "@/components/labs/estimate";
 import { LoadBalancerLab } from "@/components/labs/load-balancer";
 import { TailLatencyLab } from "@/components/labs/tail-latency";
+import { BTreeLab } from "@/components/labs/btree";
 
 // Everything a lesson can use without importing it.
 const components: MDXComponents = {
@@ -47,6 +48,7 @@ const components: MDXComponents = {
   EstimateLab,
   LoadBalancerLab,
   TailLatencyLab,
+  BTreeLab,
 };
 
 export function useMDXComponents(): MDXComponents {

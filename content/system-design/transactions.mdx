@@ -1,0 +1,143 @@
+export const meta = {
+  summary: "Transactions group changes into all-or-nothing units. Isolation levels decide what concurrent transactions can see of each other, and the bugs each level still allows.",
+  uses: ["04.01", "03.10"],
+  usedIn: ["04.05", "04.06", "07.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.01" /> for Snip's tables. <L id="03.10" /> used a transaction to record an <Term t="idempotent">idempotency</Term> key with its
+  effect; this lesson explains what that buys.
+</BeforeYouStart>
+
+## All or nothing
+
+A **transaction** wraps several statements so they succeed or fail **together**:
+
+```sql
+BEGIN;
+INSERT INTO links (code, long_url, owner_id) VALUES ('b2Qe', 'https://…', 42);
+INSERT INTO idempotency_keys (account_id, key, status, response) VALUES (42, 'K', 201, '{…}');
+COMMIT;
+```
+
+If the server crashes between the two inserts, neither survives. The guarantees are usually summed up as **ACID**:
+
+| Letter | Means | In practice |
+| --- | --- | --- |
+| **Atomic** | All of the transaction happens, or none of it | No half-created links |
+| **Consistent** | Constraints hold before and after | No link without an owner |
+| **Isolated** | Concurrent transactions don't see each other's half-done work | The subject of this lesson |
+| **Durable** | Once committed, it survives crashes | <L id="04.06" /> |
+
+Atomicity and durability are easy to state and mostly just work. **Isolation** is where the subtle bugs live.
+
+## Two users, one custom code
+
+Ana and Ben both try to claim the custom code `launch` at the same moment. Snip's first version checks, then inserts:
+
+```sql
+SELECT 1 FROM links WHERE code = 'launch';   -- nobody has it…
+INSERT INTO links (code, …) VALUES ('launch', …);
+```
+
+Both checks run before either insert, both see "free", and both insert. Without protection, one silently overwrites
+or duplicates the other. Here the fix is simple: `code` is the **<Term t="primary-key">primary key</Term>**, so the database rejects the second
+insert, and Snip tells Ben the code is taken. A unique constraint is the cheapest concurrency control there is.
+
+Not every rule fits in a constraint, though.
+
+## Write skew: the bug constraints can't catch
+
+Free accounts may have at most 1,000 links. Ana has 999 and creates two links at once from two browser tabs:
+
+<Sequence
+  title="Two transactions, each checking a limit"
+  walk
+  participants={[{ id: "t1", label: "Tab 1" }, { id: "db", label: "Database" }, { id: "t2", label: "Tab 2" }]}
+  messages={[
+    { from: "t1", to: "db", label: "BEGIN; COUNT links → 999", explain: "Tab 1 counts Ana's links: 999. Under the limit." },
+    { from: "t2", to: "db", label: "BEGIN; COUNT links → 999", explain: "Tab 2 counts at the same moment and also sees 999. Neither can see the other's uncommitted insert." },
+    { from: "t1", to: "db", label: "INSERT; COMMIT", explain: "Tab 1 inserts link 1,000 and commits." },
+    { from: "t2", to: "db", label: "INSERT; COMMIT", fail: true, explain: "Tab 2 inserts too. Ana now has 1,001 links. Each transaction was correct on its own; together they broke the rule." },
+  ]}
+/>
+
+Each transaction read the same data, made a decision based on it, and wrote something **different** (two new rows,
+not the same row). That's **write skew**. No unique constraint can stop it, and many isolation levels allow it.
+
+## Isolation levels
+
+Databases offer a menu of isolation levels: stronger levels prevent more anomalies and cost more waiting or retries.
+
+| Level | Prevents | Still allows |
+| --- | --- | --- |
+| **Read committed** (Postgres's default) | Seeing uncommitted data | A row changing between two reads in one transaction; lost updates; write skew |
+| **Snapshot isolation** ("repeatable read" in Postgres) | The above, plus: every read sees one consistent snapshot | Write skew |
+| **Serializable** | Everything: the result is as if transactions ran one at a time | Nothing, but some transactions fail and must be retried |
+
+Fixes for Snip's link limit, from most to least targeted:
+
+- **Lock the thing you're deciding about.** `SELECT … FROM users WHERE id = 42 FOR UPDATE` at the start makes the
+  second tab wait until the first commits, then it counts 1,000 and refuses.
+- **Run that transaction at `SERIALIZABLE`.** The database detects the conflict and aborts one transaction; the app
+  retries it (and the retry sees 1,000).
+- **Make it a single write.** Keep a `link_count` on the user row and `UPDATE users SET link_count = link_count + 1
+  WHERE id = 42 AND link_count < 1000`. One statement on one row can't be skewed.
+
+<Analogy>
+  **Two people booking the last meeting room.** Each checks the calendar, sees the room free at 3 p.m., and books it, for different meetings. Each booking was reasonable given what they saw. The fix is either to "hold" the room while you decide (a lock) or to have the calendar reject the second booking when it notices the clash (serializable).
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Jepsen"
+    system="PostgreSQL 12.3"
+    year={2020}
+    href="https://jepsen.io/analyses/postgresql-12.3"
+    source="Jepsen: PostgreSQL 12.3"
+    found="Even a mature database had a serializability bug, and its 'repeatable read' is really snapshot isolation."
+  >
+    Jepsen's tests found that PostgreSQL's serializable level allowed G2-item anomalies, a form of write skew, under
+    normal operation: six cases in a two-minute run. The bug, present in every version tested, was fixed with a patch
+    for the next minor release. The analysis also notes that Postgres's "repeatable read" is actually snapshot
+    isolation, which allows write skew, and recommends the documentation say so.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Two transactions at snapshot isolation each read that a doctor's shift has two people on call, and each removes a different person. Both commit. What happened?"
+  options={[
+    { text: "A dirty read: each saw the other's uncommitted change", why: "Neither saw the other's change at all; that's the problem." },
+    { text: "Write skew: each made a decision from the same snapshot and wrote different rows, together breaking the rule", correct: true, why: "Snapshot isolation allows it. Lock the rows being decided on (SELECT … FOR UPDATE), use serializable, or turn the rule into a single-row write." },
+    { text: "A lost update: one overwrote the other", why: "A lost update is two writes to the same row. Here they wrote different rows, which is what makes it write skew." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Check-then-act without protection.** Reading a value, deciding, then writing is a race unless something (a constraint, a lock, serializable) guards it.</li>
+    <li>**Assuming the default is serializable.** Most databases default to read committed. Know what your transactions actually get.</li>
+    <li>**Serializable without retries.** At that level some transactions fail by design; the application must retry them.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Transactions make groups of changes atomic: all or nothing.</li>
+    <li>Isolation levels trade anomalies for waiting: read committed, snapshot, serializable.</li>
+    <li>Unique constraints stop duplicate claims; write skew needs locks, serializable, or a single-row write.</li>
+    <li>Serializable transactions can be aborted; build retries in.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Explain transaction isolation levels and give an anomaly each one allows.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What is write skew, and how do you prevent it?", "What's the cost of serializable isolation?"]}
+>
+  <p>Read committed only hides uncommitted data, so within one transaction a row can change between reads, and concurrent read-modify-write cycles can lose updates. Snapshot isolation gives each transaction a consistent snapshot and stops lost updates on the same row, but still allows write skew: two transactions read the same data, decide, and write different rows that together break a rule. Serializable guarantees the outcome matches some one-at-a-time order.</p>
+  <p>To prevent write skew I'd lock the rows the decision depends on with SELECT FOR UPDATE, use serializable for that transaction with retries, or restructure the rule as a single conditional write. Serializable costs throughput and aborts that the application must retry.</p>
+</InterviewCard>

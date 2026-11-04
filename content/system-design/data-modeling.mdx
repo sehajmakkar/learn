@@ -1,0 +1,158 @@
+export const meta = {
+  summary: "Turning Snip's entities into tables: keys, relationships, constraints, and storing each fact once. Plus the one table that shouldn't be a table at all.",
+  uses: ["01.07", "01.05"],
+  usedIn: ["04.02", "04.12"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.07" />. Step 3 of the framework names Snip's entities (`Link`, `Click`). This lesson turns them into
+  tables.
+</BeforeYouStart>
+
+## From entities to tables
+
+A relational database stores data in **tables**: rows of the same shape, with typed columns. Modelling is deciding
+which tables exist, what each row means, and how rows refer to each other. For Snip:
+
+```sql
+CREATE TABLE users (
+  id          bigint PRIMARY KEY,
+  email       text NOT NULL UNIQUE,
+  plan        text NOT NULL DEFAULT 'free',
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE links (
+  code        text PRIMARY KEY,                       -- 'x7Kp'
+  long_url    text NOT NULL,
+  owner_id    bigint NOT NULL REFERENCES users (id),  -- many links per user
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  disabled    boolean NOT NULL DEFAULT false
+);
+
+CREATE TABLE clicks_daily (
+  code        text NOT NULL REFERENCES links (code),
+  day         date NOT NULL,
+  clicks      bigint NOT NULL,
+  PRIMARY KEY (code, day)                              -- one row per link per day
+);
+```
+
+The vocabulary, using these tables:
+
+- **Primary key:** the column(s) that identify a row. A link is identified by its `code`; a daily count by
+  `(code, day)`. The database guarantees primary keys are unique.
+- **Foreign key:** a column that points at another table's primary key. `links.owner_id` points at `users.id`. The
+  database refuses a link whose owner doesn't exist.
+- **Relationship:** one user has **many** links (one-to-many). If links could belong to many teams and teams had many
+  links, that's many-to-many, stored as a third table of `(link, team)` pairs.
+- **Constraints:** rules the database enforces for you: `NOT NULL`, `UNIQUE`, foreign keys, `CHECK (clicks >= 0)`.
+  Every rule enforced here is a bug your application can't write.
+
+## Store each fact once
+
+**Normalisation** is a formal name for a simple habit: each fact lives in exactly one place. Here's a table that breaks
+it:
+
+| code | long_url | owner_email | owner_plan |
+| --- | --- | --- | --- |
+| x7Kp | https://shop.example/… | ana@example.com | pro |
+| b2Qe | https://blog.example/… | ana@example.com | pro |
+| m9Lr | https://docs.example/… | ana@example.com | free |
+
+Ana's plan is stored once per link, so it can disagree with itself, as it already does. Changing her email means
+updating thousands of rows, and missing one leaves a contradiction. Splitting owners into their own `users` table
+and pointing at them by ID fixes it: one row per fact, and a change happens in one place.
+
+The textbook "normal forms" (1NF, 2NF, 3NF…) formalise this. In practice, the test is: **if one real-world fact
+changes, how many rows must change?** If the answer is more than one, ask whether it should be.
+
+You'll sometimes copy a fact on purpose, to make a hot read cheaper. That's <Term t="denormalisation">denormalisation</Term>, and it has a cost you
+choose deliberately (<L id="04.12" />).
+
+<Analogy>
+  **A contacts app.** Your friend's phone number is stored once, in their contact card. Messages, calls and calendar invites all point at the card. If they change their number, you edit one card and everything follows. Imagine instead that every message stored its own copy of the number.
+</Analogy>
+
+## The table that shouldn't be a table
+
+Notice there's no `clicks` table with a row per click. From the estimate in <L id="01.05" />, Snip serves about
+350 redirects a second on average: around **30 million clicks a day**, over 10 billion a year. A row per click in
+the main database would soon dwarf everything else, and every owner's chart would have to add up millions of rows.
+
+Instead, Snip keeps **daily counts** in `clicks_daily` (the stats workers from <L id="02.06" /> add to them in
+batches), and sends the raw click events to cheaper storage built for huge append-only data (<L id="04.11" />).
+Modelling isn't just tables and keys; it's deciding **what level of detail each store keeps**, based on the queries
+it has to answer.
+
+## Model for the queries
+
+Write down the questions the system asks most, and check the model answers each cheaply:
+
+| Query | Answered by |
+| --- | --- |
+| Where does `x7Kp` go? (the hot path) | `links` by primary key: one lookup |
+| List my links, newest first | `links` filtered by `owner_id`, sorted by `created_at`: needs an <Term t="index">index</Term> (<L id="04.02" />) |
+| Clicks per day for one link, last 30 days | `clicks_daily` by `(code, day)`: a small range of one key |
+| Total clicks across all of Ana's links | Join `links` and `clicks_daily`: fine per user, too slow for a global leaderboard |
+
+That last row is a hint of what's to come: a query the model can answer, but slowly. Indexes, <Term t="query-plan">query plans</Term> and
+denormalisation are the tools for it.
+
+<Quiz
+  question="Snip wants to show the owner's name next to each of their links in the dashboard. Where should the name be stored?"
+  options={[
+    { text: "In a column on links, so the dashboard doesn't need a join", why: "Then a name change means updating every one of their links, and copies can disagree. Joining one user row is cheap." },
+    { text: "In users, read with a join (or a second lookup) when showing links", correct: true, why: "The name is a fact about the user, so it lives in one place. The dashboard fetches it once per page." },
+    { text: "In both, kept in sync by the application", why: "That's denormalisation. Sometimes worth it for a hot query, but not for a name shown on one dashboard page." },
+  ]}
+/>
+
+## Try it
+
+<DesignIt
+  id="sd-04-01-pastebin-model"
+  minutes={10}
+  levels={["junior"]}
+  patterns={["data-modeling"]}
+  rubric={[
+    "Tables for users and pastes, with primary keys",
+    "A foreign key from pastes to their owner, allowing anonymous pastes",
+    "Constraints: NOT NULL where required, a unique paste ID",
+    "Paste text stored outside the database, with a pointer to it",
+    "Expiry modelled as a column, and how expired pastes are found",
+    "A list of the top queries and how the model answers each",
+  ]}
+>
+  Model the tables for a Pastebin where users (or anonymous visitors) create pastes up to 1 MB, with optional expiry,
+  and owners can list their own pastes. Write the `CREATE TABLE` statements and the three queries you expect most.
+</DesignIt>
+
+<Mistakes>
+  <ul>
+    <li>**Copying facts without meaning to.** Owner details on every link, prices on every order line without a reason: each copy can drift.</li>
+    <li>**Skipping constraints.** "The app checks that" holds until the second app, the script, or the bug. Let the database enforce rules.</li>
+    <li>**One row per event by default.** Billions of tiny rows in the main database are expensive. Decide what detail each store keeps.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Tables hold rows of one shape; primary keys identify rows; foreign keys link them.</li>
+    <li>Constraints let the database enforce rules your code might forget.</li>
+    <li>Normalise: each fact in one place. Copy facts only on purpose.</li>
+    <li>Model for your top queries, and choose the level of detail each store keeps.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is normalisation, and when would you denormalise?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What's an update anomaly?", "How would you keep a denormalised copy correct?"]}
+>
+  <p>Normalisation means structuring tables so each fact is stored in exactly one place, with other tables referring to it by key. It prevents update anomalies, where changing one fact means changing many rows and missing one leaves the data contradicting itself, and it keeps writes simple.</p>
+  <p>I'd denormalise when a frequent read is too expensive with joins or aggregation, such as a counter shown on every page, and accept the cost: more storage, more work on writes, and a way to keep the copy correct, like updating it in the same transaction or rebuilding it from the source.</p>
+</InterviewCard>

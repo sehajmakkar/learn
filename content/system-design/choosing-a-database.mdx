@@ -1,0 +1,126 @@
+export const meta = {
+  summary: "A practical way to choose where each kind of data lives: start from the queries, the numbers and the guarantees, prefer what your team runs well, and add a store only when one is earned.",
+  uses: ["04.10", "04.08", "01.08"],
+  usedIn: ["06.06", "10.01"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.10" /> for the families of databases, and <L id="01.08" /> for the cost of every extra component.
+</BeforeYouStart>
+
+## Start from the questions, not the products
+
+"Which database should we use?" is the wrong first question. Answer these first, per kind of data, and the choice
+usually follows:
+
+| Question | Why it matters |
+| --- | --- |
+| **What are the top queries?** | By key? By range? Ad hoc? Full text? Aggregates over billions of rows? |
+| **What are the numbers?** | Reads and writes per second, total size, growth (<L id="01.05" />). |
+| **What guarantees?** | Multi-row <Term t="transaction">transactions</Term>? Strong consistency, or is a little lag fine? Can any data ever be lost? |
+| **How will it change?** | New queries every month (favour flexible) or one fixed pattern (favour specialised)? |
+| **Who runs it?** | What your team already knows, and whether a managed service exists, often outweigh benchmarks. |
+
+## A sensible default
+
+For most products, the default is a **relational database** (Postgres or MySQL), run as a managed service, plus a
+cache. It handles relations, transactions, constraints and new queries, and with the ladder from <L id="04.08" /> it
+scales much further than most products ever need.
+
+Then add a specialised store when a specific kind of data **earns** it:
+
+- **Write volume or size beyond one database**, with simple access by key: key-value or wide-column.
+- **Full-text search** or many-field filtering: a search <Term t="index">index</Term>, fed from the main database.
+- **Analytics over huge event volumes**: a <Term t="columnar-store">columnar store</Term>, fed by a pipeline.
+- **Relationships many hops deep**, queried constantly: a graph database.
+- **Large files**: object storage, with only metadata in the database.
+
+## Snip's storage, so far
+
+<Arch
+  title="Where Snip's data lives"
+  nodes={[
+    { id: "app", label: "Snip services", kind: "service", x: 0, y: 1 },
+    { id: "pg", label: "Postgres", kind: "db", sub: "links, users", x: 1.6, y: 1 },
+    { id: "cache", label: "Redis", kind: "cache", sub: "code → URL", x: 1.6, y: 0 },
+    { id: "queue", label: "Click events", kind: "queue", sub: "event log", x: 0, y: 2 },
+    { id: "olap", label: "Columnar store", kind: "store", sub: "raw clicks", x: 1.6, y: 2 },
+    { id: "s3", label: "Object storage", kind: "store", sub: "backups", x: 3.2, y: 1 },
+  ]}
+  edges={[
+    { from: "app", to: "cache", label: "hot reads" },
+    { from: "app", to: "pg", label: "source of truth" },
+    { from: "app", to: "queue", label: "clicks", dashed: true },
+    { from: "queue", to: "olap", label: "load" },
+    { from: "pg", to: "s3", label: "WAL, backups" },
+  ]}
+  steps={[
+    { caption: "Postgres is the source of truth for everything relational: links, users, plans and daily counts. It needs transactions and constraints, and it fits on one well-tuned primary with replicas.", edges: ["app>pg"] },
+    { caption: "Redis holds the hot code → URL mapping, so most redirects never reach Postgres.", edges: ["app>cache"] },
+    { caption: "Raw click events (billions a year) go through an event log into a columnar store, which answers 'clicks by country by hour' by scanning compressed columns.", edges: ["app>queue", "queue>olap"] },
+    { caption: "Backups and archived write-ahead log go to object storage, for point-in-time recovery.", edges: ["pg>s3"] },
+  ]}
+  caption="Four stores, each earned by a specific kind of data. Search and a key-value store for links wait until a requirement or a number calls for them."
+/>
+
+Every extra store is another system to run, secure, back up and keep consistent with the others (the data moves
+between them asynchronously, so they disagree briefly). That cost is why the list stops at four.
+
+<Analogy>
+  **Furnishing a kitchen.** A good knife, a pan and a pot cover most cooking. You buy a rice cooker if you eat rice every day, not because restaurants have one. Every gadget takes counter space and cleaning, so each one should earn its place.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Discord"
+    system="Message storage"
+    year={2017}
+    href="https://discord.com/blog/how-discord-stores-billions-of-messages"
+    source="How Discord Stores Billions of Messages"
+    found="Discord wrote down its requirements before picking a database, then modelled the data around its one dominant query."
+  >
+    Discord started on MongoDB. By late 2015 it had 100 million stored messages, and once data
+    and indexes no longer fit in RAM, latencies became unpredictable. Its reads were random and the read/write ratio
+    about 50/50. It listed requirements (linear scalability, automatic failover, low maintenance, proven to work,
+    predictable performance, not a blob store, open source) and found Cassandra was the only database meeting all
+    of them. Messages were partitioned by channel and a time bucket, since every query operates on a channel.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A startup with 5 engineers, all experienced with Postgres, is building a marketplace: users, listings, orders and payments, with about 50 writes a second expected in year one. One engineer proposes a document database 'because it scales better'. What's the strongest response?"
+  options={[
+    { text: "Agree: document databases scale better, so start there", why: "50 writes a second is tiny for Postgres, and orders and payments need transactions and relations, which are Postgres's strengths." },
+    { text: "Use Postgres: the data is relational, needs transactions, and the team knows it; add specialised stores when a number calls for one", correct: true, why: "The requirements, the numbers and the team's experience all point the same way. Scaling questions can be revisited with real measurements." },
+    { text: "Use both from the start, to be safe", why: "Two primary databases double the operational work and create a consistency problem between them, for no requirement." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Choosing by popularity or benchmark.** Choose from your queries, numbers and guarantees.</li>
+    <li>**Ignoring operations.** The database your team can run, back up and debug at 3 a.m. is worth a lot of benchmark points.</li>
+    <li>**Collecting stores.** Each one adds work and a consistency boundary. Add one when it's earned.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Choose per kind of data, from its top queries, numbers, guarantees and how it will change.</li>
+    <li>Default to a managed relational database plus a cache; it goes a long way.</li>
+    <li>Add search, columnar, key-value or graph stores when a specific need earns them.</li>
+    <li>Every store adds operational work and data that must be kept in step.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you decide which database to use for a new system?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["When is it worth running two different databases?", "How would you keep a search index in sync with the main database?"]}
+>
+  <p>I start from the data, not the product: what the main queries are, the read and write rates and size, the guarantees needed such as transactions and consistency, and how much the queries will change. Then I weigh what the team already runs well and whether there's a managed option.</p>
+  <p>For most systems that leads to a relational database with a cache as the source of truth. I'd add a specialised store only for a specific need, like a search index for full text, a columnar store for analytics, or a wide-column or key-value store when a dataset's write volume outgrows one database, and feed it from the source of truth through change events.</p>
+</InterviewCard>

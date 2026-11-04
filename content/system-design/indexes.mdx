@@ -1,0 +1,150 @@
+export const meta = {
+  summary: "Why finding one row among 600 million takes a handful of disk reads, how a B-tree index works, which column order to choose, and what every index costs on writes.",
+  uses: ["04.01", "01.04"],
+  usedIn: ["04.03", "05.07", "04.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.01" /> for Snip's tables, and <L id="01.04" /> for what a disk read costs.
+</BeforeYouStart>
+
+## The problem: finding one row
+
+Snip's `links` table will hold about 600 million rows after five years (<L id="01.05" />). An owner opens their
+dashboard and Snip runs:
+
+```sql
+SELECT code, long_url, created_at
+FROM links
+WHERE owner_id = 42
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+Without help, the database has only one way to answer: read **every row** in the table, keep the ones where
+`owner_id = 42`, then sort them. That's a **full table scan**: about 300 GB read to return 50 rows. At <Term t="ssd">SSD</Term> speeds
+that's around 15 seconds, for every dashboard load.
+
+## An index is a sorted copy with a map
+
+An **index** is a separate structure that keeps one or more columns **in sorted order**, each entry pointing at its
+row. Because it's sorted, the database can jump to the right place instead of reading everything, the way you'd find
+a word in a dictionary.
+
+Almost every relational database uses a **B-tree** for this. Data on disk is read in **pages** (8 KB in Postgres),
+so a B-tree packs hundreds of sorted keys into each page:
+
+- The **root** page holds a few hundred keys, each pointing to a page on the next level down.
+- Each **inner** page splits its range further.
+- The **leaf** pages hold every key in order, each with a pointer to its row.
+
+Because each level multiplies by hundreds, the tree is very **shallow**. Three hundred keys per page means three
+levels cover 27 million rows and four cover 8 billion. Finding any one row takes about four page reads, and the upper
+levels are usually already in memory. Try it with Snip's table:
+
+<Lab
+  id="sd-04-02-btree"
+  title="How deep is the index?"
+  tasks={[
+    "With 600 million rows and 300 keys per page, how many levels does the index have? How many page reads to find one row?",
+    "Grow the table a hundredfold, to 60 billion rows. How many more levels does the index need?",
+    "Compare finding one row by index with a full scan of the same table. Roughly how many times faster is the index?",
+    "Shrink the keys per page to 20 (very large keys). What happens to the depth, and why do databases prefer small keys in indexes?",
+  ]}
+>
+  <BTreeLab preset={{ rows: 600000000, fanout: 300, rowBytes: 500 }} />
+</Lab>
+
+<Analogy>
+  **A dictionary's thumb tabs and page headers.** You don't read every page to find "quasar". The thumb tab gets you to Q, the page headers get you to "qua–", and a glance down the page finds the word. Three steps, whether the dictionary has a thousand words or a million.
+</Analogy>
+
+## Column order matters
+
+An index on several columns sorts by the first, then by the second within each first value, and so on, like a phone
+book sorted by surname, then first name. That decides which queries it can help:
+
+```sql
+CREATE INDEX links_owner_created ON links (owner_id, created_at DESC);
+```
+
+| Query | Uses this index? |
+| --- | --- |
+| `WHERE owner_id = 42 ORDER BY created_at DESC LIMIT 50` | **Yes, perfectly**: jump to owner 42, read the first 50 entries, already sorted. |
+| `WHERE owner_id = 42` | Yes: the leftmost column alone is fine. |
+| `WHERE created_at > now() - interval '1 day'` | **No**: dates are only sorted *within* each owner. Like finding everyone named "Ana" in a phone book sorted by surname. |
+
+The rule: an index helps a query that filters on a **leftmost prefix** of its columns. Put columns compared with `=`
+first, then the column you sort or range over.
+
+If an index also contains every column a query needs, the database can answer from the index alone without visiting
+the table at all. That's a **covering index**, and it saves a page read per row.
+
+## What indexes cost
+
+Indexes make reads fast by making writes slower:
+
+- **Every insert updates every index.** A table with six indexes does seven writes for each new row, and an update to
+  an indexed column changes the index too.
+- **Storage.** Each index is a sorted copy of its columns; several indexes can rival the table in size.
+- **Memory.** Hot indexes want to stay in RAM. Unused indexes still compete for it.
+
+So index for the queries you actually run, check that each index is used, and drop the ones that aren't. Snip's
+`links` table needs just two: the <Term t="primary-key">primary key</Term> on `code` (for redirects) and `(owner_id, created_at)` for dashboards.
+
+B-trees also handle ranges and sorting (`created_at > …`, `ORDER BY`), which is why they're the default. **Hash
+indexes** find exact matches only, and specialised indexes exist for text search, locations and arrays.
+
+<SeenInProduction>
+  <Seen
+    company="SQLite"
+    system="Query planner"
+    year={2026}
+    href="https://www.sqlite.org/queryplanner.html"
+    source="Query Planning"
+    found="The cost of a lookup drops from proportional to N (a full scan) to proportional to log N with an index, and covering indexes skip the table entirely."
+  >
+    SQLite's documentation walks through a lookup step by step. Without an index the query is a full table scan whose
+    time is proportional to the number of rows. With an index it becomes a binary search, so the time is proportional to
+    log N, and a query returning K rows costs about (K+1)·log N. When an index contains every column the query needs,
+    SQLite never consults the table, which the page describes as roughly doubling the speed.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip has an index on links (owner_id, created_at). A new admin page runs: SELECT * FROM links WHERE created_at > now() - interval '1 hour'. Will the index help?"
+  options={[
+    { text: "Yes, created_at is in the index", why: "It is, but second. Recent links are scattered across every owner's section of the index." },
+    { text: "No, because created_at isn't the leftmost column; this query needs its own index on created_at", correct: true, why: "Indexes help queries on a leftmost prefix of their columns. For this admin query, an index on created_at alone (or a scan, if it's rare) is the fix." },
+    { text: "Only if the table is small", why: "Size doesn't change which queries the index's sort order can serve." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Indexing every column, just in case.** Each index slows every write and costs memory. Index for real queries.</li>
+    <li>**Wrong column order.** An index on (created_at, owner_id) can't serve "this owner's newest links" well. Equality columns first.</li>
+    <li>**Assuming an index is used.** Check with the query plan (<L id="04.03" />).</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Without an index, finding rows means scanning the whole table.</li>
+    <li>A B-tree keeps keys sorted in pages of hundreds; a few levels cover billions of rows.</li>
+    <li>Multi-column indexes help queries on a leftmost prefix: equality columns first, then sort or range.</li>
+    <li>Every index slows writes and uses space and memory. Keep the ones queries need.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How does a database index work, and what does it cost?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why are B-trees so shallow?", "How do you decide the column order of a composite index?"]}
+>
+  <p>Most indexes are B-trees: the indexed columns kept in sorted order across fixed-size pages, with hundreds of keys per page and a few levels from root to leaves. Finding a key means walking from the root down, a handful of page reads even for billions of rows, instead of scanning the whole table. Being sorted, they also serve range queries and ORDER BY.</p>
+  <p>The cost is on writes and space: every insert, and every update to an indexed column, must update each index, and each index takes disk and memory. So I'd add indexes for the queries the system actually runs, and remove unused ones.</p>
+</InterviewCard>

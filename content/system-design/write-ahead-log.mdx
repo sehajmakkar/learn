@@ -1,0 +1,120 @@
+export const meta = {
+  summary: "How a database keeps its promise that committed data survives a crash: write the change to an append-only log first, and replay it on restart. The same log powers replication and point-in-time recovery.",
+  uses: ["04.04", "01.04"],
+  usedIn: ["04.07", "07.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.04" />: the D in <Term t="acid">ACID</Term>, durability, is this lesson's subject. The sequential versus random numbers from
+  <L id="01.04" /> explain why the design works.
+</BeforeYouStart>
+
+## The problem: committed means committed
+
+When Snip's database says a new link is committed, Snip hands out the short code. If the power fails a millisecond
+later, the link must still exist when the server comes back. That's **durability**.
+
+The obvious approach, writing the changed rows straight into their places in the data files before answering, has two
+problems. It's **slow**: one transaction may touch pages scattered across several files and indexes, and random
+writes are the expensive kind. And it's **fragile**: a crash halfway through writing an 8 KB page can leave it half
+old, half new.
+
+## Write the log first
+
+The **write-ahead log** (WAL) fixes both. Every change is first described in a record appended to the end of a log
+file. The rule is in the name: **the log is written before the data**.
+
+<Flow
+  title="What happens on COMMIT"
+  steps={[
+    { label: "Change in memory", detail: "Rows and index pages are modified in memory, in the buffer cache." },
+    { label: "Append to the WAL", detail: "A record describing the changes is appended to the log." },
+    { label: "Flush the log", detail: "The log is forced to disk (fsync). Sequential, so fast." },
+    { label: "Reply COMMIT", detail: "Now it's durable: the log alone can recreate the change." },
+    { label: "Later: checkpoint", detail: "Changed pages are written to the data files in the background." },
+  ]}
+/>
+
+After a crash, the database starts from the last **checkpoint** (a point where every change up to there was in the
+data files) and **replays** the log from there, redoing every committed change. Changes from <Term t="transaction">transactions</Term> that never
+committed are discarded. Half-written pages are repaired from the log too.
+
+Why it's fast: the commit waits only for a **sequential append** to one file, the cheapest kind of disk write. The
+scattered, random page writes happen later, in the background, and many commits' worth of changes to the same page
+are written once. Busy databases also **group commit**: one flush covers every transaction that committed in the same
+millisecond or so.
+
+<Analogy>
+  **A ship's logbook.** The crew doesn't redraw the whole chart after every turn; they jot "14:02, turned 10° east" in the logbook, which is quick. If the chart gets damaged, they can rebuild it from the last clean copy plus every entry since. The logbook is written first, always.
+</Analogy>
+
+## One log, three more jobs
+
+Once you have an ordered record of every change, it turns out to be useful well beyond crash recovery:
+
+- **Replication.** Send the log to another server and have it replay the records: that's a replica (<L id="04.07" />).
+- **Point-in-time recovery.** Take a full **base backup** now and then, and archive every WAL file since. To recover
+  to "10:42 yesterday, just before someone ran the bad `DELETE`", restore the base backup and replay the archived log
+  up to 10:41.
+- **Change data capture.** Read the log to stream every change to other systems: search <Term t="index">indexes</Term>, caches, analytics
+  (<L id="07.06" />).
+
+## The log is only as good as your backups
+
+The WAL protects against crashes, not against mistakes, lost disks or lost machines. Those need **backups stored
+elsewhere, which you have actually restored**. A backup system that has never been tested is a hope, not a backup.
+
+<SeenInProduction>
+  <Seen
+    company="GitLab"
+    system="GitLab.com database"
+    year={2017}
+    href="https://about.gitlab.com/blog/2017/02/10/postmortem-of-database-outage-of-january-31/"
+    source="Postmortem of database outage of January 31"
+    found="A replica fell behind until the WAL it needed was gone; then a recovery mistake met backups that had never been tested."
+  >
+    Under heavy load, GitLab's Postgres replica lagged until the WAL segments it needed had already been removed from
+    the primary, breaking replication. While re-syncing it, an engineer removed the data directory on the primary
+    instead of the replica. The regular `pg_dump` backups had been failing silently (a version mismatch, with alert
+    emails rejected), and disk snapshots weren't enabled. GitLab restored from an LVM snapshot taken about six hours
+    earlier, losing roughly 5,000 projects, 5,000 comments and 700 new user accounts.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A Postgres server crashes 2 ms after replying COMMIT to an insert. The new row's data page was never written to the data file. Is the row lost?"
+  options={[
+    { text: "Yes, because the data page was never written", why: "The COMMIT reply came only after the WAL record was flushed to disk. The data page isn't needed." },
+    { text: "No; on restart, the database replays the WAL and redoes the insert", correct: true, why: "That's the write-ahead rule: the log is durable before the commit is acknowledged, and replaying it rebuilds every committed change." },
+    { text: "Only if a replica received it", why: "Replicas help availability, but a single server's WAL is enough to recover its own committed data after a crash." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Turning off fsync for speed.** Commits get faster and a power cut can lose or corrupt data. Use group commit, or accept the risk knowingly for data you can rebuild.</li>
+    <li>**Untested backups.** Restore regularly into a scratch environment and check the result; alert when backups fail.</li>
+    <li>**Treating replicas as backups.** A mistake like a bad DELETE replicates instantly. You need point-in-time recovery too.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A commit is durable once its WAL record is flushed; data pages are written later at checkpoints.</li>
+    <li>After a crash, replaying the log from the last checkpoint restores every committed change.</li>
+    <li>Sequential log appends and group commit make this fast.</li>
+    <li>The same log drives replication, point-in-time recovery and change data capture. Backups still need testing.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How does a database guarantee that committed data survives a crash?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why is writing the log faster than writing the data pages?", "How does point-in-time recovery work?"]}
+>
+  <p>With a write-ahead log. Before acknowledging a commit, the database appends a record of the changes to a log and forces it to disk. The modified data pages stay in memory and are written to the data files later, at checkpoints. After a crash, it starts from the last checkpoint and replays the log, redoing committed changes and discarding uncommitted ones.</p>
+  <p>It's fast because the commit only waits for a sequential append, and group commit lets one flush cover many transactions. The same log is shipped to replicas for replication and archived alongside base backups for point-in-time recovery.</p>
+</InterviewCard>
