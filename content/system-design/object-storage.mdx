@@ -31,7 +31,7 @@ Storage, or self-hosted MinIO and Ceph.
 - Objects are written and read **whole**. You can read a byte range, but you can't change byte 1,000 of an object; you
   replace the object. That immutability is what makes the system simple to replicate, cache and scale.
 - Operations are few: `PUT`, `GET`, `DELETE`, `LIST` by prefix, plus **multipart upload** for big objects (upload parts
-  in parallel, retry failed parts, then combine) and **pre-signed URLs**, which let a browser upload or download
+  in parallel, retry failed parts, then combine) and **pre-<Term t="signed-url">signed URLs</Term>**, which let a browser upload or download
   directly without passing through your servers (<L id="13.05" />).
 
 On S3 today, reads after a successful write, overwrite or delete always return the latest version, including `LIST`

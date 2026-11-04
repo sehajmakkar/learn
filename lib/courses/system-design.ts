@@ -213,11 +213,11 @@ const modules: Module[] = [
     title: "Files and media",
     blurb: "Uploads, images, video and sync.",
     lessons: [
-      l("13.01", "Direct-to-storage uploads", 10, "CONCEPT"),
-      l("13.02", "Image processing and CDNs", 9, "CONCEPT"),
-      l("13.03", "Video transcoding and adaptive bitrate", 12, "CONCEPT"),
-      l("13.04", "File sync: chunking and content addressing", 11, "CONCEPT"),
-      l("13.05", "Signed URLs and access control", 9, "CONCEPT"),
+      l("13.01", "Direct-to-storage uploads", 10, "CONCEPT", "direct-uploads"),
+      l("13.02", "Image processing and CDNs", 9, "CONCEPT", "image-processing"),
+      l("13.03", "Video transcoding and adaptive bitrate", 12, "CONCEPT", "video-streaming"),
+      l("13.04", "File sync: chunking and content addressing", 11, "CONCEPT", "file-sync"),
+      l("13.05", "Signed URLs and access control", 9, "CONCEPT", "signed-urls"),
     ],
   },
   {

@@ -1,0 +1,177 @@
+export const meta = {
+  summary: "Uploading only what changed and storing identical content once. Splitting files into chunks named by their hash, why fixed-size chunks fail when bytes are inserted, how content-defined chunking fixes it, and the bookkeeping that content addressing needs.",
+  uses: ["13.01", "09.06", "09.01", "05.08"],
+  usedIn: ["16.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="13.01" />. Chunks are named by a cryptographic hash, which doubles as the checksum of <L id="09.06" />.
+</BeforeYouStart>
+
+## The problem: re-uploading 2 GB for a one-line change
+
+Snip Drop adds versions: a creator replaces their 2 GB video project file with an edited one, and the short link now
+serves the new version. Most of the file is identical to the last version. Re-uploading all 2 GB for every edit wastes
+the creator's time and Snip's bandwidth, and storing every version in full multiplies storage. Many creators also
+upload the very same stock footage, byte for byte.
+
+## Chunks named by their content
+
+Split each file into **chunks** and name each chunk by the **hash of its bytes** (SHA-256). A file becomes a list of
+chunk hashes. This is **content addressing**:
+
+- **Upload only what's missing.** The client sends the list of hashes; the server answers which ones it doesn't have;
+  the client uploads only those.
+- **Store identical content once.** Two files sharing a chunk point at the same stored chunk, whether they're two
+  versions of one file or the same footage from two creators.
+- **Integrity for free.** A chunk's name is its checksum: recompute the hash on read and corruption is caught
+  (<L id="09.06" />).
+
+Dropbox works this way: every file is split into 4 MB blocks hashed with SHA-256, and the list of hashes, the
+"blocklist", identifies the file's contents; on commit, the server replies with which blocks it still needs.
+
+## The insertion problem
+
+Fixed-size chunks have one weakness: insert a single byte near the start, and every boundary after it shifts by one.
+Every chunk's bytes change, every hash changes, and the "edit" re-uploads the whole file. The LBFS paper from 2001 put
+it exactly: a single byte inserted at the start of a large file would shift all the block boundaries.
+
+## Content-defined chunking
+
+Instead of cutting every N bytes, cut **where the content says**. Slide a small window over the file computing a
+**rolling hash** of the last few dozen bytes, and cut a chunk wherever that hash's low bits are all zero. The cut
+points depend only on nearby bytes, so after an insertion, boundaries further on are found in the same places relative
+to the content, and only the chunk containing the edit changes. LBFS used Rabin fingerprints over 48-byte regions,
+cutting when the low 13 bits matched a value, for chunks of about 8 KB on average, with minimum and maximum sizes to
+avoid pathological cases.
+
+## Try it
+
+<Lab
+  id="sd-13-04-chunking"
+  title="What has to be uploaded again?"
+  tasks={[
+    "Press 'Insert a word at the start'. How many fixed chunks change, and how many content-defined ones?",
+    "Start over, then 'Change a word near the end'. Why do both schemes do well here?",
+    "Start over, then 'Delete a sentence'. What happens to every fixed chunk after the deletion?",
+    "Type your own edit anywhere in the text and watch which chunks turn red.",
+  ]}
+>
+  <ChunkingLab />
+</Lab>
+
+In the lab's 600-character note, inserting "DRAFT. " at the start changes all 19 fixed chunks but only 1 of 16
+content-defined ones; deleting a sentence changes 12 of 17 fixed chunks and 1 of 15 content-defined. Changing a word
+near the end changes one chunk either way: in-place edits don't shift anything.
+
+Tested the same way on a 20 KB document: with 10 bytes inserted near the start, 285 of 286 fixed 64-byte chunks were
+new, against 2 of 190 content-defined chunks.
+
+```ts
+// A gear-style rolling hash: each byte shifts the hash and adds a pseudo-random value for that byte, so the hash
+// depends only on the last ~32 bytes. Cut where its low bits are all zero: the cut depends on content, not position.
+export function contentChunks(data: Buffer, mask = 0x3f, min = 16, max = 256) {
+  const out: Buffer[] = [];
+  let start = 0;
+  let h = 0;
+  for (let i = 0; i < data.length; i++) {
+    h = ((h << 1) + GEAR[data[i]]) >>> 0; // GEAR: 256 fixed random 32-bit values
+    const len = i - start + 1;
+    if ((len >= min && (h & mask) === 0) || len >= max) {
+      out.push(data.subarray(start, i + 1));
+      start = i + 1;
+      h = 0;
+    }
+  }
+  if (start < data.length) out.push(data.subarray(start));
+  return out;
+}
+```
+
+Production tools use the same idea with bigger chunks: restic, the backup tool, cuts files with Rabin fingerprints
+into chunks of 512 KiB to 8 MiB, about 1 MiB on average. Newer algorithms such as FastCDC make the cutting itself much
+faster.
+
+## What content addressing costs
+
+- **An index of every chunk**, with reference counts or a periodic mark-and-sweep, to know when a chunk is no longer
+  used by any file and can be deleted.
+- **Many small objects.** Millions of chunks are packed into larger files in object storage, like Haystack
+  (<L id="09.04" />).
+- **Chunk size is a trade-off.** Smaller chunks find more duplication; larger ones mean a smaller index and fewer
+  requests.
+- **Cross-user deduplication leaks a little.** If uploading a file is instant because the server already has it, the
+  uploader learns that someone else stored that exact file. Services that care deduplicate only within one account.
+
+<Analogy>
+  **A book printed from reusable pages.** Each page is filed under a fingerprint of its text, and a book is just a list of fingerprints. A new edition reuses every unchanged page and prints only the new ones. If pages were cut every 300 words, adding a sentence on page 1 would change every page; cutting at the ends of chapters and sections instead keeps the later pages identical.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Dropbox"
+    system="Blocks and blocklists"
+    year={2014}
+    href="https://dropbox.tech/infrastructure/streaming-file-synchronization"
+    source="Streaming File Synchronization (Nipunn Koorapati, Dropbox)"
+    found="Files as lists of SHA-256-named 4 MB blocks; the server says which blocks it needs."
+  >
+    Every file in Dropbox is partitioned into 4 MB blocks, the last possibly smaller, and the blocks are hashed with
+    SHA-256 and stored. A file's contents are identified by this list of hashes, its blocklist. When a client commits
+    a file, the server checks whether the hashes are known and replies with the blocks it needs. Streaming sync
+    let downloading clients prefetch blocks of not-yet-committed files, improving multi-client sync time by up to 2×.
+  </Seen>
+  <Seen
+    company="MIT and NYU"
+    system="LBFS"
+    year={2001}
+    href="https://pdos.csail.mit.edu/papers/lbfs:sosp01/lbfs.pdf"
+    source="A Low-bandwidth Network File System (Muthitacharoen, Chen and Mazières, SOSP 2001)"
+    found="Content-defined chunk boundaries survive insertions that would shift every fixed-size block."
+  >
+    The paper notes that with aligned blocks, a single byte inserted at the start of a large file would shift all the
+    block boundaries and change every block's hash. LBFS instead sets boundaries where the Rabin fingerprint of a
+    48-byte region has its low-order 13 bits equal to a chosen value, giving an expected chunk size of 8 KB, with a
+    minimum of 2 KB and a maximum of 64 KB. [restic](https://restic.readthedocs.io/en/stable/100_references.html) uses
+    the same approach for backups, with a 64-byte window and chunks of 512 KiB to 8 MiB.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A creator re-uploads a video project file after inserting a 2-second clip near the beginning. With fixed 4 MB chunks, how much uploads? With content-defined chunks?"
+  options={[
+    { text: "Only the new clip, in both cases", why: "Fixed chunks shift after an insertion, so every chunk after the clip changes too." },
+    { text: "Nearly the whole file with fixed chunks; roughly the new clip plus a chunk or two with content-defined chunks", correct: true, why: "Content-defined boundaries depend on nearby bytes, so they reappear in the same places after the inserted section." },
+    { text: "The whole file in both cases", why: "Content-defined chunking exists precisely to avoid this." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Fixed-size chunks for files that get edits in the middle.** Insertions shift everything; use content-defined chunking.</li>
+    <li>**No garbage collection.** Chunks no file references must be found and deleted.</li>
+    <li>**Tiny chunks everywhere.** The index and request overhead outweigh the extra deduplication.</li>
+    <li>**Cross-user dedup without thinking about privacy.** It reveals that a file already exists.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Split files into chunks named by their SHA-256; a file is a list of chunk hashes.</li>
+    <li>Upload only chunks the server lacks; store identical chunks once; verify integrity from the names.</li>
+    <li>Fixed-size chunks break on insertions; content-defined chunking cuts where a rolling hash says, so boundaries survive.</li>
+    <li>Content addressing needs a chunk index, garbage collection and packing of small chunks.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design file sync like Dropbox. How do you avoid re-uploading whole files?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["Why not fixed-size blocks?", "How do you delete data that's shared between files?"]}
+>
+  <p>Split each file into chunks and identify each chunk by its SHA-256 hash; a file version is a list of chunk hashes in a metadata service. To sync, the client computes the chunk list, asks the server which hashes it lacks, uploads only those to object storage, then commits the new list. Identical chunks are stored once, and hashes double as integrity checks. Other clients get a notification, fetch the new list, and download only chunks they don't have.</p>
+  <p>Fixed-size chunks fail when bytes are inserted, since every later boundary shifts, so I'd use content-defined chunking with a rolling hash and minimum and maximum chunk sizes, so boundaries follow content and edits change only nearby chunks. Deleting requires reference counting or periodic mark-and-sweep over chunk references, with small chunks packed into larger objects.</p>
+</InterviewCard>

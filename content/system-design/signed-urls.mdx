@@ -1,0 +1,151 @@
+export const meta = {
+  summary: "Letting the right people download private files without sending every byte through your servers: signed URLs and signed cookies, what they can and can't do (they're bearer tokens and hard to revoke), and the leaks to avoid. Tested HMAC link signing.",
+  uses: ["13.01", "13.03", "02.05", "14.10"],
+  usedIn: ["16.05", "16.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="13.01" />: the same signing, used for downloads. Private video (<L id="13.03" />) and CDN caching
+  (<L id="02.05" />) shape the choices.
+</BeforeYouStart>
+
+## The problem: private drops
+
+Most Snip Drop files are shared publicly, but the paid plan adds **private drops**: only people the owner invited, or
+signed in to their company account, can download. The files are big and live in object storage behind a CDN. Checking
+permissions is the app's job; moving gigabytes is not.
+
+## Option 1: proxy through the app
+
+Every download goes through Snip's servers, which check the user and stream the file. It's simple and the check
+happens on every byte range, but it puts all download traffic back on the app servers, and it can't use the CDN's
+cache for private files. Fine for small files, wrong for video.
+
+## Option 2: signed URLs
+
+The app checks permission once, then hands back a URL that the storage or CDN will honour without asking the app
+again: the path, an expiry, and a signature over both, made with a secret the storage or CDN trusts.
+
+```ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const SECRET = process.env.LINK_SIGNING_SECRET!; // shared with whatever verifies the links
+
+export function signPath(path: string, expiresAt: number) {
+  const sig = createHmac("sha256", SECRET).update(`${path}\n${expiresAt}`).digest("base64url");
+  return `${path}?exp=${expiresAt}&sig=${sig}`;
+}
+
+export function verify(url: string, now = Date.now() / 1000) {
+  const u = new URL(url, "https://snip.link");
+  const exp = Number(u.searchParams.get("exp"));
+  const sig = Buffer.from(u.searchParams.get("sig") ?? "", "base64url");
+  const expected = createHmac("sha256", SECRET).update(`${u.pathname}\n${exp}`).digest();
+  if (sig.length !== expected.length || !timingSafeEqual(sig, expected)) return "bad signature";
+  if (now > exp) return "expired";
+  return "ok";
+}
+```
+
+Tested: a link signed for 10 minutes verified as `ok`, was `expired` a second after its expiry, and gave `bad
+signature` when the path was changed to another drop or the expiry was edited to be later, since both are inside the
+signature. The comparison is constant-time (`timingSafeEqual`), so response times don't leak how much of a forged
+signature was right.
+
+S3 presigned URLs (<L id="13.01" />) and CDN signed URLs work the same way, with the provider doing the checking.
+
+## Option 3: signed cookies, for many files
+
+A private video is a playlist plus hundreds of segment files (<L id="13.03" />). Signing each segment URL means
+rewriting playlists per viewer. A **signed cookie** instead authorises a pattern of paths, such as everything under
+`/v/x7Kp/`, for a while, and the browser sends it with every request. AWS's CloudFront guidance matches this: signed
+URLs for individual files or clients without cookies, signed cookies for access to multiple restricted files, such as
+all the files of an HLS video, or when you don't want to change your URLs.
+
+## What signatures can't do
+
+- **They're bearer tokens.** Amazon describes presigned URLs exactly that way: whoever holds one can use it. A URL
+  forwarded, pasted in a chat or posted publicly works for everyone until it expires.
+- **They're hard to revoke.** Nothing is checked with the app after signing. Removing someone's access takes effect
+  only when their URL expires, unless you rotate the signing key (breaking every outstanding URL) or move the file. So
+  keep expiries short (minutes for downloads; the page asks for a fresh link when needed).
+- **They leak in logs and referrers.** Full URLs end up in access logs, analytics and browser history, and can be sent
+  to other sites in the `Referer` header. Don't log query strings of signed URLs, and send `Referrer-Policy:
+  no-referrer` on pages that embed them.
+- **Caching must be private.** A personalised signed response must not be cached for other users (<L id="02.05" />);
+  sign the path, and keep the user's identity out of shared caches.
+
+For anything where access must be withdrawn immediately, keep the check in the request path: proxy, or have the CDN
+call an authorisation endpoint, accepting the cost.
+
+<Analogy>
+  **A concert wristband.** The box office checks your ticket once and gives you a wristband for tonight (a signed cookie for the whole venue), or a single-entry stamp for one room (a signed URL). Staff at the doors only check that the band is genuine and not expired; they don't phone the box office. That's fast, but if you give your band to a friend, it works for them too, and the box office can't cancel it until the night is over.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="S3 presigned URLs"
+    year="Docs"
+    href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html"
+    source="Download and upload objects with presigned URLs (Amazon S3 documentation)"
+    found="Presigned URLs are bearer tokens: anyone holding one can use it, up to its expiry and the signer's permissions."
+  >
+    Presigned URLs grant time-limited access without changing bucket policies; their capabilities are limited by the
+    permissions of whoever created them, and they are bearer tokens that grant access to anyone who possesses them.
+    With Signature Version 4 they can be valid for up to 7 days, and a URL expires early if the credential used to
+    create it is revoked, deleted or deactivated.
+  </Seen>
+  <Seen
+    company="Amazon"
+    system="CloudFront signed URLs and cookies"
+    year="Docs"
+    href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-choosing-signed-urls-cookies.html"
+    source="Decide to use signed URLs or signed cookies (Amazon CloudFront documentation)"
+    found="Signed URLs for single files; signed cookies for many files, such as an HLS video, or to keep existing URLs."
+  >
+    CloudFront recommends signed URLs to restrict access to individual files, such as an installation download, or
+    when clients don't support cookies; and signed cookies to give access to multiple restricted files, for example all
+    the files of a video in HLS format, or when you don't want to change your current URLs. When both are present,
+    signed URLs take precedence.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="An owner removes a colleague from a private drop. The colleague still has a signed download URL that expires in 6 hours. What happens, and how should Snip design for it?"
+  options={[
+    { text: "Access stops immediately: the URL checks the drop's members", why: "A signed URL is verified by its signature and expiry alone; it doesn't consult membership." },
+    { text: "The URL keeps working until it expires; keep download URLs short-lived (minutes) and re-issue them after a fresh permission check", correct: true, why: "Short expiries bound how long revoked users keep access. For instant revocation, keep an authorisation check in the request path." },
+    { text: "Rotating the signing key fixes it with no side effects", why: "It would revoke the URL, but also every other outstanding URL for every user." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Long expiries.** A leaked or revoked user's URL works until it expires. Use minutes.</li>
+    <li>**Logging full signed URLs.** Strip query strings from logs and analytics.</li>
+    <li>**Signing one URL per video segment.** Use signed cookies for a video's many files.</li>
+    <li>**Expecting instant revocation.** Signatures can't be recalled; keep a live check where it must be immediate.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Check permission once in the app, then let storage or the CDN serve bytes against a signature.</li>
+    <li>Signed URLs suit single files; signed cookies suit many files under one path, like a video.</li>
+    <li>Signatures are bearer tokens and can't be recalled early: keep expiries short and scopes narrow.</li>
+    <li>Keep signed URLs out of logs and referrers; use a live check where revocation must be instant.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you serve private files to authorised users from a CDN?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How do you revoke access?", "Signed URLs or signed cookies?"]}
+>
+  <p>The application authenticates the user and checks permission, then issues a short-lived signed URL, an HMAC or private-key signature over the path and expiry that the CDN or storage verifies without calling back. For a single file a signed URL works; for something made of many files, like an HLS video, a signed cookie covering the path prefix avoids signing every segment. Files stay private in the bucket, readable only through the CDN.</p>
+  <p>Signed URLs are bearer tokens and can't be revoked before expiry without rotating keys, so I'd keep expiries to minutes and re-issue as needed, avoid logging them, and set a referrer policy. If access must be withdrawable instantly, I'd keep an authorisation check in the path, either by proxying or by having the edge call an auth service, and accept the extra latency.</p>
+</InterviewCard>

@@ -1,0 +1,165 @@
+export const meta = {
+  summary: "Big files shouldn't flow through your app servers. The browser uploads straight to object storage with a short-lived presigned URL; large files go in parts that can be retried and resumed; your API only authorises and records. Tested code.",
+  uses: ["09.04", "03.12", "07.05", "05.05"],
+  usedIn: ["13.02", "13.03", "13.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="09.04" /> for object storage. Processing after upload uses the job queue from <L id="07.05" />.
+</BeforeYouStart>
+
+## The problem: a 2 GB file through the API
+
+Snip launches **Snip Drop**: upload a file, get a short link (`snip.link/d/x7Kp`) that downloads it. Files can be up to
+2 GB. The first version accepts uploads through the <Term t="api">API</Term>: the browser sends the file to an app server, which streams it
+to object storage.
+
+At 2 GB, that's minutes per upload, each holding an app-server connection and its bandwidth. A burst of uploads starves
+the redirects running on the same servers (<L id="03.12" />), a deploy kills every upload in flight, and the load
+balancer's request size and timeout limits are suddenly a product feature. The app servers add nothing: they just
+copy bytes from one network socket to another.
+
+## Presigned uploads
+
+Let the browser send the bytes **directly to object storage**, and keep the app in charge of **who may upload what**:
+
+<Sequence
+  title="Uploading a file to Snip Drop"
+  walk
+  participants={[{ id: "b", label: "Browser" }, { id: "api", label: "Snip API" }, { id: "s3", label: "Object store" }, { id: "w", label: "Worker" }]}
+  messages={[
+    { from: "b", to: "api", label: "I want to upload report.pdf, 3.5 MB", explain: "The browser asks first, sending only the name, type and size." },
+    { from: "api", to: "b", label: "PUT here, within 5 minutes", reply: true, explain: "The API checks the user's plan and quota, chooses the storage key, and signs a URL valid for one upload of that size to that key." },
+    { from: "b", to: "s3", label: "PUT 3.5 MB", explain: "The bytes go straight to object storage. Snip's servers never touch them." },
+    { from: "s3", to: "w", label: "object created", explain: "The store emits an event; a worker scans the file and records it (07.05)." },
+    { from: "w", to: "api", label: "drop x7Kp ready", explain: "Only after the scan does the short link start working." },
+  ]}
+/>
+
+The <Term t="signed-url">presigned URL</Term> carries a signature made with Snip's storage credentials over the method, key, expiry and some
+headers. In Amazon's description, presigned URLs grant time-limited access to objects without changing the bucket's
+policy, and they are **bearer tokens**: anyone holding the URL can use it, within the permissions of whoever created it.
+
+```ts
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { randomUUID } from "node:crypto";
+
+const s3 = new S3Client({ region: "eu-west-2" });
+
+/** Called by the API after checking the user may upload. The browser PUTs the file straight to S3. */
+export async function createUpload(ownerId: number, contentType: string, bytes: number) {
+  if (bytes > 2 * 1024 ** 3) throw new Error("too large for Snip Drop");
+  const key = `drops/${ownerId}/${randomUUID()}`; // our name, never the user's filename
+  const url = await getSignedUrl(
+    s3,
+    new PutObjectCommand({ Bucket: "snip-drops", Key: key, ContentType: contentType, ContentLength: bytes }),
+    { expiresIn: 300 }, // five minutes to start the upload
+  );
+  return { key, url };
+}
+```
+
+Generated with test credentials (no network needed), the URL pointed at the bucket with the chosen key, carried
+`X-Amz-Expires=300`, and signed both `host` and `content-length`, so an upload of a different size is rejected; an
+oversized request was refused before any URL was made.
+
+## Big files: multipart and resumable
+
+One 2 GB PUT that fails at 95% starts again from zero. **Multipart upload** splits the file into parts uploaded
+separately (each with its own presigned URL) and combined at the end:
+
+- Parts upload **in parallel**, for throughput, and a failed part is retried on its own.
+- An upload can be **paused and resumed** later; it has no expiry until completed or aborted.
+- S3 recommends multipart for objects of 100 MB or more. Parts are 5 MiB to 5 GiB, up to 10,000 parts, and the last
+  part may be smaller.
+- Abandoned uploads keep their parts, and are billed, until aborted. Set a lifecycle rule to abort incomplete
+  multipart uploads after a few days.
+
+For phones on flaky networks, **resumable** protocols such as tus make "carry on from where I stopped" part of the
+protocol: the client asks the server how many bytes it has (a `HEAD` request returning `Upload-Offset`), then sends the
+rest with `PATCH`.
+
+## Don't trust the upload
+
+The bytes arrive without passing your code, so check them afterwards:
+
+- **Choose the key yourself.** Never use the user's filename as the storage path.
+- **Quarantine first.** Uploads land in a prefix that isn't served; a worker checks size, real type (from the file's
+  bytes, not the declared content type), and malware, then marks it ready.
+- **Short expiry, exact size.** Five minutes to start, the size signed into the URL, and a per-user quota checked when
+  issuing it.
+
+<Analogy>
+  **Sending a parcel through a courier with a prepaid label.** You don't carry the parcel to the shop's office for them to pass on; the shop gives you a label (the presigned URL) good for one parcel of a stated size to their warehouse, for a short time. The warehouse checks the label, and the shop inspects the parcel before putting it on the shelf.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="S3 presigned URLs and multipart upload"
+    year="Docs"
+    href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html"
+    source="Download and upload objects with presigned URLs (Amazon S3 documentation)"
+    found="Time-limited bearer URLs, capped by the signer's permissions; multipart for large objects, with clean-up of abandoned parts."
+  >
+    Presigned URLs grant time-limited access to objects without updating the bucket policy, use the credentials of the
+    principal that generated them, are limited by that principal's permissions, and act as bearer tokens for whoever
+    holds them; with Signature Version 4 they can last up to 7 days. The
+    [multipart upload guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html) lists parallel
+    parts, retrying a failed part without affecting others, and pausing and resuming; it recommends multipart for
+    objects of 100 MB or more and a lifecycle rule to delete incomplete multipart uploads.
+  </Seen>
+  <Seen
+    company="tus"
+    system="Resumable uploads"
+    year={2016}
+    href="https://tus.io/protocols/resumable-upload"
+    source="Resumable upload protocol 1.0.x (tus.io)"
+    found="An open HTTP protocol for resuming uploads: ask for the offset, then send the rest."
+  >
+    The tus protocol provides a mechanism for resumable file uploads over HTTP. A HEAD request returns the
+    `Upload-Offset` at which the upload should continue, and the client then uses PATCH to send the remaining bytes,
+    receiving the new offset in the response.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip Drop's presigned PUT URLs last 7 days 'to be safe'. One leaks in a support ticket screenshot. What's the risk, and the better setting?"
+  options={[
+    { text: "No risk: only the owner's browser can use it", why: "A presigned URL is a bearer token. Whoever has it can use it until it expires." },
+    { text: "Anyone can upload to that key for a week; issue URLs that expire in minutes, for one key and an exact size", correct: true, why: "Short expiry and tight scope limit what a leaked URL allows. The client asks for a new one if it needs to retry later." },
+    { text: "It lets anyone read every file in the bucket", why: "It's scoped to one operation on one key, but that's still a week of overwriting that key." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Proxying large uploads through app servers.** Sign a URL and let the store receive the bytes.</li>
+    <li>**Long-lived or broad presigned URLs.** Minutes, one key, an exact size.</li>
+    <li>**Using the client's filename as the key.** Generate keys; store the display name separately.</li>
+    <li>**Serving files before checking them.** Quarantine, verify type and scan, then publish.</li>
+    <li>**Forgetting abandoned multipart uploads.** Abort them with a lifecycle rule.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Keep large bytes off app servers: the API authorises and signs; the browser uploads directly.</li>
+    <li>Presigned URLs are short-lived bearer tokens scoped to one operation on one key.</li>
+    <li>Use multipart (parallel, retryable parts) above about 100 MB, resumable protocols for flaky clients, and clean up abandoned uploads.</li>
+    <li>Treat uploads as untrusted: your key, quarantine, type and malware checks before publishing.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you handle large file uploads from browsers and mobile apps?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you make uploads resumable?", "How do you stop people uploading malicious or oversized files?"]}
+>
+  <p>Don't route file bytes through the application servers. The client asks the API for permission with the file's name, type and size; the API checks authorization and quotas, generates a storage key, and returns a short-lived presigned URL for that key and size. The client uploads directly to object storage; a storage event or a client callback then triggers a job that validates and registers the file.</p>
+  <p>For large files I'd use multipart upload, with a presigned URL per part, parallel part uploads and retry of individual parts, plus a lifecycle rule to abort incomplete uploads; on mobile, a resumable protocol like tus. Uploads land in a quarantine location, are checked for real content type, size and malware, and only then become downloadable.</p>
+</InterviewCard>

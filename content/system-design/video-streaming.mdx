@@ -1,0 +1,163 @@
+export const meta = {
+  summary: "From one uploaded video to smooth playback on any connection: transcoding into a ladder of qualities, cutting it into short segments, playlists that let the player switch quality mid-stream, and why keyframes and segment length matter.",
+  uses: ["13.01", "13.02", "02.05", "07.05"],
+  usedIn: ["13.05", "16.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="13.01" /> for uploads and <L id="13.02" /> for the idea of serving variants. Video is delivered almost
+  entirely by CDNs (<L id="02.05" />).
+</BeforeYouStart>
+
+## The problem: a cover video on every connection
+
+Snip Bio lets creators add a 60-second video to their profile. The upload is a 1080p file from a phone, around 150
+MB. A visitor on fast Wi-Fi should see it sharp; one on a train with a weak signal should see it play without
+stalling, just blurrier; and if the signal improves halfway through, the picture should get sharper without
+restarting.
+
+Downloading one file can't do that. **Adaptive bitrate streaming** can.
+
+## 1. Transcode into a ladder
+
+A worker (<L id="07.05" />) **transcodes** the upload into several versions at different resolutions and bitrates:
+a **ladder**. Apple's HLS authoring specification gives one possible ladder for 16:9 H.264 video, for example:
+
+| Resolution | Bitrate (kbit/s) |
+| --- | --- |
+| 416 × 234 | 145 |
+| 640 × 360 | 365 |
+| 960 × 540 | 2,000 |
+| 1280 × 720 | 3,000 to 4,500 |
+| 1920 × 1080 | 6,000 to 7,800 |
+
+Transcoding is the heavy step: minutes of CPU per minute of video per rung. It parallelises well by splitting the
+video into pieces, transcoding them on many workers and joining the results, so even long videos are ready quickly.
+
+## 2. Cut it into segments
+
+Each version is cut into short **segments**, a few seconds each, stored as separate files. Apple's specification
+says target durations should be 6 seconds, and that key frames (frames that decode without reference to earlier
+ones) should be present every two seconds.
+
+Segments are what make switching possible: the player can fetch segment 5 at 2,000 kbit/s and segment 6 at 6,000
+kbit/s. That only works if every rung's segments start at the same moments, on a keyframe, which is why keyframe
+placement is aligned across the ladder.
+
+## 3. Describe it in playlists
+
+With HLS (HTTP Live Streaming, RFC 8216), a **master playlist** lists the variants, and each variant has a **media
+playlist** listing its segments:
+
+```
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=545000,RESOLUTION=640x360
+360p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=960x540
+540p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=7000000,RESOLUTION=1920x1080
+1080p/index.m3u8
+```
+
+```
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:6.0,
+seg-000.ts
+#EXTINF:6.0,
+seg-001.ts
+#EXT-X-ENDLIST
+```
+
+`BANDWIDTH` is the variant's peak segment bitrate in bits per second. The **player** measures how fast segments
+arrive and how much video it has buffered, and picks the variant for each next segment. RFC 8216 deliberately leaves
+that switching algorithm to clients. DASH is the other widely used format; the idea is the same.
+
+## 4. Serve it from the CDN
+
+Every segment is a small, immutable file, which is exactly what CDNs are best at (<L id="02.05" />): cache them for a
+long time, and the origin sees almost nothing after the first viewers. A popular video's segments are served from
+edges near viewers; the playlists, tiny and cacheable too, point at them.
+
+## What it costs
+
+- **Storage multiplies**: every rung is a full copy of the video. A short tail of rarely watched videos can skip the
+  top rungs, generated only if anyone watches.
+- **Encoding time** before the video is ready: show "processing" in the meantime, and transcode the lowest rung first
+  so playback can start soon.
+- **Segment length trade-off**: shorter segments switch quality and start faster but mean more requests and less
+  efficient compression; longer ones are the reverse.
+
+<Analogy>
+  **Delivering a long letter by many postcards.** Instead of one heavy envelope, the letter is copied in large, medium and small handwriting and split into numbered postcards. If the post is slow, the reader asks for the next card in small writing; when it speeds up, in large writing. The story never stops, it just gets easier or harder to read.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Apple"
+    system="HLS authoring specification"
+    year="Docs"
+    href="https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices"
+    source="HTTP Live Streaming (HLS) authoring specification for Apple devices"
+    found="Six-second segments, keyframes every two seconds, and a published example bitrate ladder."
+  >
+    The specification says key frames (IDRs) should be present every two seconds, target and segment durations should
+    nominally be 6 seconds, and segments must not exceed the target duration by more than half a second. It offers one
+    possible set of bitrate variants, from 416 × 234 at 145 kbit/s up to 1920 × 1080 at 7,800, and says the default
+    video variant should be the 2,000 kbit/s one.
+  </Seen>
+  <Seen
+    company="IETF"
+    system="RFC 8216: HTTP Live Streaming"
+    year={2017}
+    href="https://www.rfc-editor.org/rfc/rfc8216.txt"
+    source="RFC 8216: HTTP Live Streaming (Pantos and May)"
+    found="A master playlist of variant streams, media playlists of segments, and switching left to the client."
+  >
+    A master playlist provides a set of variant streams, each a different version of the same content, and a media
+    playlist lists media segments. Each variant's BANDWIDTH is its peak segment bitrate, in bits per second, and the
+    RFC states that clients should switch between variant streams to adapt to network conditions, while the
+    algorithms they use to switch are beyond its scope.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip transcodes its ladder with keyframes wherever the encoder chooses, different for each rung. Players stall or glitch when switching quality. Why?"
+  options={[
+    { text: "The bitrates are too far apart", why: "Wide gaps make switches more visible, but don't cause glitches." },
+    { text: "Segments in different rungs don't start at the same moments on keyframes, so a switched-to segment can't be decoded cleanly from its start", correct: true, why: "Aligned keyframes and segment boundaries across every rung are what let a player swap rungs at any segment." },
+    { text: "The CDN caches segments too long", why: "Segments never change, so long caching is correct." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Serving one big file.** It can't adapt to the connection. Use segmented adaptive streaming.</li>
+    <li>**Unaligned keyframes across rungs.** Switching breaks. Force a fixed keyframe interval for every rung.</li>
+    <li>**Encoding every rung for every video.** Rarely watched videos can skip expensive top rungs.</li>
+    <li>**Waiting for the whole ladder.** Publish the lowest rung first so playback can start.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Transcode each upload into a ladder of resolutions and bitrates.</li>
+    <li>Cut every rung into short segments, around 6 seconds, starting on aligned keyframes.</li>
+    <li>Playlists list variants and segments; the player measures throughput and picks each next segment's quality.</li>
+    <li>Segments are small immutable files, ideal for CDN caching; storage and encoding are the main costs.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How does adaptive bitrate streaming work, and how would you build the processing pipeline?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["Why must keyframes be aligned across renditions?", "How do you make processing fast for long videos?"]}
+>
+  <p>An uploaded video is transcoded into a ladder of renditions at different resolutions and bitrates, each cut into short segments of a few seconds with keyframes aligned so every rung's segments start at the same instants. A master playlist lists the renditions with their bandwidths, and media playlists list each rendition's segments, in HLS or DASH. The player downloads segments over HTTP from a CDN, measures throughput and buffer level, and chooses the rendition for each next segment, so quality adapts without stopping.</p>
+  <p>The pipeline uploads the original to object storage, a job splits it into chunks transcoded in parallel by workers and then reassembled, generates playlists and thumbnails, and publishes the lowest rung first. Segments are immutable and cached at the CDN with long lifetimes; private videos use signed cookies so all segments are authorised together.</p>
+</InterviewCard>

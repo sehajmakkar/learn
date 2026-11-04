@@ -1,0 +1,143 @@
+export const meta = {
+  summary: "One uploaded photo becomes many images: sizes for every screen, modern formats, stripped metadata. Generating variants at upload or on demand at the edge, letting the browser choose with srcset, and keeping the cache from exploding.",
+  uses: ["13.01", "02.05", "06.07", "07.05"],
+  usedIn: ["13.03"],
+};
+
+<BeforeYouStart>
+  Read <L id="13.01" /> for how originals arrive, and <L id="06.07" /> for cache keys at the CDN.
+</BeforeYouStart>
+
+## The problem: a 12 MB photo on a phone
+
+Snip Bio creators upload a profile photo and a cover image, often straight from a phone camera: 12 MB, 4,000 pixels
+wide, with GPS coordinates in its metadata. Visitors view profiles on phones over mobile data, where the avatar is 96
+pixels across. Serving the original would mean downloading 12 MB to show an image the size of a thumbnail, and
+publishing where the creator lives.
+
+## What one upload becomes
+
+- **Sizes**: an avatar at 96, 192 and 384 pixels; a cover at 640, 1,280 and 2,560. Larger sizes cover high-density
+  screens.
+- **Formats**: modern formats like WebP and AVIF are much smaller than JPEG for the same quality, for browsers that
+  support them, with JPEG as the fallback.
+- **Stripped metadata**: remove EXIF data (camera, time, GPS location) from every served copy.
+- **Fixed orientation**: apply the phone's rotation flag, so images don't appear sideways.
+
+The original stays in object storage (<L id="09.04" />), untouched, so variants can always be regenerated.
+
+## Make variants up front, or on demand?
+
+**At upload**: a job (<L id="07.05" />) creates every variant and stores them. Reads are plain cached files. But
+every upload pays for sizes that may never be requested, and adding a new size means reprocessing every image.
+
+**On demand at the edge**: the image URL carries the transformation (`/img/avatar/4821.jpg?width=192&format=auto`), and
+an image service at the CDN fetches the original, transforms it, and caches the result. Cloudflare, for example,
+describes its transformations as optimising and caching remote images from any origin at the edge: on a miss it fetches
+the original, applies the requested parameters such as width, format and quality, and caches the result. Nothing is
+generated until someone asks for it.
+
+Snip does both: avatar sizes are generated at upload (they're on every profile view), and covers are transformed on
+demand.
+
+## Don't let parameters explode the cache
+
+On-demand transforms put parameters in the URL, so every distinct parameter set is a separate cache entry and a
+separate, CPU-heavy transform (<L id="06.07" />). Left open, `width=191`, `width=192`, `width=193` … are all different,
+and anyone can make the service resize images all day. So:
+
+- **Allow a fixed set of sizes** (snap requests to the nearest allowed width) and qualities.
+- **Sign transformation URLs**, or only accept them from your own pages, so others can't generate arbitrary work.
+- **Cache the transformed result for a long time**: originals don't change in place, and a new upload gets a new key.
+
+## Let the browser pick
+
+The page offers the sizes and lets the browser choose, based on how large the image will appear and the screen's pixel
+density:
+
+```html
+<img
+  src="/img/cover/4821.jpg?width=1280"
+  srcset="/img/cover/4821.jpg?width=640 640w,
+          /img/cover/4821.jpg?width=1280 1280w,
+          /img/cover/4821.jpg?width=2560 2560w"
+  sizes="(max-width: 600px) 100vw, 600px"
+  alt="Cover image"
+  width="1280" height="480" />
+```
+
+`srcset` lists the candidates with their real widths; `sizes` says how wide the image will be on screen. A phone 375
+pixels wide at 3× density needs about 1,125 pixels, so it picks the 1,280 version, not the 2,560. The `width` and
+`height` attributes reserve space so the page doesn't jump as images load.
+
+<Analogy>
+  **A photo lab.** You hand in one negative (the original) and keep it safe. Prints are made in the sizes people actually order, some in advance for the shop window and others on request, from a fixed list of sizes so the lab isn't asked for 191 slightly different ones. And no print shows what's written on the back of the negative.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Cloudflare"
+    system="Image transformations"
+    year={2026}
+    href="https://developers.cloudflare.com/images/transform-images/"
+    source="Transform images (Cloudflare documentation)"
+    found="Transform originals on request at the edge and cache the result; nothing is generated until it's asked for."
+  >
+    Cloudflare's transformations optimise and manipulate images stored outside its own image service, caching remote
+    images from any origin at the edge. On a request, it fetches the original from the origin, applies the requested
+    parameters such as format, width and quality, and caches the transformed result. By default, it only accepts source
+    images from the same zone the transformations are served on.
+  </Seen>
+  <Seen
+    company="Mozilla"
+    system="Responsive images"
+    year={2025}
+    href="https://developer.mozilla.org/en-US/docs/Web/HTML/Guides/Responsive_images"
+    source="Using responsive images in HTML (MDN Web Docs)"
+    found="Offer several widths with srcset and the display size with sizes; the browser picks the right file."
+  >
+    `srcset` defines the set of images the browser may choose between and each image's intrinsic width (with the `w`
+    unit), and `sizes` gives media conditions with the size the image will be displayed at. The browser takes into
+    account screen size, pixel density, zoom, orientation and network speed, and picks the first image larger than the
+    slot it will fill.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's on-demand image service accepts any width in the URL. A scraper requests every width from 1 to 4,000 for thousands of profiles. What happens, and what's the fix?"
+  options={[
+    { text: "Nothing: the CDN caches each result", why: "Each width is a new cache entry and a new resize. The cache never helps, and the transform service does all the work." },
+    { text: "The transform service and storage are overwhelmed with unique work; snap to a small set of allowed widths and sign transformation URLs", correct: true, why: "A fixed set of sizes bounds the variants per image, and signing stops outsiders choosing arbitrary parameters." },
+    { text: "The originals get corrupted", why: "Originals are only read. The damage is cost and load, not corruption." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Serving originals.** Generate sized, modern-format variants.</li>
+    <li>**Keeping EXIF on served images.** Strip metadata; GPS coordinates are personal data.</li>
+    <li>**Arbitrary transform parameters.** Allow a fixed set, and sign URLs.</li>
+    <li>**One size for every screen.** Use srcset and sizes so each device downloads what it needs.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Keep the original; serve variants in several sizes and modern formats, with metadata stripped.</li>
+    <li>Generate common sizes at upload; transform the rest on demand at the edge, cached.</li>
+    <li>Constrain transform parameters to a fixed set, and sign them, so caches work and abuse is bounded.</li>
+    <li>Let the browser choose with srcset and sizes.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design image upload and delivery for a social app.", level: "Mid", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["Do you generate thumbnails at upload or on demand?", "How do you serve the right size to each device?"]}
+>
+  <p>Clients upload originals directly to object storage with presigned URLs; a job validates the image, fixes orientation, strips EXIF metadata, and generates the sizes needed everywhere, such as avatars, in WebP or AVIF plus a JPEG fallback. Other sizes are produced on demand by an image service behind the CDN, from a fixed set of allowed widths, with signed URLs, and cached for a long time since a new upload gets a new key.</p>
+  <p>Pages use srcset and sizes so each browser downloads the smallest adequate variant, with width and height set to avoid layout shift. Originals are kept so any variant can be regenerated when formats or sizes change.</p>
+</InterviewCard>
