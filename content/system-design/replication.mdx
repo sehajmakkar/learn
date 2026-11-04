@@ -1,7 +1,7 @@
 export const meta = {
   summary: "Keeping copies of a database on several servers: synchronous versus asynchronous replication, what lag breaks, and how failover can lose data or create two leaders.",
   uses: ["04.06", "02.04", "02.02"],
-  usedIn: ["04.08", "08.03"],
+  usedIn: ["04.08", "08.04"],
 };
 
 <BeforeYouStart>
@@ -83,7 +83,7 @@ Two other designs exist, with harder trade-offs, covered in Part 2's distributed
 
 - **Multi-leader:** several nodes accept writes (often one per region) and exchange changes. Writes are local and
   fast; concurrent writes to the same data conflict and must be resolved.
-- **Leaderless:** clients write to several replicas and read from several, using quorums (<L id="08.03" />).
+- **Leaderless:** clients write to several replicas and read from several, using quorums (<L id="08.04" />).
 
 <SeenInProduction>
   <Seen

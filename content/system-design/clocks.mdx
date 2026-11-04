@@ -1,0 +1,151 @@
+export const meta = {
+  summary: "Why two machines never quite agree on the time, what that does to time-ordered IDs and last-write-wins, and the tools that avoid trusting the clock: monotonic clocks, versions and logical clocks.",
+  uses: ["05.05", "04.07"],
+  usedIn: ["08.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="05.05" />: <Term t="snowflake-id">Snowflake IDs</Term> and <Term t="uuidv7">UUIDv7</Term> are only as ordered as the clocks that make them.
+</BeforeYouStart>
+
+## The problem: every machine has its own time
+
+Each server's clock is a quartz crystal, and no two run at exactly the same speed. Left alone, they drift apart by
+seconds a week. **NTP** keeps them close by checking against time servers and correcting, but "close" across a data
+centre usually means within a few milliseconds, and much worse if NTP is misconfigured, a VM is paused, or a network
+is congested.
+
+Corrections cause their own trouble. NTP can **slew** a clock (run it slightly fast or slow until it's right) or
+**step** it (jump it, sometimes backwards). Leap seconds have historically been handled by repeating a second. So a
+program that reads the time twice can see the second reading come out *earlier* than the first.
+
+## Two clocks in every machine
+
+Operating systems offer two kinds of clock, for two different questions:
+
+| | Wall clock ("time of day") | Monotonic clock |
+| --- | --- | --- |
+| **Answers** | What time is it? | How much time has passed? |
+| **Can jump backwards** | Yes, when corrected | No, never |
+| **Comparable across machines** | Roughly, within the skew | No: it's just a counter since boot |
+| **Use it for** | Timestamps people read, Snowflake's time field | Timeouts, latencies, <Term t="rate-limit">rate limits</Term> |
+
+Measuring a duration with the wall clock is a classic bug: a backwards step makes it negative, and code that never
+expected a negative duration breaks, as Cloudflare found below.
+
+## Ordering events across machines
+
+Timestamps from two machines can only order events that are further apart than the clocks' disagreement. Two Snip
+servers with clocks 5 ms apart can produce Snowflake IDs that sort in the "wrong" order for events less than 5 ms
+apart. For sorting a dashboard, that's harmless. For deciding **which write wins**, it isn't:
+
+<Sequence
+  title="Last write wins, with a clock running 40 ms fast"
+  walk
+  participants={[{ id: "a", label: "Server A (+40 ms)" }, { id: "db", label: "Database" }, { id: "b", label: "Server B" }]}
+  messages={[
+    { from: "a", to: "db", label: "set URL = old.example @ 10:00:00.040", explain: "Ana edits a link's destination. Server A's clock is 40 ms fast, so the write is stamped 10:00:00.040." },
+    { from: "b", to: "db", label: "set URL = new.example @ 10:00:00.020", explain: "10 ms later in real time, Ana fixes a typo. Server B's clock is correct and stamps it 10:00:00.020." },
+    { from: "db", to: "b", label: "keep old.example", fail: true, reply: true, explain: "Last write wins compares timestamps: .040 beats .020, so the newer edit is silently thrown away. No error, no conflict, just lost data." },
+  ]}
+/>
+
+**Last write wins** is popular because it's simple, and many distributed databases use it to settle concurrent
+updates. Its cost is that a skewed clock silently discards writes. Use it only where losing one of two near-simultaneous
+writes is acceptable.
+
+## Ordering without trusting the clock
+
+- **Let one place decide.** If every write to a row goes to that row's single primary (<L id="04.07" />), the primary's
+  order is the order. This is why <Term t="sharding">sharding</Term> with one <Term t="leader">leader</Term> per shard sidesteps most clock problems.
+- **Version numbers.** Store a version on the row, and make each update conditional: `UPDATE links SET long_url = $1, version = 8 WHERE code = 'x7Kp' AND version = 7`.
+  If someone else got there first, zero rows change and the app retries with
+  fresh data. Order comes from the data, not the clock.
+- **Logical clocks.** A **Lamport clock** is a counter each machine increments on every event and includes in every
+  message; a machine receiving a larger counter jumps its own past it. It orders causes before effects without any
+  physical time. **Hybrid logical clocks** combine a physical timestamp with a counter, staying close to real time
+  while never going backwards. Part 2 covers these in depth (<L id="08.05" />).
+- **Bound the uncertainty.** Google's Spanner gives up on exact time and asks for an interval guaranteed to contain
+  it, then waits out the uncertainty before committing (below).
+
+<Analogy>
+  **Watches at a meeting.** Ask ten people the time and you get answers a minute apart; nobody's lying. If two of them say "I arrived first" based on their own watches, you can't settle it unless they arrived well over a minute apart. The receptionist's sign-in sheet (one place deciding) settles it instantly.
+</Analogy>
+
+## What Snip does
+
+- Durations, timeouts and rate limits use the **monotonic clock**.
+- Snowflake-style click event IDs are generated with the wall clock; the generator **refuses** if time goes backwards
+  (<L id="05.05" />), and slightly misordered clicks across servers don't matter for statistics.
+- Link edits go to the link's shard primary, and the dashboard sends the version it loaded, so a stale edit fails
+  instead of overwriting a newer one.
+- NTP is monitored: an alert fires if any server's offset passes 100 ms.
+
+<SeenInProduction>
+  <Seen
+    company="Cloudflare"
+    system="RRDNS"
+    year={2017}
+    href="https://blog.cloudflare.com/how-and-why-the-leap-second-affected-cloudflare-dns/"
+    source="How and why the leap second affected Cloudflare DNS"
+    found="A wall clock stepping back one second made a duration negative, and code that assumed time never goes backwards failed."
+  >
+    Cloudflare's DNS software measured upstream round-trip times by subtracting two wall-clock readings, and Go's
+    time function wasn't monotonic at the time. At the leap second on 1 January 2017 the clock stepped back, some
+    durations went negative, and the server selection code passed them to a random number function that panics on
+    negative input. About 0.2% of DNS queries were affected at peak. The fix made the software forget its upstream
+    measurements whenever time jumped backwards.
+  </Seen>
+  <Seen
+    company="Google"
+    system="Spanner TrueTime"
+    year={2012}
+    href="https://static.googleusercontent.com/media/research.google.com/en//archive/spanner-osdi2012.pdf"
+    source="Spanner: Google's Globally-Distributed Database (OSDI 2012)"
+    found="Instead of pretending clocks agree, return an interval with a guaranteed bound, and wait out the uncertainty."
+  >
+    Spanner's TrueTime API returns not a time but an interval, earliest to latest, guaranteed to contain the true
+    time. It's backed by GPS receivers and atomic clocks in every data centre, and in Google's production environment
+    the uncertainty was typically between 1 and 7 ms. Before a <Term t="transaction">transaction</Term>'s commit becomes visible, Spanner waits
+    until its timestamp is certainly in the past (commit wait), which lets timestamps order transactions globally.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A rate limiter measures how long since a user's last request with `now() - last`, using the wall clock. What can go wrong?"
+  options={[
+    { text: "Nothing: the wall clock is accurate to milliseconds", why: "It's usually close, but NTP can step it, including backwards, which makes the difference negative or wrong." },
+    { text: "When the clock steps backwards, the elapsed time comes out negative or too small", correct: true, why: "Durations should use the monotonic clock, which never jumps. The wall clock is for timestamps people read." },
+    { text: "Two servers' clocks disagree, so users get double the limit", why: "That's a separate problem for a distributed limiter. Here the bug is a single machine's clock jumping." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Durations from the wall clock.** Use the monotonic clock for anything measured.</li>
+    <li>**Trusting timestamps from different machines to order close events.** They're only ordered beyond the skew.</li>
+    <li>**Last write wins by default.** It silently drops writes when clocks disagree. Use versions where it matters.</li>
+    <li>**Not monitoring clock offset.** A server minutes out of sync breaks IDs, certificates and logs quietly.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Clocks drift; NTP keeps them within milliseconds, and corrections can step time backwards.</li>
+    <li>Use the monotonic clock for durations and the wall clock for timestamps people read.</li>
+    <li>Cross-machine timestamps only order events further apart than the skew; last write wins can lose data.</li>
+    <li>Order by a single leader, version numbers or logical clocks, or bound the uncertainty like Spanner.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Why can't you rely on timestamps to order events in a distributed system?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What is a Lamport clock?", "How does Spanner deal with clock uncertainty?"]}
+>
+  <p>Each machine has its own clock. NTP keeps them within a few milliseconds at best, and corrections, leap seconds or VM pauses can make a clock jump, even backwards. So two events on different machines closer together than the skew can't be ordered by their timestamps, and last-write-wins conflict resolution can silently discard the newer write if its server's clock was behind.</p>
+  <p>Alternatives are to route all writes for a piece of data through one leader whose order is authoritative, use version numbers and conditional updates, or use logical clocks such as Lamport or hybrid logical clocks that capture causality. Spanner instead bounds clock uncertainty with GPS and atomic clocks and waits out that uncertainty before committing.</p>
+</InterviewCard>

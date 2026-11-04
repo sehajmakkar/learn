@@ -128,7 +128,7 @@ seconds would also have been reasonable for a first version; the click counts al
   >
     Every Slack client keeps a persistent WebSocket to Slack's servers. Clients connect to gateway servers in the
     nearest region, which track each user's channel subscriptions. Channel servers are stateful and in memory; each
-    owns a subset of channels, assigned by consistent hashing. When a message arrives, its channel server sends it to
+    owns a subset of channels, assigned by <Term t="consistent-hashing">consistent hashing</Term>. When a message arrives, its channel server sends it to
     every gateway subscribed to that channel, and Slack says messages are delivered across the world in about 500 ms.
   </Seen>
 </SeenInProduction>

@@ -1,0 +1,143 @@
+export const meta = {
+  summary: "Even a perfect hash spreads keys, not traffic. What to do when one key, one tenant or one moment takes far more than its share of reads or writes.",
+  uses: ["05.01", "02.04", "04.12"],
+  usedIn: ["05.03", "06.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="05.01" />. The fixes reuse the cache from <L id="02.04" /> and the <Term t="denormalisation">denormalised</Term> counter from <L id="04.12" />.
+</BeforeYouStart>
+
+## The problem: one link, one shard, all the traffic
+
+Snip's codes are spread across 256 logical <Term t="sharding">shards</Term> by hash, so each shard gets about 1/256 of the links. Then a
+celebrity posts a Snip link to forty million followers, and for ten minutes that **one code** gets 50,000 redirects a
+second. Hashing spread the keys evenly; it can't split one key. Every request for `x7Kp` goes to the same cache node
+and, on a miss, the same shard, while the other 255 sit idle.
+
+That's a **hot partition**, and its cause here is a **hot key** (sometimes called a celebrity key). Hot partitions
+come from three directions:
+
+| Cause | Snip example | Elsewhere |
+| --- | --- | --- |
+| **One very popular key** | A viral link | A celebrity's profile, a flash-sale product |
+| **One very big tenant** | A customer with 40 million links, sharded by owner | A huge workspace or channel |
+| **A key that follows time** | Shards by creation date: today's shard takes every write | Logs or events keyed by timestamp |
+
+The third is a choice of key, fixed by choosing a better one (<L id="05.01" />). The first two exist in the data, and
+you need ways to cope with them.
+
+## Hot reads: copy the hot key
+
+Reads are the easier half, because copies of a value can be served from many places.
+
+- **Cache it closer.** Snip's Redis tier already absorbs most redirects. For the very hottest codes, each app server
+  also keeps a tiny **in-process cache** of a few thousand entries for a few seconds. 50,000 requests a second spread
+  over 40 app servers become 40 requests a second to Redis.
+- **Spread one key over several cache nodes.** Store copies under `x7Kp#1` … `x7Kp#8`, which hash to different nodes,
+  and have each reader pick one at random. Writes must update every copy, so do it only for keys you've detected as hot.
+- **<Term t="request-coalescing">Coalesce</Term>.** When a hot key's cache entry expires, a thousand requests can miss at once and all query the database.
+  Let one request fetch it while the others wait for its answer (<L id="06.05" />).
+
+## Hot writes: split the key
+
+Writes are harder, because they must end up in one correct value. Every click on the viral link increments
+`total_clicks` on one row (<L id="04.12" />), and one row can only take so many updates a second before the
+<Term t="transaction">transactions</Term> queue on its lock.
+
+- **Batch.** Snip already does this: click events go to a queue, and workers turn thousands of clicks into one
+  `UPDATE` every few seconds (<L id="02.06" />). This is the first fix to reach for.
+- **Split the counter.** Keep N rows per hot counter, `x7Kp:0` … `x7Kp:15`. Each write picks one at random; a read sums
+  all N. Writes spread over N rows (or N shards, if the sub-keys hash differently); reads get a little more expensive.
+
+```sql
+-- a split counter: 16 rows for one link; the app picks a random slot, 0 to 15
+UPDATE link_clicks SET clicks = clicks + 1
+WHERE code = 'x7Kp' AND slot = $1;
+
+SELECT sum(clicks) FROM link_clicks WHERE code = 'x7Kp';
+```
+
+## Big tenants: give them their own home
+
+When the hot partition is a tenant (all of one customer's data on one shard), the options are to move that tenant to a
+**dedicated shard** (easy with a directory, <L id="05.01" />), or to shard their data by a finer key, such as the
+channel or the link instead of the customer. That's what Slack did, below.
+
+<Analogy>
+  **A bakery on the day of a festival.** On a normal day one till per counter is enough. When everyone wants the same famous cake, you don't open more tills for bread: you put trays of that cake at several counters (copies of a hot read), and you take orders on slips that one baker collects in batches (batched writes).
+</Analogy>
+
+## Find them before they find you
+
+Hot keys are invisible in averages: 256 shards at 5% CPU and one at 100% averages to fine. Watch per-shard load, not
+just the total, and sample the busiest keys (a periodic "top 100 codes this minute" from the request log) so you can
+spot a viral link in seconds and turn on the hot-key handling for it.
+
+<SeenInProduction>
+  <Seen
+    company="Discord"
+    system="Message storage"
+    year={2023}
+    href="https://discord.com/blog/how-discord-stores-trillions-of-messages"
+    source="How Discord stores trillions of messages"
+    found="One busy channel could slow the whole database cluster; routing requests for a channel to one service and coalescing them was part of the fix."
+  >
+    Discord partitions messages by channel and a time bucket. A server with hundreds of thousands of people sends far
+    more messages than a group of friends, and heavy reads on one channel created hot partitions whose latency spread
+    across the cluster, because quorum reads involved the overloaded nodes. Discord added data services between its
+    API and the database that coalesce identical requests, querying once for many readers, and routed requests by
+    channel ID with <Term t="consistent-hashing">consistent hashing</Term> (<L id="05.03" />) so all requests for a channel reach the same instance. After
+    moving to ScyllaDB in 2022, p99 latency for reading history fell from 40–125 ms to about 15 ms.
+  </Seen>
+  <Seen
+    company="Slack"
+    system="Message storage on Vitess"
+    year={2020}
+    href="https://slack.engineering/scaling-datastores-at-slack-with-vitess/"
+    source="Scaling Datastores at Slack with Vitess"
+    found="When the hot partition is a tenant, shard by something finer than the tenant."
+  >
+    With every team's data on one shard, Slack's largest enterprise customers created hot spots that couldn't be
+    spread across the fleet, so most shards were over-provisioned to leave room. Moving messages to be sharded by
+    channel ID instead of workspace spread a big team's traffic across many shards.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A viral link's cache entry is on one Redis node, which is now at 100% CPU. The other cache nodes are idle. What helps most, fastest?"
+  options={[
+    { text: "Add more Redis nodes", why: "The hot key still hashes to one node. More nodes take load off the others, which weren't busy." },
+    { text: "A short-lived in-process cache on each app server for the hottest codes", correct: true, why: "Each app server answers the hot code from its own memory, so the Redis node sees one request per server every few seconds instead of every redirect." },
+    { text: "Reshard the database", why: "The database isn't the bottleneck here, and resharding doesn't split one key either." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Assuming hashing solves hot spots.** It spreads keys, not traffic to one key.</li>
+    <li>**Watching only averages.** One overloaded shard hides inside a healthy-looking total.</li>
+    <li>**Splitting every key.** Copies and split counters cost extra work on every write or read; apply them to keys you've detected as hot.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Hot partitions come from popular keys, big tenants, or keys that follow time.</li>
+    <li>Hot reads: cache closer (in-process), copy the key across nodes, and coalesce misses.</li>
+    <li>Hot writes: batch them, or split one counter into several rows summed on read.</li>
+    <li>Give big tenants their own shard or a finer key, and monitor per-shard and per-key load.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "One celebrity's posts get millions of reads and likes a minute. How do you stop their data overloading one shard?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Scenario" }}
+  followUps={["How do you detect a hot key?", "What does splitting a counter cost on reads?"]}
+>
+  <p>Treat reads and writes separately. For reads, serve the post from cache, with a short-lived in-process cache on each application server for the hottest keys, and if needed replicate the key under several suffixed cache keys so it spreads across cache nodes. Coalesce cache misses so only one request rebuilds an expired entry.</p>
+  <p>For likes, don't update one row per like. Send likes through a queue and apply them in batches, and for extreme keys split the counter into many sub-rows that are summed on read. To find hot keys, track per-shard load and sample the top keys continuously, so the special handling can be switched on for just those keys.</p>
+</InterviewCard>

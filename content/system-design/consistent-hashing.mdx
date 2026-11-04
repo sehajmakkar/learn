@@ -1,0 +1,201 @@
+export const meta = {
+  summary: "Mapping keys to servers so that adding or removing one moves only a fair share of keys, not nearly all of them. The ring, virtual nodes, and a small implementation.",
+  uses: ["05.01", "03.06", "02.04"],
+  usedIn: ["05.04", "06.06", "08.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="05.01" /> for hash <Term t="sharding">sharding</Term>. <L id="03.06" /> introduced hashing requests to servers, and <L id="02.04" />
+  the cache this lesson protects.
+</BeforeYouStart>
+
+## The problem: hash mod N moves almost everything
+
+At peak, Snip's redirects make about 100,000 cache reads a second, spread over four Redis nodes. Each code goes to node
+`hash(code) mod 4`. The cache is running hot, so you add a fifth node, and the formula becomes `hash(code) mod 5`.
+
+For most codes, `mod 5` gives a different answer from `mod 4`. **About 80% of keys now map to a different node**,
+where they aren't cached. For the next few minutes, 80% of redirects miss and fall through to the database shards:
+tens of thousands of extra queries a second, the moment you tried to add capacity. Removing a node (or losing one) does
+the same.
+
+Only a fifth of the keys *needed* to move, the share the new node should take. **Consistent hashing** moves roughly
+that share and no more.
+
+## The ring
+
+Picture the output of the hash function, 0 to 2³²−1, bent into a circle.
+
+1. **Place each server on the ring** by hashing its name: `hash("redis-A")` gives its position.
+2. **Place each key on the ring** by hashing it: `hash("x7Kp")`.
+3. **A key belongs to the first server clockwise from it.**
+
+Now add server E. It lands at one point on the ring and takes over only the keys between itself and the server before
+it, keys that used to belong to the next server along. **Every other key stays where it was.** Remove a server, and
+only its keys move, to the next server clockwise.
+
+## Virtual nodes
+
+With one point per server, the arcs between servers are random lengths, so one server may own three times the keys of
+another. And when a server leaves, all its keys go to a single neighbour, which suddenly has double the load.
+
+The fix is **virtual nodes**: put each server on the ring many times (`redis-A#0`, `redis-A#1`, … `redis-A#199`). With
+hundreds of points each, every server owns many small arcs scattered round the ring, so loads even out, and a
+departing server's keys spread across all the others. A bigger machine can simply get more virtual nodes.
+
+<Lab
+  id="sd-05-03-ring"
+  title="Add a server, count what moves"
+  tasks={[
+    "Start with hash mod N and four servers, then add a fifth. What share of keys moved, and what's a fair share?",
+    "Switch to the hash ring with 1 virtual node per server, then add a server. How many keys moved this time? How even is the load?",
+    "Raise virtual nodes to 200. How far is the busiest server from the average now?",
+    "Remove a server with 200 virtual nodes. Where do its keys go: to one neighbour, or spread out?",
+  ]}
+>
+  <HashRingLab preset={{ mode: "mod", servers: 4, vnodes: 1 }} />
+</Lab>
+
+With 10,000 keys, the lab shows the pattern clearly. `mod N` moves about 80% of keys going from four servers to five.
+The ring with one point per server moves far fewer, but its busiest server can hold nearly twice the average. With 200
+virtual nodes, adding a fifth server moves about 21% of keys (a fair share is 20%), and the busiest server is within a
+few percent of the average.
+
+<Analogy>
+  **Seats round a table.** Guests sit down, and each guest is served by the waiter standing next clockwise. When a new waiter joins, they step in between two others and take over only the guests in that gap. Nobody else at the table changes waiter. Giving each waiter several spots round the table keeps their workloads even.
+</Analogy>
+
+## A small implementation
+
+A ring is a sorted array of positions. Finding a key's server is a binary search for the first position at or after
+the key's hash, wrapping to the start.
+
+```ts
+import { createHash } from "node:crypto";
+
+// 32-bit position on the ring, from the first 4 bytes of an MD5 hash
+const position = (s: string) => createHash("md5").update(s).digest().readUInt32BE(0);
+
+export class HashRing {
+  private points: { at: number; node: string }[] = [];
+
+  constructor(private vnodes = 200) {}
+
+  add(node: string) {
+    for (let v = 0; v < this.vnodes; v++) this.points.push({ at: position(`${node}#${v}`), node });
+    this.points.sort((a, b) => a.at - b.at);
+  }
+
+  remove(node: string) {
+    this.points = this.points.filter((p) => p.node !== node);
+  }
+
+  /** The node that owns `key`: the first point clockwise from the key's position. */
+  get(key: string): string {
+    if (this.points.length === 0) throw new Error("empty ring");
+    const h = position(key);
+    let lo = 0;
+    let hi = this.points.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.points[mid].at < h) lo = mid + 1;
+      else hi = mid;
+    }
+    return this.points[lo % this.points.length].node;
+  }
+}
+```
+
+```ts
+const ring = new HashRing();
+["redis-A", "redis-B", "redis-C", "redis-D"].forEach((n) => ring.add(n));
+ring.get("x7Kp"); // → "redis-B", and the same answer on every app server
+```
+
+Every client that builds the ring from the same list of nodes gets the same answers, with no coordination. The hash
+doesn't need to be secure, only fast and evenly spread; MD5 is used here because it's built into Node.
+
+## Replicas: walk further round
+
+To keep N copies of each key, walk clockwise from the key and take the first N **distinct physical servers**, skipping
+virtual nodes of a server you already have. If one fails, the next server along already holds a copy. This is how
+Dynamo-style databases place replicas (<L id="08.04" />).
+
+## Where it's used, and the alternatives
+
+Consistent hashing shows up wherever many clients must agree, without asking anyone, which server owns a key: cache
+clusters (<L id="06.06" />), distributed databases, and load balancers that send the same user or object to the same
+backend (<L id="03.06" />).
+
+Two related techniques are worth recognising. **Rendezvous hashing** scores every server for a key (hash of key plus
+server) and picks the highest: simple, with no ring to store, at the cost of checking every server per lookup.
+**Bounded loads** caps each server at a little above the average; a key whose server is full moves on clockwise to the
+next one with room, which keeps hot spots from overloading one server.
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Dynamo"
+    year={2007}
+    href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
+    source="Dynamo: Amazon's Highly Available Key-value Store (SOSP 2007)"
+    found="Basic consistent hashing gave uneven load and ignored machine size; virtual nodes, then fixed equal-sized partitions, fixed both."
+  >
+    Dynamo, which ran Amazon's shopping cart, placed keys on a consistent hashing ring and gave each node many
+    positions ("tokens"), so a failed node's load spread evenly over the rest and bigger machines could take more
+    tokens. Its first scheme, random tokens, made a joining node scan other nodes' data to take over its ranges; in
+    busy shopping seasons that bootstrapping took almost a day. Amazon moved to splitting the ring into a fixed number
+    of equal partitions and assigning whole partitions to nodes, which balanced load better and made moves simpler.
+  </Seen>
+  <Seen
+    company="Google and Vimeo"
+    system="Consistent hashing with bounded loads"
+    year={2017}
+    href="https://research.google/blog/consistent-hashing-with-bounded-loads/"
+    source="Consistent Hashing with Bounded Loads"
+    found="Capping each server's load and overflowing to the next server on the ring cut Vimeo's cache bandwidth by almost 8×."
+  >
+    Google researchers bounded each server's load at a factor above the average: a key whose server is full moves
+    clockwise to the next server with spare capacity, and each change moves only a bounded number of other keys. It
+    was first used in Google Cloud Pub/Sub. An engineer at Vimeo found the paper and implemented it in HAProxy, which
+    reduced Vimeo's cache bandwidth by a factor of almost eight.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A cache cluster uses consistent hashing with 200 virtual nodes per server across 10 servers. One server dies. Roughly what happens?"
+  options={[
+    { text: "About 90% of keys move to new servers", why: "That's what hash mod N would do. On the ring, only the dead server's keys move." },
+    { text: "About 10% of keys move, spread across the other nine servers", correct: true, why: "Only the dead server's keys (about a tenth) need a new home, and because its virtual nodes are scattered round the ring, they spread over all the others." },
+    { text: "About 10% of keys move, all to one neighbour", why: "That happens with one point per server. Virtual nodes spread a departing server's keys across many neighbours." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**`hash(key) mod N` for anything that grows.** Changing N remaps almost every key.</li>
+    <li>**One point per server.** Load is uneven and a failure dumps everything on one neighbour. Use hundreds of virtual nodes.</li>
+    <li>**Clients with different server lists.** Each builds a different ring and they disagree about where keys live. Distribute membership from one source.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>hash mod N moves about (N−1)/N of keys when N changes; consistent hashing moves about 1/N.</li>
+    <li>Servers and keys are hashed onto a ring; each key belongs to the first server clockwise.</li>
+    <li>Virtual nodes even out load, spread a failed server's keys, and weight bigger machines.</li>
+    <li>Replicas go to the next distinct servers clockwise; bounded loads and rendezvous hashing are close relatives.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is consistent hashing, and why is it better than hash mod N?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why do you need virtual nodes?", "How would you place replicas?"]}
+>
+  <p>With hash mod N, changing the number of servers changes the result for almost every key, so adding one cache server to four remaps around 80% of keys and causes a wave of misses. Consistent hashing puts servers and keys on the same hash ring and assigns each key to the next server clockwise. Adding a server takes over only the keys between it and its predecessor, about 1/N of the total, and removing one moves only its own keys.</p>
+  <p>With a single point per server the arcs are uneven and a failed server's load lands on one neighbour, so each server gets hundreds of virtual nodes. That evens out load, spreads a failure's keys across all servers, and lets bigger machines take more virtual nodes. Replicas go to the next distinct physical servers clockwise.</p>
+</InterviewCard>

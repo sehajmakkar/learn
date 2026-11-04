@@ -1,0 +1,174 @@
+export const meta = {
+  summary: "Paging through big lists by remembering where the last page ended, instead of counting rows to skip. Why OFFSET slows down and drifts, and the query and cursor that replace it.",
+  uses: ["03.04", "04.02", "04.03", "05.01"],
+  usedIn: ["15.08", "15.09"],
+};
+
+<BeforeYouStart>
+  <L id="03.04" /> chose cursors for Snip's API; this lesson builds them. You'll need composite <Term t="index">indexes</Term> from <L id="04.02" />
+  and reading plans from <L id="04.03" />.
+</BeforeYouStart>
+
+## The problem: OFFSET counts every row it skips
+
+Snip's dashboard shows an owner's links, newest first, 50 to a page. The obvious query:
+
+```sql
+SELECT code, long_url, created_at FROM links_by_owner
+WHERE owner_id = $1
+ORDER BY created_at DESC
+LIMIT 50 OFFSET 8000;  -- page 161
+```
+
+`OFFSET 8000` doesn't jump to row 8,001. The database walks the index from the start and **reads and throws away
+8,000 rows** before returning 50. Page 1 is fast; page 161 does about 160 times the work. For Ana's 8,000 links that's
+tolerable. For a customer with 40 million links exporting them through the <Term t="api">API</Term>, the last pages each read tens of
+millions of rows, and the whole export reads trillions.
+
+It also **drifts**. Ana loads page 1. While she reads, she creates three links. Page 2, computed as "skip 50", now
+starts three rows earlier, and she sees the last three links of page 1 again. Deletes do the opposite and skip rows
+she never saw.
+
+## Keyset pagination: start after the last row
+
+Instead of "skip N rows", say **"rows after the last one I saw"**. The page remembers the sort key of its last row,
+and the next query starts there:
+
+```sql
+SELECT code, long_url, created_at FROM links_by_owner
+WHERE owner_id = $1
+  AND (created_at, code) < ($2, $3)  -- after the last row of the previous page
+ORDER BY created_at DESC, code DESC
+LIMIT 51;
+```
+
+With an index on `(owner_id, created_at DESC, code DESC)`, the database seeks straight to the position after the last
+row and reads 51 rows, whether it's page 2 or page 800,000. And because each page starts from a row rather than a
+count, new links and deletions elsewhere in the list don't shift it.
+
+Two details make it correct:
+
+- **A unique tiebreaker.** Two links can share a `created_at`. Sorting by `created_at` alone, a page boundary between
+  them would skip or repeat one. Adding `code`, which is unique, gives every row a distinct position.
+- **One extra row.** Asking for 51 when the page holds 50 tells you whether there's a next page without a separate
+  count.
+
+## The cursor
+
+The client shouldn't build that `WHERE` clause. The API returns an opaque **cursor** that encodes the last row's key,
+and the client sends it back for the next page:
+
+```ts
+type Cursor = { createdAt: string; code: string };
+
+const encode = (c: Cursor) => Buffer.from(JSON.stringify(c)).toString("base64url");
+const decode = (s: string): Cursor => JSON.parse(Buffer.from(s, "base64url").toString());
+
+export async function listLinks(db: Db, ownerId: string, cursor?: string, limit = 50) {
+  const after = cursor ? decode(cursor) : null;
+  const rows = await db.query(
+    `SELECT code, long_url, created_at::text AS created_at
+       FROM links_by_owner
+      WHERE owner_id = $1 ${after ? "AND (created_at, code) < ($3, $4)" : ""}
+      ORDER BY created_at DESC, code DESC
+      LIMIT $2`,
+    after ? [ownerId, limit + 1, after.createdAt, after.code] : [ownerId, limit + 1],
+  );
+  const page = rows.slice(0, limit);
+  const last = page.at(-1);
+  return {
+    links: page,
+    next_cursor: rows.length > limit && last ? encode({ createdAt: last.created_at, code: last.code }) : null,
+  };
+}
+```
+
+```
+GET /v1/links?limit=50
+→ { "links": [...], "next_cursor": "eyJjcmVhdGVkQXQiOiIyMDI2LTExLTA0IDEwOjQy..." }
+
+GET /v1/links?limit=50&cursor=eyJjcmVhdGVkQXQiOiIyMDI2LTExLTA0IDEwOjQy...
+```
+
+Because the cursor is opaque, Snip can change what's inside it later (add a filter, switch to an ID) without breaking
+clients. The timestamp travels as Postgres's own text (`created_at::text`), not a JavaScript `Date`, which would cut
+microseconds to milliseconds and shift the boundary.
+
+<Analogy>
+  **A bookmark versus "page 161".** Telling a friend "carry on from page 161" fails if someone has added pages at the front since. Leaving a bookmark at the last line you read works however the book changes, and you open straight to it instead of counting pages.
+</Analogy>
+
+## What you give up
+
+| | OFFSET | Keyset |
+| --- | --- | --- |
+| **Cost of page N** | Grows with N | Constant |
+| **Stable while data changes** | No: skips and repeats | Yes |
+| **Jump to page 37** | Yes | No, only next (and previous, by reversing the comparison) |
+| **"Page 3 of 812"** | Needs a count | Needs a count, usually an estimate |
+| **Sort by any column** | Yes | Needs an index matching the sort, with a unique tiebreaker |
+
+For infinite scroll, feeds, API listings and exports, keyset is the right default. For a small admin table where people
+jump to page 7, OFFSET is fine.
+
+## Across shards
+
+If a list spans <Term t="sharding">shards</Term>, each shard returns its own next page in the same order, and the service **merges** them,
+like merging sorted piles of cards. The cursor then holds one position per shard. Snip avoids this for the dashboard
+by keeping `links_by_owner` sharded by owner (<L id="05.01" />), so one owner's list lives on one shard.
+
+<SeenInProduction>
+  <Seen
+    company="Slack"
+    system="Web API"
+    year={2017}
+    href="https://slack.engineering/evolving-api-pagination-at-slack/"
+    source="Evolving API Pagination at Slack"
+    found="Offset paging read too many rows and repeated or skipped messages in busy channels; opaque cursors fixed both."
+  >
+    Slack found that LIMIT and OFFSET don't scale for large datasets, because the database still reads every skipped
+    row, and that in channels with frequent writes the page window shifts, returning duplicates or skipping results.
+    Its cursor-based scheme fetches one extra row and returns its position as `next_cursor`, an opaque Base64 string.
+    Keeping cursors opaque let Slack put different things inside them for different endpoints, including positions
+    on several shards for Enterprise Grid. The cost: no total count and no jumping to a page.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A keyset query sorts by created_at only, with the cursor holding the last row's created_at. Several links were created in the same millisecond. What goes wrong?"
+  options={[
+    { text: "Nothing: timestamps are unique enough", why: "Bulk imports and busy systems create many rows with the same timestamp." },
+    { text: "Rows that share the boundary timestamp are skipped or repeated", correct: true, why: "With created_at < cursor, rows at exactly the boundary time that didn't fit on the last page are skipped. Add a unique column like code as a tiebreaker." },
+    { text: "The query falls back to a full table scan", why: "The index still applies. The problem is correctness at page boundaries, not speed." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**OFFSET for deep pagination or exports.** Each page re-reads everything before it.</li>
+    <li>**No tiebreaker.** Sort by a unique column last, or rows at page boundaries go missing.</li>
+    <li>**An index that doesn't match the sort.** Without it, the database sorts everything for every page.</li>
+    <li>**Cursors clients can read and build.** Keep them opaque so you can change them later.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>OFFSET reads and discards every skipped row, and pages drift when data changes.</li>
+    <li>Keyset pagination starts after the last row seen: constant cost per page, stable under writes.</li>
+    <li>Sort by a unique tiebreaker, fetch one extra row, and index exactly the sort order.</li>
+    <li>Wrap the position in an opaque cursor; across shards, merge each shard's page.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you paginate an API that lists millions of records?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle ties in the sort column?", "What if users need to jump to a specific page?"]}
+>
+  <p>With keyset, or cursor, pagination rather than OFFSET. OFFSET makes the database read and discard every skipped row, so deep pages get slower, and inserts or deletes shift the window so clients see duplicates or miss rows. Instead each response includes an opaque cursor encoding the sort key of the last row, and the next query asks for rows after that key, served by an index that matches the sort.</p>
+  <p>The sort must end with a unique column so every row has a distinct position, and fetching limit plus one row tells you if there's another page. The trade-off is no jumping to arbitrary pages and no cheap total count, which most feeds and APIs don't need.</p>
+</InterviewCard>

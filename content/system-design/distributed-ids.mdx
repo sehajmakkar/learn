@@ -1,0 +1,225 @@
+export const meta = {
+  summary: "Generating unique IDs when there's no single database to count for you: ticket servers, blocks of IDs, UUIDv4 and v7, and Snowflake. Plus how Snip makes its short codes.",
+  uses: ["05.01", "04.02"],
+  usedIn: ["05.06", "15.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="05.01" />: once rows live on many <Term t="sharding">shards</Term>, no one shard can hand out IDs for all of them. <L id="04.02" />
+  explains why the order of IDs matters to an index.
+</BeforeYouStart>
+
+## The problem: who counts?
+
+On one Postgres server, IDs are easy: `bigserial` counts 1, 2, 3. With 256 <Term t="logical-shard">logical shards</Term>, each shard's counter
+starts at 1 and they collide. Keeping one central counter brings back a single machine that every insert depends on.
+
+What we usually want from an ID:
+
+- **Unique**, across every shard and server, forever.
+- **Generated without coordination**, or with very little, so it's fast and never blocks.
+- **Roughly sortable by time**, so recent rows sit together in an <Term t="index">index</Term> and "newest first" is cheap.
+- **Small**: 64 bits fits a `bigint` and most languages; 128 bits is twice the index.
+- Sometimes **unguessable**, so IDs don't reveal how many rows exist or let anyone list them.
+
+No scheme gives all of these. Here are the common ones.
+
+| Scheme | Size | Time-ordered | Coordination | Weak spot |
+| --- | --- | --- | --- | --- |
+| **Ticket server** (one counter database) | 64-bit | Yes | Every ID, or every block | The counter is a dependency |
+| **Blocks of IDs** (each server reserves 1,000 at a time) | 64-bit | Roughly | One request per block | Gaps; order only roughly by time |
+| **UUIDv4** (random) | 128-bit | No | None | Big; random inserts spread over the whole index |
+| **UUIDv7** (time, then random) | 128-bit | Yes, to the millisecond | None | Big; reveals creation time |
+| **Snowflake** (time, machine, sequence) | 64-bit | Yes, to the millisecond | Each machine needs a unique number | Depends on clocks (<L id="05.06" />) |
+
+## Ticket servers and blocks
+
+The simplest fix keeps a counter, but takes it off the hot path. A **ticket server** is a tiny database whose only job
+is to return the next number. Two of them, one handing out odd numbers and one even, survive the loss of either.
+
+Cheaper still, each app server reserves a **block** of IDs at once and hands them out from memory:
+
+```sql
+-- reserve IDs 1,000 at a time; the app uses next - 1000 up to next - 1
+UPDATE id_blocks SET next = next + 1000 WHERE name = 'links' RETURNING next;
+```
+
+One round trip per thousand IDs. A crash wastes the rest of a block (gaps are fine), and IDs from different servers
+interleave, so order is only rough.
+
+## UUIDs
+
+A **UUID** is 128 bits, generated anywhere with no coordination. Version 4 is entirely random, which makes it unique
+and unguessable, but as a <Term t="primary-key">primary key</Term> every insert lands at a random place in the <Term t="b-tree">B-tree</Term>, touching a different page
+each time and keeping the whole index hot in memory. **UUIDv7**, standardised in 2024, puts a 48-bit millisecond
+timestamp first and fills the rest with random bits. New IDs sort after old ones, so inserts go to the right-hand
+edge of the index, like an auto-increment key.
+
+## Snowflake: 64 bits, no coordination
+
+Twitter's Snowflake packs three fields into one 64-bit integer:
+
+```
+| 1 unused | 41 bits: ms since a custom epoch | 10 bits: machine | 12 bits: sequence |
+```
+
+- **41 bits of milliseconds** last about 69 years from the chosen epoch.
+- **10 bits of machine number** allow 1,024 generators, each assigned a unique number at deploy time.
+- **12 bits of sequence** allow 4,096 IDs per machine per millisecond.
+
+Each machine generates IDs alone, and because the timestamp comes first, IDs sort by time across machines (within the
+clocks' disagreement). A generator in TypeScript:
+
+```ts
+const EPOCH = 1735689600000n; // 2025-01-01 UTC, Snip's own epoch
+const MAX_SEQ = 4095n;
+
+export class Snowflake {
+  private last = -1n;
+  private seq = 0n;
+
+  constructor(private machine: bigint) {
+    if (machine < 0n || machine > 1023n) throw new Error("machine must be 0–1023");
+  }
+
+  next(): bigint {
+    let now = BigInt(Date.now());
+    if (now < this.last) {
+      // The clock went backwards. Issuing IDs now could repeat old ones, so refuse.
+      throw new Error(`clock moved back ${this.last - now} ms`);
+    }
+    if (now === this.last) {
+      this.seq = (this.seq + 1n) & MAX_SEQ;
+      if (this.seq === 0n) {
+        // 4,096 IDs used this millisecond: wait for the next one.
+        while (now <= this.last) now = BigInt(Date.now());
+      }
+    } else {
+      this.seq = 0n;
+    }
+    this.last = now;
+    return ((now - EPOCH) << 22n) | (this.machine << 12n) | this.seq;
+  }
+}
+```
+
+Two things can go wrong, and both are handled above: the clock moving backwards (refuse, rather than risk a
+duplicate) and running out of sequence numbers within one millisecond (wait). Machine numbers must also never be
+reused by two running generators at once, which is a deployment problem, not a code one.
+
+## Snip's short codes
+
+Snip's codes face one more constraint: people type and share them, so they must be **short**. A Snowflake ID in base62
+(digits plus upper and lower case letters) is 11 characters, longer than Snip wants. And a counter in base62 is short
+but **guessable**: anyone could walk through `x7Kp`, `x7Kq`, `x7Kr` and find every link, including private ones.
+
+So Snip draws **random codes** and lets the database catch the rare collision:
+
+- 62⁷ is about 3.5 trillion seven-character codes. Today Snip expects 600 million links over five years, so a new
+  random code collides with an existing one about 0.02% of the time.
+- At a hundred times the traffic, 60 billion links, that rises to about 1.7%. Snip moves to **eight characters**
+  (about 218 trillion), back to 0.03%.
+- The code is the shard key (<L id="05.01" />), so its uniqueness is checked by the one shard that owns it: insert,
+  and on a primary key conflict, draw again.
+
+```sql
+INSERT INTO links (code, long_url, owner_id) VALUES ($1, $2, $3)
+ON CONFLICT (code) DO NOTHING
+RETURNING code; -- no row back means the code was taken: draw another and retry
+```
+
+Snip's other IDs, such as click events, use Snowflake-style 64-bit IDs, where size and time order matter and nobody
+types them.
+
+<Analogy>
+  **Raffle tickets at a big fair.** One central booth printing numbers is a queue. Giving each stall a roll of tickets (blocks) works until a stall runs out. Snowflake is each stall printing "time, stall number, count": no two stalls can print the same ticket, and sorting tickets sorts them by time.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Twitter"
+    system="Snowflake"
+    year={2010}
+    href="https://github.com/twitter-archive/snowflake/tree/snowflake-2010"
+    source="Snowflake (2010 release README)"
+    found="Uncoordinated, roughly time-ordered 64-bit IDs: timestamp, machine number and sequence, and a refusal to run when the clock goes backwards."
+  >
+    Moving tweets from MySQL to Cassandra, which has no way to generate sequential IDs, Twitter needed at least 10,000
+    IDs a second per process, generated without machines coordinating, roughly sorted by time and under 64 bits. The
+    design was a 41-bit millisecond timestamp with a custom epoch, a 10-bit machine number and a 12-bit sequence. The
+    README warns that Snowflake depends on NTP and refuses to generate IDs if the clock runs backwards.
+  </Seen>
+  <Seen
+    company="Flickr"
+    system="Ticket servers"
+    year={2010}
+    href="https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/"
+    source="Ticket Servers: Distributed Unique Primary Keys on the Cheap"
+    found="Two small MySQL servers, one handing out odd IDs and one even, gave sharded data unique 64-bit keys."
+  >
+    Flickr's sharded MySQL couldn't rely on auto-increment, which isn't unique across databases, and it rejected GUIDs
+    because they're big and index badly. Its ticket servers each hold one row per sequence and use `REPLACE INTO` with
+    `LAST_INSERT_ID()` to atomically get the next number. Two servers, configured to step by 2 from offsets 1 and 2,
+    split the space into odd and even, so either can fail. They had run in production since 2006.
+  </Seen>
+  <Seen
+    company="IETF"
+    system="RFC 9562, UUIDv7"
+    year={2024}
+    href="https://www.rfc-editor.org/rfc/rfc9562"
+    source="Universally Unique IDentifiers (UUIDs)"
+    found="Random UUIDs have poor index locality; UUIDv7 puts a millisecond timestamp first to fix it."
+  >
+    The standard that defines UUIDv7 notes that non-time-ordered UUIDs such as v4 have poor database-index locality:
+    values created one after another land far apart in an index. UUIDv7 puts a 48-bit Unix timestamp in milliseconds
+    in the most significant bits, followed by random bits, and the RFC recommends it over the older time-based
+    versions 1 and 6.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's primary keys for click events are random UUIDv4s. Inserts are slowing as the table grows, and the index no longer fits in memory. Why, and what helps?"
+  options={[
+    { text: "UUIDs are too long to compare quickly; switch to strings", why: "Comparison cost isn't the issue, and strings would be bigger still." },
+    { text: "Random keys insert all over the index, so most inserts touch an uncached page; time-ordered IDs like UUIDv7 or Snowflake append at one end", correct: true, why: "With time-ordered keys, new rows go to the same few pages at the right edge of the B-tree, which stay in memory." },
+    { text: "The database runs out of UUIDs", why: "There are 2¹²² random v4 UUIDs. Running out isn't a practical concern." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**One central auto-increment for a sharded system.** Every insert now depends on one machine.</li>
+    <li>**Sequential public IDs.** They reveal your volume and let anyone list every record. Keep them internal or use random ones.</li>
+    <li>**Random UUIDs as the primary key of a huge, insert-heavy table.** Prefer a time-ordered ID.</li>
+    <li>**Two Snowflake generators with the same machine number.** They will produce duplicates. Assign numbers centrally.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Distributed IDs trade off uniqueness, coordination, time order, size and guessability.</li>
+    <li>Ticket servers and blocks keep a counter off the hot path; UUIDs need no coordination at all.</li>
+    <li>UUIDv7 and Snowflake put time first, so IDs sort by time and insert at one end of the index.</li>
+    <li>Snip's short codes are random base62, with collisions caught by the owning shard's primary key.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a unique ID generator for a distributed system.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["What happens if a machine's clock goes backwards?", "How do you assign machine numbers?"]}
+>
+  <p>First I'd ask what the IDs need: 64-bit or 128-bit, sortable by time or not, and whether they're exposed publicly. For sortable 64-bit IDs I'd use a Snowflake-style layout: 41 bits of milliseconds since a custom epoch, 10 bits of machine ID and 12 bits of per-millisecond sequence. Each generator works independently, gives up to 4,096 IDs per millisecond, and IDs sort roughly by time across machines.</p>
+  <p>The risks are clocks and machine numbers. If the clock moves backwards the generator must refuse or wait rather than risk duplicates, and machine IDs must be leased from a coordination service so two live generators never share one. If 128 bits is acceptable, UUIDv7 avoids machine IDs entirely.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "How would a URL shortener generate its short codes?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["What's the collision probability?", "Why not encode an auto-increment ID?"]}
+>
+  <p>I'd generate random base62 codes of seven or eight characters and insert them with the code as the primary key, retrying on the rare conflict. With seven characters there are about 3.5 trillion codes, so with hundreds of millions in use a collision is a fraction of a percent; at tens of billions I'd move to eight characters.</p>
+  <p>Encoding a counter in base62 gives short codes but makes them guessable, so anyone could enumerate every link, and a counter needs coordination. Snowflake IDs avoid coordination but are 11 characters in base62, longer than a shortener wants.</p>
+</InterviewCard>

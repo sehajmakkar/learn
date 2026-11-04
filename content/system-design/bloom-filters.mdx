@@ -1,0 +1,211 @@
+export const meta = {
+  summary: "A few bits per item that answer \"definitely not in the set\" or \"probably in it\". How Bloom filters work, how to size one, a small implementation, and where databases use them.",
+  uses: ["01.04", "05.03"],
+  usedIn: ["09.03", "15.06"],
+};
+
+<BeforeYouStart>
+  The memory and disk numbers from <L id="01.04" /> are why this matters. <L id="05.03" /> used hashing to place keys;
+  here several hashes mark one item.
+</BeforeYouStart>
+
+## The problem: an expensive "no"
+
+Before Snip shortens a URL, it checks it against a blocklist of known phishing and malware sites: 50 million entries
+from a security feed, held by a separate blocklist service. Snip creates about 350 links a second at peak, and almost
+every URL is fine. So nearly every check is a network call whose answer is "no".
+
+Keeping the whole list in each app server would avoid the call, but 50 million URLs averaging 80 bytes is about 4 GB
+per server. What Snip needs is something small that can say **"definitely not on the list"** for the clean URLs, and
+send only the rest to the service.
+
+## How a Bloom filter works
+
+A **Bloom filter** is an array of m bits, all zero to start, and k hash functions.
+
+- **Add** an item: hash it k ways, giving k positions, and set those bits to 1.
+- **Check** an item: hash it the same k ways. If **any** of those bits is 0, the item was **definitely never added**.
+  If all are 1, it was **probably** added, or its bits happen to have been set by other items.
+
+So a Bloom filter has **no false negatives** (if it says no, the answer is no) and a tunable rate of **false
+positives** (it sometimes says maybe for an item that isn't there). For Snip that's exactly right: a false positive
+costs one unnecessary call to the blocklist service, which gives the real answer.
+
+<Flow
+  title="Checking a URL against Snip's blocklist"
+  steps={[
+    { label: "Hash the URL", detail: "7 hash functions give 7 bit positions." },
+    { label: "Any bit is 0", detail: "Definitely not on the list: shorten it. About 99% of checks end here." },
+    { label: "All bits are 1", detail: "Maybe on the list: ask the blocklist service for the real answer." },
+    { label: "Service answers", detail: "Blocked if it's really there; a false positive costs only this call." },
+  ]}
+/>
+
+<Analogy>
+  **A guest list written as initials.** The doorman has only a card of initials. If yours aren't on it, you're definitely not invited, and he can say so instantly. If they are, you might be, or someone else might share your initials, so he checks the full list in the office. Most people are turned away (or let through) at the door; the office sees only the maybes.
+</Analogy>
+
+## Sizing one
+
+Two numbers decide the size: how many items you'll add (n) and the false positive rate you'll accept (p). The optimal
+size and number of hashes are:
+
+```
+bits  m = −n · ln(p) / (ln 2)²
+hashes k = (m / n) · ln 2
+```
+
+That works out to roughly **10 bits per item for 1%**, whatever the items are:
+
+| Bits per item | Hashes | False positive rate |
+| --- | --- | --- |
+| 5 | 3 | about 9% |
+| 10 | 7 | about 0.8% |
+| 15 | 10 | about 0.07% |
+
+Each extra 5 bits per item cuts false positives about tenfold. For Snip's 50 million URLs at 1%: about 480 million
+bits, **60 MB**, with 7 hashes. That fits comfortably in every app server, against 4 GB for the list itself.
+
+## A small implementation
+
+Instead of k different hash functions, a standard trick derives all k positions from two hashes: position i is
+`h1 + i·h2`, wrapped to the array's size.
+
+```ts
+import { createHash } from "node:crypto";
+
+export class BloomFilter {
+  readonly m: number; // bits
+  readonly k: number; // hashes per item
+  private bits: Uint8Array;
+
+  constructor(expectedItems: number, falsePositiveRate: number) {
+    this.m = Math.ceil((-expectedItems * Math.log(falsePositiveRate)) / Math.LN2 ** 2);
+    this.k = Math.max(1, Math.round((this.m / expectedItems) * Math.LN2));
+    this.bits = new Uint8Array(Math.ceil(this.m / 8));
+  }
+
+  private positions(item: string): number[] {
+    const d = createHash("md5").update(item).digest();
+    const h1 = d.readUInt32BE(0);
+    const h2 = (d.readUInt32BE(4) | 1) >>> 0; // odd, and unsigned
+    return Array.from({ length: this.k }, (_, i) => (h1 + i * h2) % this.m);
+  }
+
+  add(item: string) {
+    for (const p of this.positions(item)) this.bits[p >> 3] |= 1 << (p & 7);
+  }
+
+  /** false: definitely never added. true: probably added. */
+  mightContain(item: string): boolean {
+    return this.positions(item).every((p) => (this.bits[p >> 3] & (1 << (p & 7))) !== 0);
+  }
+}
+```
+
+Tested with 200,000 items at a 1% target, it uses 240 KB, reports every added item, and says "maybe" for about 0.98%
+of items it never saw. (The `>>> 0` matters: without it, `|` turns large hashes negative in JavaScript and positions
+go out of range.)
+
+## What Bloom filters can't do
+
+- **No deletes.** Clearing an item's bits could clear bits other items share. Rebuild the filter from the source list
+  instead (Snip rebuilds from the feed every hour and swaps it in), or use a counting Bloom filter or a cuckoo filter,
+  which support removal at a cost in space.
+- **Fixed capacity.** Add far more than n items and the false positive rate climbs steeply. Size for growth, and
+  rebuild larger when needed.
+- **No listing.** You can't get the items back out; it only answers "might this be in the set?"
+
+## Where they're used
+
+The classic use is inside storage engines. An LSM-tree database (<L id="09.03" />) keeps data in many sorted files,
+and a lookup for a key might otherwise read every one. A Bloom filter per file, held in memory, rules out the files
+that don't have the key, so most lookups read one file or none. Cassandra sets a false positive chance per table,
+0.01 by default for most tables. Other uses: a web crawler skipping URLs it has already fetched (<L id="15.06" />), a
+CDN declining to cache objects requested only once, and a cache rejecting lookups for keys that can't exist.
+
+<SeenInProduction>
+  <Seen
+    company="Meta"
+    system="RocksDB"
+    year={2021}
+    href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter"
+    source="RocksDB Bloom Filter (project wiki)"
+    found="About 10 bits per key in every data file lets most reads skip files that can't contain the key."
+  >
+    RocksDB, the storage engine Meta built and many databases embed, can store a Bloom filter in every data file to
+    tell whether the file may contain a key; a zero answer means the key definitely isn't there. The wiki gives the
+    trade-off directly: about 4.9 bits per key for a 10% false positive rate, 9.9 bits for 1% and 15.5 bits for 0.1%.
+    It notes that filters often take around 10% of a system's memory, and that a newer variant, the Ribbon filter,
+    saves about 30% of that space for the same accuracy.
+  </Seen>
+</SeenInProduction>
+
+## Snip at the end of Module 05
+
+<Arch
+  title="Snip, split across machines"
+  nodes={[
+    { id: "app", label: "Snip app", kind: "service", sub: "+ Bloom filter", x: 0, y: 1 },
+    { id: "redis", label: "Redis ring", kind: "cache", sub: "consistent hash", x: 1.4, y: 0 },
+    { id: "router", label: "Shard router", kind: "service", sub: "256 logical", x: 1.4, y: 1 },
+    { id: "block", label: "Blocklist", kind: "service", sub: "50M bad URLs", x: 1.4, y: 2 },
+    { id: "links", label: "Link shards", kind: "db", sub: "by code", x: 2.8, y: 0.5 },
+    { id: "owners", label: "Owner shards", kind: "db", sub: "by owner", x: 2.8, y: 1.5 },
+  ]}
+  edges={[
+    { from: "app", to: "redis", label: "code" },
+    { from: "app", to: "router" },
+    { from: "router", to: "links" },
+    { from: "router", to: "owners" },
+    { from: "app", to: "block", label: "maybe", dashed: true },
+  ]}
+  steps={[
+    { caption: "Redirects look the code up in a Redis cluster whose nodes are placed with consistent hashing (05.03), so adding a node moves only its share of keys. Viral codes also sit in a tiny in-process cache (05.02).", edges: ["app>redis"] },
+    { caption: "Misses and new links go through the shard router: links are sharded by a hash of the code across 256 logical shards (05.01), which move between machines as whole units (05.04).", edges: ["app>router", "router>links"] },
+    { caption: "The dashboard reads a copy of each owner's links, sharded by owner, and pages through it with keyset cursors (05.07).", edges: ["router>owners"] },
+    { caption: "New codes are random base62, checked by the owning shard's primary key (05.05). Each long URL is first checked against a 60 MB Bloom filter; only the rare 'maybe' asks the blocklist service.", edges: ["app>block"] },
+  ]}
+/>
+
+Snip's data no longer fits one machine, and nothing depends on a single counter or a single clock. Every request
+still reaches its data in one hop, because each query was matched to a shard key. The next module goes deep on the
+layer that answers most of Snip's traffic before any of this is touched: caching (<L id="06.01" />).
+
+<Quiz
+  question="Snip's blocklist filter says 'definitely not' for a URL. Later the URL is added to the security feed, but the filter isn't rebuilt for an hour. What happens if someone shortens it in that hour?"
+  options={[
+    { text: "The filter catches it, because Bloom filters have no false negatives", why: "No false negatives is only true for items that were added. This URL was added to the feed, not to this filter." },
+    { text: "It gets through: the filter only knows the items it was built from, so new entries need a rebuild or an incremental add", correct: true, why: "A filter reflects the set it was built from. Snip can add new feed entries to the live filter as they arrive (adds are cheap), and rebuild periodically to drop removed ones." },
+    { text: "The filter returns a random answer until rebuilt", why: "The answer is deterministic. It's just answering for the old set." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Treating "maybe" as "yes".** A positive must be confirmed against the real data, unless an occasional false yes is truly harmless.</li>
+    <li>**Undersizing.** Adding twice the planned items raises false positives sharply. Size for growth.</li>
+    <li>**Trying to delete.** Clearing bits creates false negatives for other items. Rebuild, or use a counting or cuckoo filter.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A Bloom filter answers "definitely not" or "probably yes" using a few bits per item.</li>
+    <li>No false negatives; false positives fall about tenfold for every 5 extra bits per item (10 bits ≈ 1%).</li>
+    <li>No deletes and fixed capacity: rebuild from the source of truth.</li>
+    <li>Used to skip expensive lookups: storage files, crawled URLs, blocklists, one-hit cache objects.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is a Bloom filter, and when would you use one?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["How do you choose its size?", "How would you handle deletions?"]}
+>
+  <p>A Bloom filter is a bit array plus several hash functions that represents a set very compactly. Adding an item sets the bits at its hash positions; checking an item looks at those bits, and if any is zero the item was definitely never added. If all are set it probably was, with a false positive rate you choose when sizing it. About ten bits per item gives roughly a 1% false positive rate, independent of how large the items are.</p>
+  <p>I'd use one in front of an expensive lookup where most answers are "no": an LSM storage engine skipping files that can't contain a key, a crawler skipping visited URLs, or a service checking a large blocklist. It doesn't support deletion, so I'd rebuild it periodically from the source, or use a counting or cuckoo filter if removals matter.</p>
+</InterviewCard>

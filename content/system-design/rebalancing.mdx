@@ -1,0 +1,136 @@
+export const meta = {
+  summary: "Moving data between shards while the system keeps serving: fixed logical partitions, splitting ranges, and the copy, catch up, verify and cut over routine for each move.",
+  uses: ["05.01", "05.03", "04.09", "04.07"],
+  usedIn: ["06.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="05.01" /> for logical <Term t="sharding">shards</Term> and <L id="05.03" /> for why hash mod N is a trap. The moving routine reuses
+  <Term t="expand-contract">expand and contract</Term> from <L id="04.09" /> and replication from <L id="04.07" />.
+</BeforeYouStart>
+
+## The problem: the shards are filling up
+
+Snip runs 256 logical shards on 8 Postgres machines, 32 each. Two years on, the machines are at 80% disk and CPU climbs
+every month. The plan: 16 machines, 16 logical shards each. That means moving 128 logical shards, half the data, onto
+new machines, **while redirects keep working and no link is lost**.
+
+Rebalancing has three requirements:
+
+1. **Load ends up even** across the new set of machines.
+2. **Only as much data moves as necessary.** The new machines must receive half the data; moving more is waste.
+3. **The system stays up**, and every write made during the move ends up in the right place.
+
+## How the data is divided decides how it can move
+
+| Scheme | How you grow | Verdict |
+| --- | --- | --- |
+| **hash mod N machines** | Change N: nearly every row moves | Avoid |
+| **Fixed number of logical partitions** | Move whole partitions to new machines; the key → partition mapping never changes | The common choice: Notion, Dynamo's final design, Snip |
+| **Split ranges when they grow** | A range past its size limit splits in two, and one half can move | Natural for range sharding; partitions follow the data's size |
+| **<Term t="consistent-hashing">Consistent hashing</Term>** | New nodes take a share of the ring from their neighbours | Common in caches and Dynamo-style stores |
+
+With fixed logical partitions, choose the count up front, and generously: it caps how many machines you can ever
+spread over. Notion picked 480 because it divides evenly into many machine counts. Too many partitions has a cost too,
+since each one carries overhead (connections, files, metadata), so a few hundred to a few thousand is typical.
+
+## Moving one logical shard
+
+Each move follows the same routine, close to the expand and contract pattern of <L id="04.09" />:
+
+<Flow
+  title="Moving logical shard 41 from Postgres 2 to Postgres 9"
+  steps={[
+    { label: "Copy", detail: "Snapshot shard 41's tables onto the new machine, throttled to spare the old one." },
+    { label: "Catch up", detail: "Stream every change made since the snapshot, via logical replication." },
+    { label: "Verify", detail: "Compare row counts, checksums, and sampled reads from both copies." },
+    { label: "Cut over", detail: "Pause shard 41's writes, wait for lag to reach zero, flip the map, resume." },
+    { label: "Keep a way back", detail: "Replicate new writes back to the old copy, in case you must roll back." },
+    { label: "Clean up", detail: "After a quiet period, drop shard 41 from the old machine." },
+  ]}
+/>
+
+The cutover is the only moment that touches live traffic. Writes for one logical shard pause for a second or two in
+the router or <Term t="connection-pooler">connection pooler</Term>, while the last changes replicate, and then resume against the new machine. Reads can
+often keep going throughout.
+
+Then repeat, a few shards at a time, watching load on both sides. Snip moves 128 shards over a couple of weeks, in
+daytime, with a person watching.
+
+<Analogy>
+  **Moving house one room at a time.** You don't empty the whole house into a lorry. You copy one room's contents to the new place, keep forwarding any post that arrives for that room, check nothing's missing, then change the address on the door for just that room. If something's wrong, the old room is still there.
+</Analogy>
+
+## Automatic or by hand?
+
+Some databases rebalance automatically when a node joins, leaves or fills up. That's convenient, and also risky: a
+rebalance is heavy work, and if a slow node is mistaken for a dead one, the system may start moving its data onto
+nodes that are already busy, making everything slower and triggering more moves. Many teams let the system **propose**
+a plan and have a person **approve** it, and they throttle moves so they can't crowd out real traffic.
+
+<SeenInProduction>
+  <Seen
+    company="Notion"
+    system="Postgres, 32 to 96 machines"
+    year={2023}
+    href="https://www.notion.com/blog/the-great-re-shard"
+    source="The Great Re-shard: adding Postgres capacity (again) with zero downtime"
+    found="Logical shards made it a move, not a re-split: logical replication, dark reads, then a per-database cutover users barely noticed."
+  >
+    Notion's shards were running above 90% CPU at peak, so it tripled its machines from 32 to 96, going from 15
+    logical shards per database to 5. Data moved with Postgres logical replication (creating <Term t="index">indexes</Term> after the copy
+    cut syncing from three days to twelve hours). Dark reads compared old and new copies. Each cutover paused
+    traffic in PgBouncer, confirmed replication had caught up, switched the shard mapping, set up replication back to
+    the old databases for rollback, and resumed. At worst, users saw a saving spinner for about a second.
+  </Seen>
+  <Seen
+    company="Slack"
+    system="Vitess resharding"
+    year={2020}
+    href="https://slack.engineering/scaling-datastores-at-slack-with-vitess/"
+    source="Scaling Datastores at Slack with Vitess"
+    found="A sharding layer with built-in split workflows turned a sudden surge into routine work."
+  >
+    In March 2020, as people moved to working from home, Slack's query rates rose by 50% in a single week. One busy
+    keyspace was resharded using Vitess's splitting workflows, which copy, catch up and cut over for you.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip has 256 logical shards on 8 machines and wants 16 machines. With fixed logical shards, how much data moves?"
+  options={[
+    { text: "Almost all of it, because the number of machines changed", why: "That's hash mod machines. Keys map to logical shards, which don't change; only whole shards move." },
+    { text: "About half: 128 logical shards move to the 8 new machines", correct: true, why: "The new machines must end up with half the data, and moving whole logical shards moves exactly that, without re-splitting any rows." },
+    { text: "None: the new machines start empty and take only new links", why: "Then the old machines stay full and the new ones get only new data. Load wouldn't even out." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Too few logical shards.** You can never spread over more machines than you have partitions.</li>
+    <li>**Moving everything at once.** Move a few shards at a time, throttled, and watch both sides.</li>
+    <li>**No way back.** Keep the old copy and replicate new writes to it until the move has proved itself.</li>
+    <li>**Rebalancing during an incident.** Moving data adds load. Fix the overload first.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Rebalance so load ends even, only the necessary data moves, and the system stays up.</li>
+    <li>Fixed logical partitions moved as whole units are the common, simple choice; range splitting and rings are the others.</li>
+    <li>Each move: copy, catch up, verify, cut over with a brief pause, keep a way back, clean up.</li>
+    <li>Throttle moves and keep a person in the loop; automatic rebalancing can make overload worse.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Your sharded database needs twice as many machines. How do you move the data without downtime?", level: "Senior", frequency: 2, importance: "Must-know", kind: "Scenario" }}
+  followUps={["Why not use hash mod N machines?", "What happens to writes during the cutover?"]}
+>
+  <p>I'd rely on having many more logical shards than machines, so keys never change shard and I only move whole shards. For each shard: snapshot it onto the new machine, stream changes since the snapshot with logical replication or change data capture, verify with counts, checksums and sampled dark reads, then cut over by briefly pausing writes for that shard at the router, waiting for replication lag to hit zero, updating the shard map and resuming.</p>
+  <p>I'd keep replication running back to the old copy for a while so I can roll back, move a few shards at a time with throttling, and delete the old copies only once everything has been stable.</p>
+</InterviewCard>

@@ -1,0 +1,205 @@
+export const meta = {
+  summary: "Splitting one dataset across several databases: choosing a shard key, the three ways to map keys to shards, and what you give up once the data is split.",
+  uses: ["04.08", "04.10", "01.05"],
+  usedIn: ["05.02", "05.04", "05.07", "15.02"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.08" />, which ends with sharding as the last and most expensive step, and <L id="04.10" /> for <Term t="partition-key">partition keys</Term>.
+  The numbers come from <L id="01.05" />.
+</BeforeYouStart>
+
+## The problem: one primary isn't enough
+
+At a hundred times today's traffic (<L id="01.05" />), Snip stores a billion new links a month: 30 TB over five years,
+and growing by 6 TB a year. Reads are mostly served by the cache, but every new link, every cache miss and every
+dashboard query lands on one primary. Its disk, its memory for hot <Term t="index">indexes</Term>, its <Term t="vacuum">vacuum</Term> (<L id="04.05" />) and its
+backups (a 30 TB restore takes many hours) all get harder every month. <L id="04.08" />'s cheaper steps have been used
+up.
+
+**Sharding** splits the data itself: each of several databases (shards) holds part of the rows, and each row lives on
+exactly one shard. Every shard is an ordinary Postgres primary with its own replicas, a fraction of the size.
+
+## The shard key decides everything
+
+Each row is placed by its **shard key**. The rule for choosing it: **the queries you run most should need only one
+shard**. Snip's hot query is the redirect, "find the link for code `x7Kp`", so the natural key is `code`.
+
+That choice has a cost. The dashboard query, "Ana's links, newest first", now doesn't know which shards hold Ana's
+links: they're spread across all of them. It must ask every shard and merge the answers (**scatter-gather**), which is
+as slow as the slowest shard (<L id="03.12" />). The usual fix is a second, <Term t="denormalisation">denormalised</Term> copy keyed the other way
+(<L id="04.12" />): a small `links_by_owner` table, sharded by `owner_id`, holding each owner's codes.
+
+| If Snip shards by | Redirect by code | Owner's dashboard | Watch out for |
+| --- | --- | --- | --- |
+| `code` | One shard | Every shard, unless there's a copy by owner | Keeping the owner copy in step |
+| `owner_id` | Must find the owner first (put the shard in the code?) | One shard | One huge customer filling a shard |
+
+Good shard keys have many distinct values, spread traffic evenly, and appear in nearly every query. Tenant IDs
+(workspace, organisation) are popular because most queries stay inside one tenant, until one tenant grows bigger than a
+shard.
+
+## Three ways to map keys to shards
+
+**Range.** Each shard holds a contiguous range of keys: codes `0`–`F` on shard 1, `G`–`P` on shard 2, and so on.
+Range queries ("every key between these two") stay on one shard, and splitting a full range in two is natural. The
+danger is keys that arrive in order: if the key is a timestamp or an increasing ID, every new row goes to the last
+range, and one shard takes all the writes.
+
+**Hash.** Hash the key and use the hash to pick the shard. Neighbouring keys land far apart, so load spreads evenly,
+including for increasing IDs. The price: range queries on the key now touch every shard, and the obvious mapping,
+`hash(key) mod N`, moves almost every key when N changes. That's the problem <L id="05.03" /> solves.
+
+**Directory.** A lookup table records which shard holds each key, or each group of keys (a tenant, a range). It's the
+most flexible: move one big customer to a shard of their own by changing one row. The cost is an extra lookup on every
+request, and the directory itself must be fast, cached and highly available, since nothing works without it.
+
+<Analogy>
+  **Filing cabinets.** Range is "A–F in the first cabinet": easy to browse a stretch of names, but everyone called Smith crowds one drawer. Hash is "put each file in the cabinet its number says": evenly spread, but browsing alphabetically means opening every cabinet. Directory is a card index at the door saying where each file lives: you can move anything, as long as the card index is never lost.
+</Analogy>
+
+## Logical shards on physical machines
+
+Instead of one shard per machine, most systems create **many more logical shards than machines**, and place several
+on each: say 256 logical shards on 8 machines, 32 each. The key maps to a logical shard, which never changes; a small
+table maps logical shards to machines, which does. Growing to 16 machines then means **moving whole logical shards**,
+not re-splitting rows (<L id="05.04" />).
+
+<Arch
+  title="Snip, sharded by code"
+  nodes={[
+    { id: "app", label: "Snip app", kind: "service", x: 0, y: 1 },
+    { id: "router", label: "Shard router", kind: "service", sub: "code → shard", x: 1.4, y: 1 },
+    { id: "s1", label: "Postgres 1", kind: "db", sub: "shards 0–31", x: 2.8, y: 0 },
+    { id: "s2", label: "Postgres 2", kind: "db", sub: "shards 32–63", x: 2.8, y: 1 },
+    { id: "s8", label: "Postgres 8", kind: "db", sub: "shards 224–255", x: 2.8, y: 2 },
+  ]}
+  edges={[
+    { from: "app", to: "router" },
+    { from: "router", to: "s1", dashed: true },
+    { from: "router", to: "s2", label: "x7Kp" },
+    { from: "router", to: "s8", dashed: true },
+  ]}
+  steps={[
+    { caption: "A redirect for x7Kp arrives. The app hands the query to the shard router, a library in the app or a proxy in front of the databases.", edges: ["app>router"] },
+    { caption: "The router hashes x7Kp to logical shard 41, looks up which machine holds shard 41 (Postgres 2), and sends the query there. One shard, one query.", edges: ["router>s2"] },
+    { caption: "Each machine holds 32 of the 256 logical shards, about 4 TB, with its own replicas and backups. To grow, whole logical shards move to new machines.", edges: ["router>s1", "router>s8"] },
+  ]}
+/>
+
+The router can live in three places: a **library** in the application (no extra hop, but every service needs it), a
+**proxy** between the application and the databases, or the **database itself**, as in the distributed databases of
+<L id="04.10" />.
+
+## What you give up
+
+Once rows live on different machines, features that one database gave you for free stop working across shards:
+
+- **Transactions** across shards. Updating rows on two shards atomically needs a distributed protocol (<L id="08.11" />);
+  most designs avoid it by keeping related rows on one shard.
+- **Joins** across shards, done in application code or avoided with copies.
+- **Unique constraints** across shards. A unique email on `users` sharded by `user_id` can't be enforced by any one
+  shard. (Snip's codes are fine: the code *is* the shard key, so its shard checks it.)
+- **Auto-increment IDs**, since each shard counts separately (<L id="05.05" />).
+- **Simple operations.** Schema changes, backups and failovers now happen N times.
+
+That's why sharding comes last: shard when the data or write load truly outgrows one well-tuned primary, and choose the
+key by studying the queries first.
+
+<SeenInProduction>
+  <Seen
+    company="Notion"
+    system="Postgres, sharded by workspace"
+    year={2021}
+    href="https://www.notion.com/blog/sharding-postgres-at-notion"
+    source="Herding elephants: lessons learned from sharding Postgres at Notion"
+    found="480 logical shards on 32 machines, keyed by workspace ID so most queries stay on one shard; their first lesson was to shard earlier."
+  >
+    Notion's single Postgres was nearing its limits: CPU spikes, and vacuum stalling badly enough to risk <Term t="transaction">transaction</Term>
+    ID wraparound. They sharded every table reachable from `block` by workspace ID, since each block belongs to one
+    workspace and users mostly work within one. They chose 480 logical shards, 15 per machine on 32 machines, because
+    480 divides evenly into many machine counts. The move used double writes, a three-day backfill and <Term t="dark-read">dark reads</Term>
+    comparing both databases, then a few minutes of scheduled downtime.
+  </Seen>
+  <Seen
+    company="Slack"
+    system="MySQL, moving to Vitess"
+    year={2020}
+    href="https://slack.engineering/scaling-datastores-at-slack-with-vitess/"
+    source="Scaling Datastores at Slack with Vitess"
+    found="Sharding by workspace kept each team on one shard, until the largest teams outgrew the largest hardware."
+  >
+    Slack's MySQL clusters were partitioned by workspace ID. The largest customers' shards reached the biggest machines
+    available, big teams created hot spots that forced most shards to be over-provisioned, and a shard outage took
+    down every customer on it. Slack moved to Vitess, a sharding layer for MySQL, which let tables use other keys:
+    messages are now sharded by channel ID. By late 2020 Vitess served 99% of Slack's query load, 2.3 million queries
+    a second at peak.
+  </Seen>
+</SeenInProduction>
+
+## Try it
+
+<DesignIt
+  id="sd-05-01-pastebin-shard"
+  minutes={10}
+  levels={["mid"]}
+  patterns={["sharding"]}
+  rubric={[
+    "A shard key chosen from the top queries, with the reason",
+    "What happens to the 'my pastes' list under that key",
+    "Range, hash or directory, and why",
+    "More logical shards than machines, and a rough count",
+    "At least two things that stop working across shards, and how the design avoids them",
+  ]}
+>
+  Your Pastebin (from <L id="04.01" />) now stores 50 TB of paste metadata and needs sharding. The top queries are
+  "read paste by ID" (99% of traffic) and "list my pastes, newest first". Choose the shard key and mapping, and say how
+  each query is answered.
+</DesignIt>
+
+<Quiz
+  question="Snip shards links by hash of code. Which query gets slower?"
+  options={[
+    { text: "Redirect: find the link for code x7Kp", why: "The code is the shard key, so the router sends this to exactly one shard." },
+    { text: "List Ana's links, newest first", correct: true, why: "Ana's links are spread across every shard, so this becomes a scatter-gather unless there's a copy keyed by owner." },
+    { text: "Insert a new link with a fresh code", why: "The new code hashes to one shard, which also enforces its uniqueness." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Sharding too early.** It adds permanent complexity. Exhaust the cheaper steps in <L id="04.08" /> first.</li>
+    <li>**Choosing the key before listing the queries.** The key should make the most common queries single-shard.</li>
+    <li>**An increasing value as a range key.** Every new row lands on the last shard.</li>
+    <li>**One logical shard per machine.** Growing then means re-splitting data instead of moving whole shards.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Sharding splits rows across databases; each row lives on one shard, chosen by its shard key.</li>
+    <li>Pick the key so the hottest queries hit one shard; others need scatter-gather or a copy keyed differently.</li>
+    <li>Range keeps ranges together but can create hot spots; hash spreads load; a directory is flexible but must never fail.</li>
+    <li>Create many logical shards per machine, and accept the loss of cross-shard transactions, joins and unique constraints.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you shard the database for a URL shortener?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How would a user list their own links?", "How would you add more shards later?"]}
+>
+  <p>I'd shard by a hash of the short code, because the redirect, by far the hottest query, looks links up by code, so it always hits exactly one shard. Hashing spreads codes evenly, and the shard that owns a code also enforces its uniqueness. I'd map codes to a few hundred logical shards and place those on a smaller number of machines, so growing means moving whole logical shards.</p>
+  <p>The cost is that "list my links" spans every shard. I'd keep a small copy keyed by owner, sharded by owner ID, written alongside each new link or updated from an event, and accept that it can lag slightly.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "Compare range-based and hash-based sharding.", level: "Mid", frequency: 2, importance: "Must-know", kind: "Concept" }}
+  followUps={["When would you use a directory instead?"]}
+>
+  <p>Range sharding gives each shard a contiguous range of keys, so range scans stay on one shard and ranges can be split when they grow. But if keys arrive in order, like timestamps or increasing IDs, every write goes to the last range and that shard becomes hot. Hash sharding places keys by a hash, which spreads load evenly even for sequential keys, but range queries then touch every shard, and naive hash mod N reshuffles almost everything when shards are added.</p>
+  <p>A directory, a lookup table from key or tenant to shard, is the most flexible, for example to give one large customer its own shard, at the cost of an extra lookup and a component that must be highly available.</p>
+</InterviewCard>
