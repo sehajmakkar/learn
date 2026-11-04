@@ -1,0 +1,178 @@
+export const meta = {
+  summary: "Snip's users are spread around the world, but its servers are in one place. A CDN keeps copies of files near users, and the headers you send decide what it keeps.",
+  uses: ["02.04", "01.04"],
+  usedIn: ["02.06", "06.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.04" />: a CDN is a <Term t="cache">cache</Term>, just in a different place. You'll also use the round-trip times from
+  <L id="01.04" />.
+</BeforeYouStart>
+
+## The problem: distance
+
+All of Snip's servers are in one datacenter in Virginia. For a user in Sydney, every round trip crosses the Pacific
+and back, taking on the order of 200 ms, and no faster server can change that: it's the speed of light in fibre
+(<L id="01.04" />).
+
+Opening Snip's dashboard takes several round trips before anything appears: one to set up the connection, one or two
+for encryption, one for the HTML, then more for the scripts, styles and images it refers to. From Sydney, that adds up
+to a second or more of waiting. Meanwhile, most of the bytes are **static files**, identical for every user: the
+JavaScript bundle, the CSS, the logo, the fonts.
+
+## A CDN
+
+A **CDN** (content delivery network) is a large set of servers, called **edge servers**, spread across many cities.
+Each one keeps copies of files, and users are sent to one close to them. Snip's own servers become the **origin**:
+the place the CDN fetches a file from when it doesn't have it yet.
+
+<Sequence
+  title="Two users in Sydney load Snip's script"
+  walk
+  participants={[{ id: "a", label: "User A" }, { id: "b", label: "User B" }, { id: "edge", label: "Edge (Sydney)" }, { id: "origin", label: "Origin (Virginia)" }]}
+  messages={[
+    { from: "a", to: "edge", label: "GET /app.3f9a.js", explain: "User A's browser is sent to the nearby Sydney edge, a few milliseconds away." },
+    { from: "edge", to: "origin", label: "GET /app.3f9a.js", explain: "The edge doesn't have the file yet (a miss), so it fetches it across the Pacific." },
+    { from: "origin", to: "edge", label: "200 + Cache-Control", reply: true, explain: "The origin sends the file with headers saying how long it may be kept. The edge stores it." },
+    { from: "edge", to: "a", label: "200", reply: true, explain: "User A pays the long round trip once." },
+    { from: "b", to: "edge", label: "GET /app.3f9a.js", explain: "Later, User B asks for the same file." },
+    { from: "edge", to: "b", label: "200 (hit)", reply: true, explain: "The edge answers from its copy in a few milliseconds. The origin never hears about it." },
+  ]}
+/>
+
+That gives Snip three things at once:
+
+- **Speed** for users far from Virginia: most files come from a few milliseconds away.
+- **Less load on the origin**: it serves each file once per edge, not once per user.
+- **A shield.** CDNs are built to absorb huge traffic spikes, including attacks, before they reach the origin.
+
+<Analogy>
+  **Local warehouses.** An online shop with one central warehouse ships everything across the country, slowly. Shops that stock their bestsellers in small warehouses near each city deliver those overnight, and only send the unusual orders from the centre. A CDN is the network of local warehouses for files.
+</Analogy>
+
+## Headers decide what's cached
+
+The CDN keeps what your responses tell it to keep, through the `Cache-Control` header. Snip uses three rules:
+
+| Response | Header | Why |
+| --- | --- | --- |
+| Scripts, styles, images with a fingerprint in the name (`app.3f9a.js`) | `public, max-age=31536000, immutable` | The name changes whenever the content does, so a copy can be kept for a year. |
+| The HTML page | `no-cache` (keep it, but check with the origin first) | It names the current script files, so it must always be fresh. |
+| A logged-in dashboard or anything personal | `private, no-store` | Never keep one user's data where another user could be served it. |
+
+The first row is the key trick. Instead of asking the CDN to throw away old copies when you deploy (slow, and
+easy to get wrong), you give every new version a **new file name**. The new HTML points at `app.8c21.js`, which no
+edge has yet, so they all fetch it. The old file can stay cached forever; nobody asks for it anymore.
+
+## Should the edge serve redirects too?
+
+Snip's busiest traffic isn't files; it's <Term t="redirect">redirects</Term>. Could the CDN cache those, so a Sydney redirect never crosses the
+Pacific? It can, with a `Cache-Control` header on the 302. That's the same trade-off as the 301 in <L id="01.06" />:
+clicks answered at the edge never reach Snip, so click counts would have to come from the CDN's logs instead. Some CDNs
+also run small programs at the edge that could look the code up and record the click there.
+
+Snip keeps redirects at the origin for now: its requirement is 50 ms **at the server**, the cache from
+<L id="02.04" /> already meets it, and accurate counting matters more than the last 100 ms for distant users. It's a
+reasonable next step if Snip goes global, and a good one to mention in an interview.
+
+<Evolve
+  title="Snip: add a CDN for static files"
+  change="Static files are served from edge servers near users"
+  before={{
+    nodes: [
+      { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+      { id: "lb", label: "Load balancer", kind: "lb", x: 1, y: 1 },
+      { id: "app", label: "Snip app", kind: "service", sub: "×10", x: 2, y: 1 },
+      { id: "cache", label: "Redis", kind: "cache", x: 3, y: 0 },
+      { id: "pg", label: "Postgres", kind: "db", sub: "primary + replicas", x: 3, y: 1 },
+    ],
+    edges: [
+      { from: "user", to: "lb", label: "all" },
+      { from: "lb", to: "app" },
+      { from: "app", to: "cache" },
+      { from: "app", to: "pg" },
+    ],
+  }}
+  after={{
+    nodes: [
+      { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+      { id: "cdn", label: "CDN edge", kind: "cdn", sub: "near the user", x: 1, y: 0 },
+      { id: "lb", label: "Load balancer", kind: "lb", x: 1, y: 1 },
+      { id: "app", label: "Snip app", kind: "service", sub: "×10", x: 2, y: 1 },
+      { id: "cache", label: "Redis", kind: "cache", x: 3, y: 0 },
+      { id: "pg", label: "Postgres", kind: "db", sub: "primary + replicas", x: 3, y: 1 },
+    ],
+    edges: [
+      { from: "user", to: "cdn", label: "files" },
+      { from: "cdn", to: "app", label: "on miss", dashed: true },
+      { from: "user", to: "lb", label: "the rest" },
+      { from: "lb", to: "app" },
+      { from: "app", to: "cache" },
+      { from: "app", to: "pg" },
+    ],
+  }}
+  caption="Files come from the nearest edge; redirects and the API still go to the origin, where clicks are counted."
+/>
+
+## What a CDN costs
+
+- **Money per gigabyte** served, on top of what you already pay.
+- **Staleness.** Anything cached at the edge is out of your hands until it expires. Fingerprinted file names avoid
+  most of the pain.
+- **Leaks, if headers are wrong.** Caching a personalised page at the edge can show one user's data to others. Mark
+  anything personal `private`.
+- **Harder debugging.** "It works for me" can mean you and the user hit different edges with different copies.
+
+<SeenInProduction>
+  <Seen
+    company="Netflix"
+    system="Open Connect"
+    year={2016}
+    href="https://about.netflix.com/en/news/how-netflix-works-with-isps-around-the-globe-to-deliver-a-great-viewing-experience"
+    source="How Netflix works with ISPs around the globe to deliver a great viewing experience"
+    found="At big enough scale, a company can build its own CDN and place the edge servers inside internet providers' networks."
+  >
+    Netflix decided in 2011 to build its own CDN, Open Connect. By 2016 it had appliances in close to 1,000 locations,
+    many inside internet providers' own networks, and it delivered 100% of Netflix's video traffic. New files are
+    copied across oceans once, during off-peak hours, then replicated to servers within each provider, with popularity
+    models deciding which files go where.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip deploys a new design, but many users still see the old styles hours later. The stylesheet is served as /styles.css with max-age=86400 (one day). What's the best fix?"
+  options={[
+    { text: "Turn off caching for the stylesheet", why: "That fixes freshness but sends every request back to the origin, losing the CDN's benefit." },
+    { text: "Put a fingerprint of the content in the file name, and cache it for a long time", correct: true, why: "A new version gets a new name, which no cache has, while unchanged files stay cached. The HTML, which isn't cached long, points to the right name." },
+    { text: "Ask users to clear their browser cache", why: "Copies sit in the CDN and in every browser. You can't rely on users, and it would happen again on the next deploy." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Caching personal pages.** A missing `private` header on a logged-in page can serve one user's data to another.</li>
+    <li>**Reusing file names for new versions.** Then every deploy is a race against cached copies. Fingerprint the names.</li>
+    <li>**Caching redirects without thinking about counts.** Whatever the edge answers, the origin never sees.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Distance costs round trips no server can speed up; a CDN puts copies of files near users.</li>
+    <li>Edges fetch from the origin on a miss and keep files as long as `Cache-Control` allows.</li>
+    <li>Fingerprint static file names and cache them for a year; keep HTML fresh; never cache personal data publicly.</li>
+    <li>Caching redirects at the edge is possible, but those clicks bypass Snip's counting.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is a CDN, and what would you put on one?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How do you make sure users get a new version after a deploy?", "Could you put API responses on a CDN?"]}
+>
+  <p>A CDN is a network of edge servers in many locations that cache content close to users. A request goes to a nearby edge; on a miss the edge fetches from the origin and keeps a copy as long as the cache headers allow. It cuts latency for distant users and takes load off the origin.</p>
+  <p>The natural fit is static content: scripts, styles, images, fonts, video. I'd fingerprint file names so they can be cached for a long time and a deploy just uses new names. Public responses that are the same for everyone can also be cached briefly, but anything personal should be marked private.</p>
+</InterviewCard>

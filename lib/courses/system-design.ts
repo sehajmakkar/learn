@@ -34,12 +34,12 @@ const modules: Module[] = [
     title: "From one server to millions",
     blurb: "One system, Snip, grown a step at a time.",
     lessons: [
-      l("02.01", "One box: app and database together", 9, "CONCEPT"),
-      l("02.02", "Split the database; scale up or out", 10, "CONCEPT"),
-      l("02.03", "Stateless servers behind a load balancer", 11, "CONCEPT"),
-      l("02.04", "Read replicas and a cache", 11, "CONCEPT"),
-      l("02.05", "A CDN for static content", 9, "CONCEPT"),
-      l("02.06", "Async workers and queues", 10, "CONCEPT"),
+      l("02.01", "One box: app and database together", 9, "CONCEPT", "one-box"),
+      l("02.02", "Split the database; scale up or out", 10, "CONCEPT", "scaling-up-and-out"),
+      l("02.03", "Stateless servers behind a load balancer", 11, "CONCEPT", "stateless-servers"),
+      l("02.04", "Read replicas and a cache", 11, "CONCEPT", "replicas-and-cache"),
+      l("02.05", "A CDN for static content", 9, "CONCEPT", "cdn"),
+      l("02.06", "Async workers and queues", 10, "CONCEPT", "async-workers"),
     ],
   },
   {

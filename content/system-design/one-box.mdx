@@ -1,0 +1,137 @@
+export const meta = {
+  summary: "Snip launches on a single machine. Why that's the right start, what it does well, and the four things that break first.",
+  uses: ["01.01", "01.08"],
+  usedIn: ["02.02"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.01" /> to meet Snip, and <L id="01.08" /> for why we start small. This module grows Snip one step at a
+  time; each lesson adds one piece and says what forced it.
+</BeforeYouStart>
+
+## Launch day
+
+Snip goes live. A few hundred people create links in the first week, and those links are opened a few thousand times.
+Everything runs on **one rented server**: the Snip app, the database, and the files that make up the web page.
+
+<Arch
+  title="Snip on launch day"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+    { id: "dns", label: "DNS", kind: "dns", sub: "snip.link", x: 0, y: 0 },
+    { id: "app", label: "Snip app", kind: "service", x: 1, y: 1 },
+    { id: "db", label: "Postgres", kind: "db", sub: "same disk", x: 2, y: 1 },
+    { id: "files", label: "Static files", kind: "store", sub: "HTML, CSS, JS", x: 1, y: 0 },
+  ]}
+  edges={[
+    { from: "user", to: "dns", label: "where?" },
+    { from: "user", to: "app", label: "GET /x7Kp" },
+    { from: "app", to: "db", label: "look up" },
+    { from: "app", to: "files" },
+  ]}
+  groups={[{ label: "One server", nodes: ["app", "db", "files"] }]}
+  steps={[
+    { caption: "The browser asks DNS where snip.link lives and gets back the server's one IP address.", edges: ["user>dns"] },
+    { caption: "It sends the request for the short code to that address. The app receives it.", edges: ["user>app"] },
+    { caption: "The app asks Postgres for the long URL. Postgres is on the same machine, so there's no network hop: well under a millisecond.", edges: ["app>db"] },
+    { caption: "The app answers with a 302 redirect. For the home page, it serves the HTML and scripts from the same disk.", edges: ["app>files"] },
+  ]}
+  caption="One machine does everything. A request never leaves the box after it arrives."
+/>
+
+## Why one box is a good start
+
+It's easy to sneer at a single server, but at this size it's the best design available:
+
+- **Fast.** The app talks to the database over a local socket, not a network. No hop costs half a millisecond.
+- **Cheap.** One modest server costs a few dollars a month.
+- **Simple to understand.** One place to look at logs, one place to deploy, one thing to back up.
+- **Easy to change.** With no other teams and no other services, you can rename a table on a Tuesday afternoon.
+
+At launch the most important job is finding out whether anyone wants Snip. Every hour spent on infrastructure nobody
+needs yet is an hour not spent on that.
+
+<Analogy>
+  **A food truck.** One person takes orders, cooks and hands over the food, all in one small space. It's fast and cheap, and perfect for testing whether people like the menu. Nobody opens a restaurant with three kitchens to find that out.
+</Analogy>
+
+## What breaks first
+
+The single box works until one of these starts to hurt. Usually they arrive in roughly this order:
+
+| Problem | What happens | What Snip will do about it |
+| --- | --- | --- |
+| **One machine to fail** | If the server dies, or its provider has an outage, every Snip link on the internet stops working. | Spare copies of each part (<L id="02.02" />, <L id="02.03" />) |
+| **Deploys mean downtime** | Restarting the app to ship a change drops every request for those seconds. | Several app servers, updated one at a time (<L id="02.03" />) |
+| **Parts fight over resources** | A slow analytics query eats the CPU and memory that <Term t="redirect">redirects</Term> need, so redirects slow down. | The database on its own machine (<L id="02.02" />) |
+| **It runs out of room** | Traffic outgrows the CPU, or data outgrows the disk. | A bigger machine first, then more machines (<L id="02.02" />, <L id="02.04" />) |
+
+The first row is the big one. A machine that's up 99.9% of the time is still down for about **nine hours a year**
+(<L id="01.03" />), and Snip promised that redirects would almost never fail. The server becomes what's called a
+**single point of failure**: one part whose failure takes the whole system down with it. Most of this module is about
+removing them one by one.
+
+## Backups are not redundancy
+
+Even on one box, back up the database to somewhere **off the machine** (another provider's object storage is
+typical) and test that you can restore it. That protects the data: if the disk dies, you lose at most the hours since
+the last backup.
+
+It doesn't protect <Term t="availability">availability</Term>. Restoring a backup onto a new server takes minutes to hours, and every redirect fails
+until it's done. Backups answer "will we lose links?"; spare copies that are already running answer "will links keep
+working?". Snip needs both, but at launch, backups come first.
+
+<SeenInProduction>
+  <Seen
+    company="SQLite"
+    system="sqlite.org"
+    year={2015}
+    href="https://www.sqlite.org/whentouse.html"
+    source="Appropriate Uses For SQLite"
+    found="A real public website served hundreds of thousands of requests a day from one small virtual machine, with an embedded database."
+  >
+    In 2015 the SQLite project's own website handled about 400,000 to 500,000 HTTP requests a day, 15–20% of them
+    touching the database, on a single virtual machine that shared a physical server with 23 others. The same page
+    suggests that sites with fewer than 100,000 hits a day should work fine on SQLite, and calls that a conservative
+    figure.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip runs on one server that's up 99.9% of the time. Redirects must 'almost never fail'. What's the main problem with the current design?"
+  options={[
+    { text: "It's too slow: the database should be on another machine", why: "The database being local actually makes queries faster. Speed isn't the problem at this traffic." },
+    { text: "The server is a single point of failure: when it's down, every link is down", correct: true, why: "99.9% still means about nine hours of failed redirects a year, all at once for every link. Spare copies are the fix, coming in the next lessons." },
+    { text: "It can't handle the traffic", why: "A few thousand redirects a day is nothing for one server. Scale isn't the issue yet." },
+    { text: "There are no backups", why: "Backups are essential, but they protect the data, not availability. Even with good backups, links fail while you restore." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Starting with ten boxes.** The single server is the right launch design. Name what would make you change it.</li>
+    <li>**Confusing backups with availability.** A backup brings data back after a while; it doesn't keep the system answering.</li>
+    <li>**Keeping the only backup on the same machine.** If the disk or the server goes, the backup goes with it.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Snip launches with the app, database and files on one server: fast, cheap and simple.</li>
+    <li>The first problems are one machine to fail, downtime on deploys, parts competing for resources, and running out of room.</li>
+    <li>A single point of failure is a part whose failure takes everything down. This module removes them one at a time.</li>
+    <li>Back up off the machine from day one. Backups protect data, not availability.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Your whole app runs on one server. What are the risks, and what would you change first?", level: "Junior", frequency: 2, importance: "Must-know", kind: "Scenario" }}
+  followUps={["What's the difference between a backup and a replica?", "How would you deploy without downtime?"]}
+>
+  <p>The server is a single point of failure: if it crashes, or its host has an outage, everything is down. Deploys restart the only copy of the app, so users see errors while it comes back. The app and database compete for the same CPU, memory and disk, so a heavy query can slow every request. And there's a ceiling on how much one machine can do.</p>
+  <p>First I'd make sure there are tested backups stored off the machine, since losing data is the worst outcome. Then I'd move the database to its own server, run at least two app servers behind a load balancer so one can fail or be redeployed without downtime, and add a standby database copy.</p>
+</InterviewCard>

@@ -1,0 +1,226 @@
+export const meta = {
+  summary: "Some work doesn't need to happen while the user waits. Put it on a queue, let workers do it later, and pay for that with delay and duplicates.",
+  uses: ["02.04", "02.05", "01.02"],
+  usedIn: ["07.01", "07.03"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.04" />. Snip handles about 100,000 <Term t="redirect">redirects</Term> a second at peak, with Redis in front of Postgres. You'll
+  also need Snip's requirement from <L id="01.02" /> that click counts may lag by a minute.
+</BeforeYouStart>
+
+## The problem: work in the wrong place
+
+Two jobs are still done **while the user waits**, and both hurt.
+
+**Counting clicks.** Every redirect runs `UPDATE links SET clicks = clicks + 1` before answering. At 100,000
+redirects a second that's 100,000 writes a second on the primary, which was built for about 350. Worse, a viral link
+gets thousands of updates a second **to the same row**, and each one waits for the one before it to release the row.
+Redirects for that link slow to a crawl at exactly the moment it matters most.
+
+**Checking new links.** Snip checks every new long URL against an outside service that lists malware and phishing
+sites. It usually answers in 200 ms, sometimes takes two seconds, and now and then is down. While the check runs, the
+owner waits. When the service is down, nobody can create links.
+
+Neither job's result is needed to answer the request. The redirect only needs the long URL; the owner only needs the
+short code.
+
+## The idea: do it later
+
+Put the work on a **queue** and answer straight away. A queue is a list of messages that keeps them safely until
+something takes them off. Separate programs called **workers** take messages from the queue and do the work at their
+own pace.
+
+<Arch
+  title="Snip's click counting, moved off the redirect"
+  nodes={[
+    { id: "app", label: "Snip app", kind: "service", x: 0, y: 1 },
+    { id: "cache", label: "Redis", kind: "cache", sub: "code → URL", x: 1.4, y: 0 },
+    { id: "queue", label: "Click queue", kind: "queue", x: 1.4, y: 1 },
+    { id: "worker", label: "Stats workers", kind: "worker", sub: "×4", x: 2.8, y: 1 },
+    { id: "pg", label: "Postgres", kind: "db", sub: "primary", x: 4.2, y: 1 },
+  ]}
+  edges={[
+    { from: "app", to: "cache", label: "look up" },
+    { from: "app", to: "queue", label: "click event", dashed: true },
+    { from: "queue", to: "worker", label: "batches" },
+    { from: "worker", to: "pg", label: "one UPDATE per code" },
+  ]}
+  steps={[
+    { caption: "A redirect looks up the long URL in Redis, as before.", edges: ["app>cache"] },
+    { caption: "Instead of updating the count, the app adds a small message to the queue (code, time, country) and sends the 302 right away. Adding a message takes about a millisecond.", edges: ["app>queue"] },
+    { caption: "Workers take messages off in batches of a few thousand and add them up in memory: x7Kp +1,840, b2Qe +12, and so on.", edges: ["queue>worker"] },
+    { caption: "Each batch becomes one UPDATE per code. Thousands of clicks on a viral link become a single write, a few seconds late, which the requirements allow.", edges: ["worker>pg"] },
+  ]}
+  caption="The redirect does one fast lookup and one fast append. The slow, contended work happens behind it, in bulk."
+/>
+
+The link check works the same way, with a twist that's worth saying out loud. The link is saved and **works
+immediately** (a requirement), and a check message goes on a second queue. Within seconds a worker checks it; if the
+URL is dangerous, the worker disables the link and deletes its <Term t="cache">cache</Term> entry. The cost of that choice: a bad link can
+work for a few seconds. The alternative, making every owner wait for the check and blocking creation when the service
+is down, was judged worse. A stricter product could choose differently.
+
+<Analogy>
+  **A restaurant's order slips.** The waiter doesn't stand in the kitchen while your food cooks. They clip an order slip on the rail and go back to the tables. Cooks take slips in order, and if a rush comes in, the slips just pile up a little until the kitchen catches up. Nobody is turned away at the door because the grill is busy.
+</Analogy>
+
+## What a queue buys
+
+- **Fast requests.** The user waits for the append, not the work.
+- **Smoothed spikes.** If clicks jump tenfold for an hour, the queue grows and workers catch up afterwards. The
+  database sees a steady stream instead of the spike.
+- **Isolation from failures.** When the link-check service is down, messages wait in the queue and are retried later.
+  Link creation keeps working.
+- **Separate scaling.** Add workers when the queue grows, without touching the app servers.
+
+## What it costs
+
+- **Results arrive later.** Counts are seconds behind, and a link is checked a moment after it starts working. Only
+  move work whose result can wait.
+- **Duplicates.** Most queues guarantee each message is delivered **<Term t="at-least-once">at least once</Term>**, not exactly once. If a worker
+  adds a batch to the counts and then crashes before telling the queue it's done, the batch is delivered again and
+  counted twice. Workers need to be safe to repeat, for example by recording which batches they've applied. That's
+  <L id="07.03" />.
+- **Order isn't guaranteed** unless you design for it (<L id="07.04" />).
+- **Something new to watch.** Track how many messages are waiting and how old the oldest one is. A growing queue
+  means workers can't keep up. Messages that fail again and again go to a separate **dead-letter queue** so they
+  don't block the rest.
+
+## Which work should be async?
+
+| Snip task | Sync or async | Why |
+| --- | --- | --- |
+| Redirect | Sync | The user is waiting for the answer. |
+| Create a link | Sync | The owner needs the short code now. |
+| Count a click | Async | Counts may lag a minute; doing it inline is the bottleneck. |
+| Check a URL for malware | Async | Slow, unreliable outside service; a few seconds' delay is acceptable. |
+| Email a weekly stats report | Async, on a schedule | Nobody is waiting; it can run at 3 a.m. |
+
+A good rule: if the user can't continue without the result, do it now. If they can, it's a candidate for the queue.
+
+## Snip at the end of Module 02
+
+Here's everything this module added, with a redirect and a link creation walked through it:
+
+<Arch
+  title="Snip after Module 02"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+    { id: "cdn", label: "CDN", kind: "cdn", sub: "static files", x: 1, y: 0 },
+    { id: "lb", label: "Load balancer", kind: "lb", sub: "pair", x: 1, y: 1 },
+    { id: "app", label: "Snip app", kind: "service", sub: "stateless ×10", x: 2, y: 1 },
+    { id: "cache", label: "Redis", kind: "cache", sub: "code → URL", x: 3, y: 0 },
+    { id: "pg", label: "Postgres", kind: "db", sub: "primary + replicas", x: 3, y: 1 },
+    { id: "queue", label: "Queues", kind: "queue", sub: "clicks, checks", x: 2, y: 2 },
+    { id: "worker", label: "Workers", kind: "worker", x: 3, y: 2 },
+    { id: "ext", label: "Safety check", kind: "external", sub: "outside service", x: 4, y: 2 },
+  ]}
+  edges={[
+    { from: "user", to: "cdn", label: "files" },
+    { from: "user", to: "lb" },
+    { from: "lb", to: "app" },
+    { from: "app", to: "cache" },
+    { from: "app", to: "pg" },
+    { from: "app", to: "queue", dashed: true },
+    { from: "queue", to: "worker" },
+    { from: "worker", to: "pg" },
+    { from: "worker", to: "ext" },
+  ]}
+  steps={[
+    { caption: "The page's scripts and styles come from a nearby CDN edge (02.05).", edges: ["user>cdn"] },
+    { caption: "A redirect reaches one of ten stateless app servers through the load balancer (02.03).", edges: ["user>lb", "lb>app"] },
+    { caption: "The app finds the long URL in Redis; on a miss it reads a replica, and the primary only for brand-new codes (02.04).", edges: ["app>cache", "app>pg"] },
+    { caption: "It queues a click event and answers with a 302 (02.06).", edges: ["app>queue"] },
+    { caption: "Workers fold clicks into counts in batches, and check new links against the outside service, disabling any that are dangerous.", edges: ["queue>worker", "worker>pg", "worker>ext"] },
+  ]}
+  caption="Every piece is here because a number or a requirement called for it. The single Postgres primary is the part that will need attention next."
+/>
+
+The one part that hasn't been <Term t="horizontal-scaling">scaled out</Term> is the **Postgres primary**: every write still goes through one machine.
+At 350 new links a second it's comfortable. If Snip grew another hundredfold, writes and storage would outgrow one
+machine, and the data would have to be split. That's Part 2: <L id="04.07" /> for replication done properly,
+<L id="05.01" /> for splitting data, and <L id="05.05" /> for generating unique short codes without one central counter.
+
+<SeenInProduction>
+  <Seen
+    company="GitHub"
+    system="Resque"
+    year={2009}
+    href="https://github.blog/2009-11-03-introducing-resque/"
+    source="Introducing Resque"
+    found="Moving work to a fast, Redis-backed queue took seconds off page loads, and priorities kept important jobs ahead of housekeeping."
+  >
+    GitHub built Resque, a Redis-backed job queue, after its previous database-backed queue made creating a job take
+    two seconds or more, time added to every page that created one. GitHub said it relied "very, very heavily" on its
+    queue: Resque had processed over 10 million jobs since a recent data centre move, with separate queues so repository
+    creation and forks ran ahead of jobs like warming caches, and archive jobs ran only on the file servers.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's stats workers crash and stay down for ten minutes during peak traffic. What do users notice?"
+  options={[
+    { text: "Redirects fail, because click events can't be processed", why: "Redirects only append to the queue; they don't wait for workers. As long as the queue accepts messages, redirects work." },
+    { text: "Click counts stop rising for ten minutes, then catch up once workers restart", correct: true, why: "Messages wait in the queue. When the workers come back, they work through the backlog, faster if you add more. Nothing is lost, and nobody's redirect was slowed." },
+    { text: "Ten minutes of clicks are lost for good", why: "The queue keeps messages until a worker confirms it has processed them. That's the point of using one." },
+  ]}
+/>
+
+## Try it
+
+<DesignIt
+  id="sd-02-06-pastebin-grow"
+  minutes={20}
+  levels={["junior", "mid"]}
+  patterns={["scaling", "caching", "cdn", "queues"]}
+  rubric={[
+    "Starts from one box and names its single points of failure",
+    "Moves the database out and runs stateless app servers behind a load balancer",
+    "Puts paste text in object storage, not the database, and serves popular pastes from a cache or CDN",
+    "Uses read replicas or a cache for reads, and says how a brand-new paste is found immediately",
+    "Moves at least one slow job (view counts, expiry, spam checks) to a queue, and names the delay it causes",
+    "Each step is tied to a number or a requirement",
+  ]}
+>
+  Take the Pastebin from <L id="01.07" /> (a million new pastes a day, 10 reads each, pastes up to 1 MB) and grow it
+  the way this module grew Snip. Start with one box. Then say what you'd add, in what order, and which number or
+  requirement forces each step. Draw the final design.
+</DesignIt>
+
+<Mistakes>
+  <ul>
+    <li>**Queuing work the user needs.** If the next screen needs the result, a queue just adds delay and complexity.</li>
+    <li>**Assuming exactly-once.** Plan for every message being processed twice, and make that harmless.</li>
+    <li>**Not watching the queue.** A queue hides problems until it's hours behind. Alert on its depth and on the age of the oldest message.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Work whose result the user doesn't need right away can go on a queue and be done by workers.</li>
+    <li>Snip queues click events and batches them, turning 100,000 row updates a second into a few writes per link.</li>
+    <li>Queues give fast requests, smoothed spikes and isolation from failing services.</li>
+    <li>They cost delay, duplicates (at-least-once delivery) and a new thing to monitor.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "When would you use a message queue in a design? What problems does it introduce?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What does at-least-once delivery mean for your workers?", "What would you monitor on a queue?"]}
+>
+  <p>When work doesn't have to finish before the user gets a response: sending email, processing uploads, updating counters, calling slow or unreliable outside services. The request adds a message and returns, and workers process messages at their own pace. That keeps requests fast, absorbs spikes, lets the work be retried when a dependency is down, and lets workers scale separately.</p>
+  <p>The costs: results are delayed, most queues deliver at least once so workers must be idempotent, ordering isn't guaranteed by default, and you need to monitor queue depth and message age and handle messages that keep failing, usually with a dead-letter queue.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "How would you count clicks on a link that suddenly gets 50,000 clicks a second?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How accurate do the counts need to be?", "How would you avoid double counting if a worker crashes?"]}
+>
+  <p>Not by updating one database row per click: every update would contend for the same row lock, and the redirect would wait on it. I'd have the redirect path publish a click event to a queue or log and return immediately. Workers consume events in batches, aggregate counts per link in memory, and write one increment per link per batch.</p>
+  <p>That turns 50,000 writes a second into a handful, at the cost of counts lagging by seconds. To avoid double counting on retries, the worker records which batch or offset it has applied in the same transaction as the counts.</p>
+</InterviewCard>

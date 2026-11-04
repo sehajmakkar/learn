@@ -1,0 +1,188 @@
+export const meta = {
+  summary: "Run several copies of the app behind a load balancer. It only works once no copy keeps anything the others need.",
+  uses: ["02.02", "01.03"],
+  usedIn: ["02.04", "03.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.02" />. Snip now has the app on one machine and Postgres (with a <Term t="replica">standby</Term>) on another. The app is the
+  next <Term t="single-point-of-failure">single point of failure</Term>.
+</BeforeYouStart>
+
+## The problem: one app server
+
+Snip's app server is still alone. When it crashes, every <Term t="redirect">redirect</Term> fails, and every deploy means a few seconds of
+errors while it restarts. Snip promised redirects would almost never fail, so the fix is the same as for the database:
+**more than one copy**, so any one can fail or be restarted while the others answer.
+
+Two copies need something in front of them to decide which one gets each request. That's a **load balancer**.
+
+## The load balancer
+
+A load balancer is the one address the outside world talks to. It receives each request and passes it to one of
+the app servers behind it:
+
+<Evolve
+  title="Snip: from one app server to several"
+  change="Add a load balancer and run the app three times"
+  before={{
+    nodes: [
+      { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+      { id: "app1", label: "Snip app", kind: "service", x: 1, y: 1 },
+      { id: "pg", label: "Postgres", kind: "db", sub: "primary + standby", x: 3, y: 1 },
+    ],
+    edges: [
+      { from: "user", to: "app1" },
+      { from: "app1", to: "pg" },
+    ],
+  }}
+  after={{
+    nodes: [
+      { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+      { id: "lb", label: "Load balancer", kind: "lb", x: 1, y: 1 },
+      { id: "app1", label: "Snip app 1", kind: "service", x: 2, y: 0 },
+      { id: "app2", label: "Snip app 2", kind: "service", x: 2, y: 1 },
+      { id: "app3", label: "Snip app 3", kind: "service", x: 2, y: 2 },
+      { id: "pg", label: "Postgres", kind: "db", sub: "primary + standby", x: 3, y: 1 },
+    ],
+    edges: [
+      { from: "user", to: "lb" },
+      { from: "lb", to: "app1" },
+      { from: "lb", to: "app2" },
+      { from: "lb", to: "app3" },
+      { from: "app1", to: "pg" },
+      { from: "app2", to: "pg" },
+      { from: "app3", to: "pg" },
+    ],
+  }}
+  caption="Any app server can answer any request. One can crash, or be taken out for a deploy, and the other two carry on."
+/>
+
+It does three jobs:
+
+- **Spreads requests.** The simplest rule is round robin: first request to server 1, next to server 2, and so on.
+  "Fewest open connections" is a common alternative when requests vary in cost. <L id="03.06" /> covers the options.
+- **Checks health.** Every few seconds it asks each server a simple question, usually an HTTP request to a path like
+  `/health`. A server that fails a few checks in a row stops getting traffic until it recovers. This is what turns
+  "one server crashed" from an outage into a non-event.
+- **Hides the servers.** Users only know the load balancer's address, so you can add, remove and replace servers
+  behind it without anyone noticing.
+
+That last point also gives Snip **deploys without downtime**: take one server out of rotation, update it, check its
+health, put it back, and repeat for the next. At every moment at least two servers are answering.
+
+<Analogy>
+  **A restaurant host.** Diners don't pick their own table; the host at the door looks at which waiters are free and seats them. If a waiter goes home sick, the host just stops seating people in that section. Diners never need to know who's working tonight.
+</Analogy>
+
+## The catch: state
+
+This all works only if **any server can handle any request**. Here's what goes wrong if one doesn't. Say the app keeps
+logged-in sessions in its own memory: after you log in, server 1 remembers "this cookie belongs to Ana". Now step
+through Ana's next two requests:
+
+<Sequence
+  title="Sessions kept in one server's memory"
+  walk
+  participants={[{ id: "b", label: "Ana's browser" }, { id: "lb", label: "Load balancer" }, { id: "s1", label: "App server 1" }, { id: "s2", label: "App server 2" }]}
+  messages={[
+    { from: "b", to: "lb", label: "POST /login", explain: "Ana logs in. The load balancer sends this request to server 1." },
+    { from: "lb", to: "s1", label: "POST /login", explain: "Server 1 checks her password and stores her session in its own memory." },
+    { from: "s1", to: "b", label: "Set-Cookie: session=abc", reply: true, explain: "Ana's browser now holds a cookie that only server 1 understands." },
+    { from: "b", to: "lb", label: "GET /links", explain: "She opens her dashboard. This time round robin picks server 2." },
+    { from: "lb", to: "s2", label: "GET /links (abc)", explain: "Server 2 has never seen session abc." },
+    { from: "s2", to: "b", label: "302 → /login", reply: true, fail: true, explain: "Ana is logged out for no reason she can see. One click later she might land on server 1 and be logged in again." },
+  ]}
+/>
+
+Anything a server keeps in its own memory or on its own disk between requests is **state**: sessions, uploaded files
+waiting to be processed, counters, an in-memory list of rate limits. With state on the servers, they're no longer
+interchangeable, and losing one loses its state.
+
+There are two ways out.
+
+**Sticky sessions.** Tell the load balancer to always send the same user to the same server, usually with a cookie of
+its own. It's quick to set up, but it treats the symptom: load spreads unevenly, and when a server dies, everyone
+stuck to it still loses their session.
+
+**Stateless servers.** Move the state out of the app servers into something they all share:
+
+| State | Where it goes instead |
+| --- | --- |
+| Sessions | A shared store like Redis or the database, or a signed token the browser holds itself |
+| Uploaded files | Object storage (S3 or similar), not the server's disk |
+| Counters, rate limits | Redis or the database |
+| Cached data | A shared <Term t="cache">cache</Term> (<L id="02.04" />) |
+
+Now each server is **stateless**: it keeps nothing between requests that another server would need. Any server can
+answer any request, a crash loses nothing, and adding capacity means starting another copy. This is the version Snip
+uses. A Snip redirect was stateless from the start (look up the code, answer); only the logged-in dashboard needed
+fixing.
+
+## The load balancer is a single point of failure too
+
+Putting everything behind one load balancer just moves the problem. In practice you either run a pair of them,
+where a standby takes over the shared address if the active one fails, or use a cloud provider's managed load
+balancer, which is already run as many machines behind the scenes. Either way, it's worth saying in an interview.
+
+<SeenInProduction>
+  <Seen
+    company="Heroku"
+    system="The Twelve-Factor App"
+    year={2011}
+    href="https://12factor.net/processes"
+    source="The Twelve-Factor App: VI. Processes"
+    found="A widely used guide to building web apps makes statelessness a rule, and calls sticky sessions a violation."
+  >
+    The Twelve-Factor App, written at Heroku from what its team saw running apps on the platform, says app
+    processes should be "stateless and share-nothing": anything that needs to persist goes in a backing service such
+    as a database. It says sticky sessions "should never be used or relied upon", and suggests a store with expiry,
+    such as Memcached or Redis, for session data.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="After Snip adds a second app server, users say they're logged out at random, then logged in again on refresh. What's the most likely cause?"
+  options={[
+    { text: "The load balancer is failing health checks", why: "A failing server would be taken out of rotation; it wouldn't cause logins to flicker on and off." },
+    { text: "Sessions are stored in each server's memory, so requests that land on the other server don't recognise the user", correct: true, why: "Each server only knows the sessions it created. Move sessions to a shared store, or use signed tokens, so any server can check them." },
+    { text: "The database is too slow", why: "A slow database would make requests slow, not log people out." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Writing to the local disk.** Uploads and generated files on one server's disk vanish for every other server, and when that server is replaced.</li>
+    <li>**Reaching for sticky sessions.** They hide the state problem instead of fixing it, and still lose sessions when a server dies.</li>
+    <li>**A health check that always says yes.** If `/health` returns 200 even when the database connection is broken, the load balancer keeps sending traffic to a server that can't do its job.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Several app servers behind a load balancer remove the app as a single point of failure.</li>
+    <li>The load balancer spreads requests, health-checks servers and hides them, which also allows deploys without downtime.</li>
+    <li>It only works if servers are stateless: sessions, files and counters live in shared stores.</li>
+    <li>Run the load balancer as a pair, or use a managed one, so it isn't the new single point of failure.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What does it mean for a web server to be stateless, and why does it matter for scaling?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Where would you keep user sessions?", "What are sticky sessions, and why are they usually a bad idea?"]}
+>
+  <p>A stateless server keeps nothing between requests that another server would need: no sessions in memory, no files on local disk. All of that lives in shared stores like a database, Redis or object storage, or in a signed token the client sends.</p>
+  <p>It matters because then any server can handle any request. A load balancer can spread traffic freely, a crashed server loses nothing, deploys can replace servers one at a time, and adding capacity is just starting more copies.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "How does a load balancer know a server is unhealthy, and what happens next?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What should a health check actually test?", "What happens if every server fails its health check at once?"]}
+>
+  <p>It sends a health check to each server every few seconds, typically an HTTP request to an endpoint like /health, and marks a server unhealthy after several failures in a row. It stops routing new requests to that server and keeps checking; once it passes again for a few checks, it goes back into rotation.</p>
+  <p>The check should test what the server needs to do its job, such as being able to reach the database, without being so heavy that the checks themselves cause load.</p>
+</InterviewCard>

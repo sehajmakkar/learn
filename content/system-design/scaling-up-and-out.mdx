@@ -1,0 +1,166 @@
+export const meta = {
+  summary: "Give the database its own machine, then grow each part either by making its machine bigger or by adding more machines.",
+  uses: ["02.01", "01.03", "01.04"],
+  usedIn: ["02.03", "02.04"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.01" />. You'll need the idea of a <Term t="single-point-of-failure">single point of failure</Term> from there, and the "parts in a chain
+  multiply" rule from <L id="01.03" />.
+</BeforeYouStart>
+
+## The problem: two jobs, one machine
+
+A few months in, Snip has a few thousand users. Once a month an owner downloads a report of every click on every
+link, and while that query runs, <Term t="redirect">redirects</Term> slow from 5 ms to 400 ms. The database and the app are on the same machine,
+so a heavy query takes CPU, memory and disk bandwidth away from everything else.
+
+The two parts also want different hardware. The app needs CPU and very little disk. The database wants lots of memory
+(to keep hot data out of the disk) and fast storage. On one machine you can't size either one properly.
+
+## Step 1: give the database its own machine
+
+<Evolve
+  title="Snip: move the database out"
+  change="The database moves to its own server"
+  before={{
+    nodes: [
+      { id: "user", label: "Browser", kind: "user", x: 0, y: 0 },
+      { id: "app", label: "Snip app", kind: "service", x: 1, y: 0 },
+      { id: "db", label: "Postgres", kind: "db", sub: "same machine", x: 2, y: 0 },
+    ],
+    edges: [
+      { from: "user", to: "app" },
+      { from: "app", to: "db" },
+    ],
+    groups: [{ label: "One server", nodes: ["app", "db"] }],
+  }}
+  after={{
+    nodes: [
+      { id: "user", label: "Browser", kind: "user", x: 0, y: 0 },
+      { id: "app", label: "Snip app", kind: "service", sub: "CPU-heavy box", x: 1, y: 0 },
+      { id: "pg", label: "Postgres", kind: "db", sub: "RAM + fast SSD", x: 2.6, y: 0 },
+    ],
+    edges: [
+      { from: "user", to: "app" },
+      { from: "app", to: "pg", label: "over the network" },
+    ],
+  }}
+  caption="Each part now gets a machine shaped for its job, and restarting or replacing the app no longer touches the data."
+/>
+
+What Snip gains:
+
+- **Each part sized for its job.** The database gets memory and fast disks; the app gets CPU.
+- **No more fighting.** A busy app can't starve the database, and the other way round.
+- **The app becomes replaceable.** It holds no data, so you can rebuild it, redeploy it, or later run several copies,
+  all pointing at the same database.
+
+What it costs:
+
+- **A network hop** on every query: about half a millisecond inside one datacenter (<L id="01.04" />). A redirect that
+  makes one query barely notices; a page that makes 50 queries one after another does.
+- **One more machine** to pay for, patch and monitor.
+- **Lower <Term t="availability">availability</Term>, for now.** A redirect needs both machines. Two machines that are each up 99.9% of the time give
+  about 99.8% together. Splitting things up doesn't remove single points of failure; it just separates them, so you
+  can fix each one on its own. That's the next two lessons.
+
+## Step 2: up or out?
+
+When a part runs out of room, there are two ways to grow it:
+
+- **Scale up (vertical scaling):** move it to a bigger machine, with more cores, memory or faster disks.
+- **Scale out (horizontal scaling):** add more machines and split the work between them.
+
+| | Scale up | Scale out |
+| --- | --- | --- |
+| **Code changes** | None: same program, bigger box | The work must be splittable across machines |
+| **Ceiling** | The biggest machine you can buy | Very high: keep adding machines |
+| **Failure** | Still one machine to fail | One machine fails, the others carry on |
+| **Cost** | Price rises steeply at the very top end | Many ordinary machines, plus something to spread work across them |
+| **Changing size** | Usually a restart or a switch to a new machine | Add or remove machines while running |
+| **Complexity** | Low | Higher: coordination, more moving parts |
+
+<Analogy>
+  **A busy bakery.** Scaling up is buying a bigger oven: same baker, same recipes, more loaves per hour, until there's no bigger oven to buy. Scaling out is opening a second bakery: no limit on loaves, but now you need to decide which customers go where and keep the recipes in step.
+</Analogy>
+
+## The usual answer: out for the app, up for the database
+
+Most systems end up doing both, for a simple reason: **things that hold no data scale out easily, and things that hold
+data don't.**
+
+- **The app** keeps nothing between requests (or can be made to, in <L id="02.03" />). Any copy can answer any
+  request, so you add copies and spread requests across them.
+- **The database** holds the data. Splitting it across machines means deciding which machine owns which rows, and
+  every query that spans them gets harder (that's <Term t="sharding">sharding</Term>, in <L id="05.01" />). So you scale it up for as long as
+  you can, and take load off it in other ways first: a <Term t="cache">cache</Term> and read copies (<L id="02.04" />).
+
+Modern servers are very large, and a single well-tuned database goes much further than most people expect. Snip's
+estimate from <L id="01.05" /> (1,000 reads and 10 writes a second at peak, 300 GB) fits on a mid-sized database
+server with years of room.
+
+## Don't forget the standby
+
+Scaling up still leaves the database as a single point of failure. The standard fix is a **standby**: a second
+database server that receives every change from the main one (the **primary**) and can take over within seconds to
+minutes if the primary dies. That swap is called **failover**.
+
+It doesn't add capacity, and it costs a whole second server that mostly waits. But it means a dead disk is a short
+blip instead of hours of restoring from backup. You'll see how it works, and what can go wrong, in <L id="04.07" />.
+
+<SeenInProduction>
+  <Seen
+    company="Let's Encrypt"
+    system="Certificate authority database"
+    year={2021}
+    href="https://letsencrypt.org/2021/01/21/next-gen-database-servers.html"
+    source="The Next Gen Database Servers Powering Let's Encrypt"
+    found="A service securing hundreds of millions of websites chose a bigger single database over splitting its data, and got a tenfold latency improvement."
+  >
+    Let's Encrypt runs its certificate authority against a single MariaDB database "to minimize complexity", sending
+    some reads to <Term t="replica">replicas</Term>. In late 2020 it moved the primary from a 24-core, 1 TB RAM server with SATA SSDs to a
+    64-core, 2 TB RAM server with NVMe drives. Primary CPU dropped from over 90% to about 25%, and the median API
+    response went from about 90 ms to about 9 ms. They note they may need to shard eventually, but hardware advances
+    have let them avoid it so far.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's database is at 85% CPU at peak, and most of that load is writes. There's plenty of budget. What's the simplest next step?"
+  options={[
+    { text: "Shard the database across four machines", why: "That would work, but it's the most complex option: every query and every future feature has to know which shard to use. Save it for when a bigger machine can't keep up." },
+    { text: "Move the database to a bigger machine", correct: true, why: "Scaling up needs no code changes and buys a lot of headroom. Keep the standby, and plan the next step for when the biggest sensible machine isn't enough." },
+    { text: "Add a cache in front of the database", why: "A cache takes reads off the database. This load is mostly writes, which still have to reach the database." },
+    { text: "Add more app servers", why: "The app isn't the bottleneck. More app servers would send the database even more work." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Scaling out the database first.** Sharding is a big, lasting complexity. A bigger machine, a cache and read copies usually come first.</li>
+    <li>**Forgetting the extra hop.** Splitting a system adds network calls. Chatty code that made 50 local queries gets slow when each one crosses the network.</li>
+    <li>**Thinking a split adds availability.** Two machines in a chain are less available than one. Availability comes from spare copies, not from splitting.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Giving the database its own machine lets each part be sized for its job and stops them competing.</li>
+    <li>It adds a network hop and, until there are spare copies, lowers availability.</li>
+    <li>Scale up: a bigger machine, no code changes, a ceiling. Scale out: more machines, no ceiling, more complexity.</li>
+    <li>Parts without data scale out easily; databases usually scale up first, with a standby for failover.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between vertical and horizontal scaling? When would you choose each?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why are databases harder to scale horizontally than web servers?", "What does a standby database give you, and what doesn't it?"]}
+>
+  <p>Vertical scaling means moving to a bigger machine: more CPU, memory or faster disks. It needs no code changes and keeps things simple, but there's a ceiling, the top-end machines get expensive, and it's still one machine that can fail. Horizontal scaling means adding more machines and spreading the work. It has a much higher ceiling and survives single failures, but the work has to be splittable and you need something to spread it, like a load balancer.</p>
+  <p>Stateless app servers are easy to scale horizontally, so I'd do that early. For a database, I'd scale vertically as long as it's reasonable, add a standby for failover, and take reads off it with a cache and read replicas before considering sharding.</p>
+</InterviewCard>

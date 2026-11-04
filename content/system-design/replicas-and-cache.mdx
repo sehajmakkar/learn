@@ -1,0 +1,221 @@
+export const meta = {
+  summary: "Snip's traffic grows a hundredfold and the database can't keep up with reads. Two fixes, read replicas and a cache, and what each one costs.",
+  uses: ["02.02", "02.03", "01.05"],
+  usedIn: ["02.05", "02.06", "06.01", "04.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.03" />. Snip now runs three <Term t="stateless">stateless</Term> app servers behind a <Term t="load-balancer">load balancer</Term>, all talking to one Postgres
+  primary with a standby. You'll also use the "×100" estimate from <L id="01.05" />.
+</BeforeYouStart>
+
+## The problem: reads
+
+A large chat app starts using Snip for every link its users share, and traffic grows a hundredfold. From the
+estimate in <L id="01.05" />, that's about 350 new links and 35,000 <Term t="redirect">redirects</Term> a second on average, and around
+**100,000 redirects a second at peak**.
+
+Adding app servers is easy now: they're stateless. But every redirect still asks the one database the same question,
+"where does this code go?", and the graphs show the primary at 90% CPU at peak, almost all of it from those lookups.
+Writes are fine. **Reads** are the problem.
+
+There are two standard ways to take reads off a database. Most systems end up using both.
+
+## Fix 1: read replicas
+
+A **read replica** is a copy of the database that receives every change from the primary and applies it. The app
+sends **writes to the primary** and **reads to the replicas**. Since replicas only serve reads, you can add more of
+them as read traffic grows. (The standby from <L id="02.02" /> is built the same way; it just doesn't take traffic.)
+
+The catch is that copying takes time. The primary commits a write, then sends it to each replica, which applies it a
+moment later. That delay is **replication lag**: usually milliseconds, but it can grow to seconds when a replica is
+busy. During it, a replica returns old data. For Snip, that breaks a requirement:
+
+<Sequence
+  title="A brand-new link, read from a replica"
+  walk
+  participants={[{ id: "u", label: "Owner, friend" }, { id: "app", label: "Snip app" }, { id: "p", label: "Primary" }, { id: "r", label: "Replica" }]}
+  messages={[
+    { from: "u", to: "app", label: "POST /links", explain: "The owner creates a link." },
+    { from: "app", to: "p", label: "INSERT x7Kp", explain: "Writes go to the primary, which saves the new link." },
+    { from: "app", to: "u", label: "201 snip.link/x7Kp", reply: true, explain: "The owner gets the short link and pastes it into a chat straight away." },
+    { from: "u", to: "app", label: "GET /x7Kp", explain: "A friend clicks it within a second. Reads go to a replica." },
+    { from: "app", to: "r", label: "SELECT x7Kp", explain: "The replica hasn't applied the insert yet: it's a few hundred milliseconds behind." },
+    { from: "r", to: "app", label: "not found", reply: true, fail: true, explain: "The replica says the code doesn't exist, so the friend sees a 404 for a link that was just created." },
+    { note: "a moment later, the replica catches up", over: ["p", "r"] },
+  ]}
+/>
+
+Snip promised "a new link works the moment it's created", so it needs a rule for this. The simplest one: **if a
+replica says a code doesn't exist, ask the primary before answering 404.** Real codes are almost always found on the
+replica, so only brand-new links (and mistyped ones) reach the primary. Other systems use "read your own writes":
+for a few seconds after a user writes, send that user's reads to the primary.
+
+## Fix 2: a cache
+
+A **cache** keeps copies of frequently read data in memory, in a store like Redis or Memcached. Reading memory takes
+about 100 ns, while a database query costs a network round trip plus index and disk work (<L id="01.04" />), and the
+cache can serve far more lookups per machine.
+
+Snip uses the most common pattern, **cache-aside**: the app checks the cache first, and only on a miss asks the
+database and saves the answer in the cache.
+
+<Arch
+  title="A Snip redirect, with cache-aside"
+  nodes={[
+    { id: "lb", label: "Load balancer", kind: "lb", x: 0, y: 1 },
+    { id: "app", label: "Snip app", kind: "service", sub: "×N", x: 1, y: 1 },
+    { id: "cache", label: "Redis", kind: "cache", sub: "code → URL", x: 2.6, y: 0 },
+    { id: "rep", label: "Read replica", kind: "db", x: 2.6, y: 1 },
+    { id: "pg", label: "Primary", kind: "db", sub: "+ standby", x: 2.6, y: 2 },
+  ]}
+  edges={[
+    { from: "lb", to: "app" },
+    { from: "app", to: "cache", label: "1. get" },
+    { from: "app", to: "rep", label: "2. on miss" },
+    { from: "app", to: "pg", label: "3. if not found" },
+  ]}
+  steps={[
+    { caption: "A redirect for /x7Kp reaches one of the app servers.", edges: ["lb>app"] },
+    { caption: "The app asks Redis for x7Kp. With a good hit rate, about 19 in 20 redirects end here, in well under a millisecond.", edges: ["app>cache"] },
+    { caption: "On a miss, it reads a replica, then stores the answer in Redis with an expiry time so the next request for x7Kp is a hit.", edges: ["app>rep", "app>cache"] },
+    { caption: "Only if the replica has never heard of the code does the app ask the primary, which covers links created in the last moment.", edges: ["app>pg"] },
+  ]}
+  caption="Each layer only sees the requests the layer above it missed."
+/>
+
+What makes a cache work is the **hit rate**, the share of reads it answers. At 100,000 redirects a second:
+
+| Hit rate | Reads that reach the database |
+| --- | --- |
+| 80% | 20,000 a second |
+| 95% | 5,000 a second |
+| 99% | 1,000 a second |
+
+Snip is close to ideal for caching. Links never change once created (editing is out of scope), so cached answers are
+never wrong. And clicks are lopsided: a small share of links, the ones shared today, get most of the traffic. If 10
+million links are clicked on a busy day, at 500 bytes each that's about 5 GB, which fits in one cache server's memory.
+
+<Analogy>
+  **The library's front desk.** Most visitors ask for this week's bestsellers, so the librarian keeps a few copies at the desk. Those requests are answered in seconds; only unusual requests mean a walk into the stacks. The desk shelf is small, but it handles most of the questions.
+</Analogy>
+
+## What a cache costs
+
+- **Stale data.** The cache is a copy; when the original changes, the copy is wrong until it's updated or expires.
+  Snip mostly avoids this because links don't change. When something does change (an owner deletes a link, say),
+  the usual move is to **delete the cache entry**, not overwrite it, and let the next read fill it from the database.
+  Give every entry an expiry time (a TTL) as a safety net.
+- **Cold starts.** A cache that restarts empty sends every read to the database at once. <L id="06.05" /> covers how
+  to soften that.
+- **Missing keys.** Requests for codes that don't exist always miss. Someone scanning random codes goes straight past
+  the cache. Caching "not found" for a short time helps.
+- **One more system** to size, monitor and keep available.
+
+## Which first?
+
+| | Read replicas | Cache |
+| --- | --- | --- |
+| **Best for** | Many different queries: dashboards, searches, reports | The same small set of keys read again and again |
+| **Freshness** | Behind by the replication lag | Behind until expiry or deletion |
+| **App changes** | Send reads to a different address | Check cache, fill on miss, delete on change |
+| **Capacity per machine** | A database server's worth | Far more simple lookups per machine |
+
+Snip uses both: Redis for redirects, which are one key lookup repeated endlessly, and a replica for the owners'
+dashboard and stats queries, which vary too much to cache well.
+
+<Evolve
+  title="Snip at 100× traffic"
+  change="Add a cache for redirects and a read replica"
+  before={{
+    nodes: [
+      { id: "lb", label: "Load balancer", kind: "lb", x: 0, y: 1 },
+      { id: "app", label: "Snip app", kind: "service", sub: "×3", x: 1, y: 1 },
+      { id: "pg", label: "Primary", kind: "db", sub: "+ standby", x: 2.6, y: 2 },
+    ],
+    edges: [
+      { from: "lb", to: "app" },
+      { from: "app", to: "pg", label: "all reads, writes" },
+    ],
+  }}
+  after={{
+    nodes: [
+      { id: "lb", label: "Load balancer", kind: "lb", x: 0, y: 1 },
+      { id: "app", label: "Snip app", kind: "service", sub: "×10", x: 1, y: 1 },
+      { id: "cache", label: "Redis", kind: "cache", sub: "redirects", x: 2.6, y: 0 },
+      { id: "rep", label: "Read replica", kind: "db", sub: "dashboard reads", x: 2.6, y: 1 },
+      { id: "pg", label: "Primary", kind: "db", sub: "+ standby", x: 2.6, y: 2 },
+    ],
+    edges: [
+      { from: "lb", to: "app" },
+      { from: "app", to: "cache", label: "redirects" },
+      { from: "app", to: "rep", label: "reads" },
+      { from: "app", to: "pg", label: "writes" },
+      { from: "pg", to: "rep", label: "copies", dashed: true },
+    ],
+  }}
+  caption="The primary now handles writes and a trickle of reads; the cache absorbs almost all redirects."
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Facebook"
+    system="Memcache"
+    year={2013}
+    href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala"
+    source="Scaling Memcache at Facebook (NSDI 2013)"
+    found="The same cache-aside pattern, with delete-on-write, scaled to billions of requests a second."
+  >
+    Facebook's paper describes memcache as a "demand-filled look-aside cache" in front of MySQL, serving billions of
+    requests per second. On a write, the web server updates the database and then deletes the cache entry rather than
+    updating it, because deletes are safe to repeat. For keys prone to stampedes, a mechanism they call leases cut the
+    peak database query rate from 17,000 to 1,300 a second.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip serves 100,000 redirects a second at peak and the cache hit rate drops from 99% to 95% after a deploy. What happens to the reads reaching the database?"
+  options={[
+    { text: "They rise by about 4%", why: "The hit rate fell by 4 points, but what matters is the misses: they went from 1% to 5%." },
+    { text: "They rise five times, from about 1,000 to 5,000 a second", correct: true, why: "Misses went from 1% to 5% of 100,000. Small changes in hit rate are big changes in database load, which is why hit rate is one of the first things to watch on a cache." },
+    { text: "They don't change; the cache still handles most reads", why: "It still handles most reads, but the database's share grew fivefold." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Reading your own write from a replica.** Right after a write, a replica may not have it yet. Decide what each read can tolerate.</li>
+    <li>**Updating the cache on write instead of deleting.** Two writers updating at once can leave the older value in the cache. Deleting is safer.</li>
+    <li>**No expiry.** Without a TTL, a missed invalidation leaves wrong data in the cache forever.</li>
+    <li>**Caching everything.** Cache the hot, repeated reads. Data that's read once wastes memory and lowers the hit rate.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>When reads overwhelm the database, take them off it with read replicas, a cache, or both.</li>
+    <li>Replicas copy every write and serve reads, but lag behind; plan for reads that need the latest data.</li>
+    <li>Cache-aside: check the cache, read the database on a miss, store the answer with a TTL, delete on change.</li>
+    <li>Hit rate drives everything: going from 99% to 95% sends five times as many reads to the database.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Your database is overloaded with reads. What are your options, and how do you choose?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Scenario" }}
+  followUps={["How do you handle a user reading their own write from a lagging replica?", "How would you keep the cache from serving stale data?"]}
+>
+  <p>First I'd check that the queries are indexed and efficient, since that's free. Then the two main tools are read replicas and a cache. Replicas are full copies that serve reads, which suits varied queries like dashboards, but they lag the primary, so reads that need the latest data go to the primary or use read-your-writes. A cache like Redis suits a small set of keys read over and over: cache-aside, with a TTL and deletion when the data changes.</p>
+  <p>For a URL shortener, redirects are one key lookup with a skewed distribution and data that never changes, so a cache absorbs most of them. I'd add a replica for the analytics and dashboard queries.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "What is replication lag, and how can it cause bugs?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What can make lag grow?", "How would you monitor it?"]}
+>
+  <p>It's the delay between a write committing on the primary and a replica applying it. It's usually milliseconds but can reach seconds or more when replicas are busy or the network is slow. During that window, reads from the replica return old data.</p>
+  <p>The classic bug is a user writing something and immediately not seeing it, or seeing it appear and disappear as reads go to different replicas. Fixes include reading from the primary for a short time after a user writes, falling back to the primary when data is missing, or tracking the write's position and only using replicas that have caught up.</p>
+</InterviewCard>
