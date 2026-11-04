@@ -1,0 +1,141 @@
+export const meta = {
+  summary: "Three common styles for an API: resources over HTTP, typed remote calls, and queries that ask for exactly the fields they need. What each is good at, with Snip as the example.",
+  uses: ["03.01", "01.07"],
+  usedIn: ["03.04", "03.08"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.07" />: step 3 of the framework is writing the <Term t="api">API</Term>. This lesson is about which style to write it in.
+</BeforeYouStart>
+
+## Same job, three styles
+
+Snip's dashboard needs, for one link: its long URL, its click count, and clicks by day for the last week. Here's that
+request in each of the three styles you'll meet most.
+
+**REST** treats the API as a set of **resources** with URLs, and uses HTTP's own verbs and status codes on them:
+
+```http
+GET /links/x7Kp            → 200 { "code": "x7Kp", "long_url": "…", "created_at": "…" }
+GET /links/x7Kp/stats      → 200 { "clicks": 18420, "by_day": [ … ] }
+```
+
+**gRPC** treats the API as **functions** you call on a remote server. You define them, and the messages they take,
+in a schema file; tools generate client and server code in each language. Messages travel as compact binary
+(Protocol Buffers) over HTTP/2:
+
+```protobuf
+service Links {
+  rpc GetLink (GetLinkRequest) returns (Link);
+  rpc GetStats (GetStatsRequest) returns (Stats);
+}
+message GetLinkRequest { string code = 1; }
+message Link { string code = 1; string long_url = 2; int64 clicks = 3; }
+```
+
+**GraphQL** exposes one endpoint and a typed schema of everything that can be asked for. The **client** writes a
+query naming exactly the fields it wants, across related objects, and gets back just those:
+
+```graphql
+query {
+  link(code: "x7Kp") {
+    longUrl
+    clicks
+    clicksByDay(last: 7) { day count }
+  }
+}
+```
+
+## How they compare
+
+| | REST | gRPC | GraphQL |
+| --- | --- | --- | --- |
+| **Shape** | Resources and HTTP verbs | Functions with typed messages | One endpoint, typed schema, client-written queries |
+| **Format** | Usually JSON | Binary Protocol Buffers | JSON |
+| **Contract** | Often informal; OpenAPI if you add it | Strict schema, generated code | Strict schema |
+| **HTTP <Term t="cache">caching</Term>** | Works naturally for `GET` | Not really | Hard: most queries are `POST` to one URL |
+| **Browsers** | Native | Needs a proxy layer | Native |
+| **Fetching shape** | Fixed per endpoint: can be too much or too little | Fixed per method | Exactly what the client asks for |
+| **Streaming** | Not built in | Built in, both directions | Subscriptions, via extra machinery |
+| **Best at** | Public APIs, simple CRUD, cacheable reads | Fast, typed calls between your own services | Many different clients needing different views of related data |
+
+<Analogy>
+  **Ordering food.** REST is a set menu: each dish is fixed, easy to understand, and the kitchen can prepare popular ones in advance (caching). gRPC is a professional kitchen's order system: terse, precise, and fast, but only staff know the codes. GraphQL is a build-your-own bowl: you get exactly what you ask for, but the kitchen has to handle any combination anyone dreams up.
+</Analogy>
+
+## What each one costs
+
+- **REST** endpoints are designed around resources, not screens. A dashboard may need several calls (link, then
+  stats, then owner) to draw one page, and each response may include fields it doesn't need. That's fine for most
+  APIs and gets painful on slow mobile networks.
+- **gRPC** is fast and strictly typed, which is exactly what you want between your own services. But browsers can't
+  call it directly, binary messages are harder to inspect while debugging, and every client needs generated code.
+- **GraphQL** moves the shape of the query to the client, which is great for the client and hard for the server: a
+  single query can ask for a lot of nested data, so you need limits on query depth and cost, careful batching to
+  avoid one database query per item, and different ways to cache.
+
+## Snip's choices
+
+- **Public API: REST.** Developers can try it with `curl`, every language has an HTTP client, and `GET` responses can
+  be cached by <Term t="cdn">CDNs</Term> and browsers.
+- **Between Snip's own services, if it splits into several:** gRPC is a common choice, for typed contracts and speed.
+  <L id="03.08" /> covers how services talk.
+- **GraphQL:** only if Snip grew many client apps that each needed very different slices of the data. One dashboard
+  doesn't justify it.
+
+The choice is rarely all-or-nothing. Many companies use REST at the edge, gRPC inside, and GraphQL for one product
+surface with demanding clients.
+
+<SeenInProduction>
+  <Seen
+    company="GitHub"
+    system="GraphQL API (API v4)"
+    year={2016}
+    href="https://github.blog/2016-09-14-the-github-graphql-api/"
+    source="The GitHub GraphQL API"
+    found="A large public REST API moved to GraphQL to cut round trips and over-fetching, and the load they caused."
+  >
+    GitHub said its REST API was responsible for over 60% of the requests made to its database tier. Clients sometimes
+    needed two or three calls to build a complete view of one resource, and responses were full of URL hints while
+    still missing data clients needed: "too much data and didn't include data that consumers needed". GitHub
+    launched a GraphQL API so clients could ask for exactly what they needed in one request.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip splits its stats into a separate internal service that the main app calls on every dashboard load. No browsers call it directly. Which style fits best?"
+  options={[
+    { text: "GraphQL, so the main app can ask for any fields it wants", why: "The main app is the only client, and its needs are known. GraphQL's flexibility mostly adds work on the server here." },
+    { text: "gRPC, for a typed contract and fast binary calls between services", correct: true, why: "Internal, known clients, called often: that's gRPC's sweet spot. Generated code also catches contract mismatches at build time." },
+    { text: "REST, because it's always the simplest", why: "REST would work fine too. But for a hot internal call between your own services, gRPC's typing and efficiency are usually worth it." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Choosing GraphQL for one client.** The flexibility costs real server-side work; it pays off when many clients need different data.</li>
+    <li>**Exposing gRPC directly to browsers.** It needs a translation layer; a public REST API is simpler for outside developers.</li>
+    <li>**Calling any JSON over HTTP "REST".** If every call is `POST /doThing`, it's remote procedure calls in JSON, and loses REST's caching and clarity.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>REST: resources and HTTP verbs. Simple, cacheable, universal. Fixed response shapes.</li>
+    <li>gRPC: typed functions over HTTP/2 with binary messages. Fast and strict; best between your own services.</li>
+    <li>GraphQL: clients ask for exactly the fields they need. Flexible for clients, harder for servers.</li>
+    <li>Pick per boundary: REST at the edge and gRPC inside is a common mix.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "When would you choose REST, gRPC or GraphQL for an API?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How do you cache GraphQL responses?", "What is the N+1 query problem in GraphQL, and how do you avoid it?"]}
+>
+  <p>REST for public and simple APIs: resources over HTTP, easy to call from anywhere, and GET responses cache naturally in browsers and CDNs. gRPC for internal service-to-service calls: a strict schema with generated clients, compact binary messages over HTTP/2 and built-in streaming, at the cost of browser support and easy debugging.</p>
+  <p>GraphQL when many different clients need different slices of related data: each client asks for exactly the fields it wants in one round trip. The server then has to guard against expensive queries, batch data loading to avoid N+1 queries, and handle caching differently.</p>
+</InterviewCard>

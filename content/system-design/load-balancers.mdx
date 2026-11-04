@@ -1,0 +1,154 @@
+export const meta = {
+  summary: "How load balancers work: layer 4 versus layer 7, the algorithms that pick a server, health checks, and how to drain a server without dropping anyone. With a simulator.",
+  uses: ["02.03", "03.01"],
+  usedIn: ["03.07", "03.11", "05.03"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.03" />, which introduced <Term t="load-balancer">load balancers</Term> and <Term t="health-check">health checks</Term> for Snip. This lesson opens the box.
+</BeforeYouStart>
+
+## Two kinds of load balancer
+
+A load balancer can make its decision at two different levels, named after layers of the network model:
+
+- **Layer 4 (transport)** looks only at connections: IP addresses and ports. It picks a server when a <Term t="tcp">TCP</Term> connection
+  opens and passes the bytes through without reading them. Very fast and protocol-agnostic, but it can't see URLs,
+  headers or cookies, and every request on one connection goes to the same server.
+- **Layer 7 (application)** ends the connection itself, reads each HTTP request, and decides per request. It can route
+  `/api/*` to one group of servers and `/static/*` to another, add headers, terminate <Term t="tls">TLS</Term>, retry a failed request on
+  another server, and spread requests from one long-lived connection across many servers.
+
+| | Layer 4 | Layer 7 |
+| --- | --- | --- |
+| **Sees** | IPs, ports, connections | Full HTTP requests |
+| **Decides** | Once per connection | Once per request |
+| **TLS** | Passes it through | Usually terminates it |
+| **Can route by** | Address and port | Path, host, headers, cookies |
+| **Cost** | Very low per packet | More work per request |
+
+Large sites often use both in layers: a layer 4 tier spreads connections across a fleet of layer 7 proxies, which
+then route requests to applications. GitHub's setup below is exactly this.
+
+## Choosing a server
+
+The algorithm matters most when requests or servers aren't all the same. The common ones:
+
+- **Round robin:** each server in turn. Even when every request costs the same, and blind to everything else.
+- **Weighted round robin:** bigger servers get proportionally more turns.
+- **Random:** surprisingly decent, but uneven over short stretches.
+- **Least connections:** the server with the fewest requests in progress right now. Adapts to slow requests and
+  slow servers, because a server that's struggling holds more open requests and so gets fewer new ones.
+- **Two random choices:** pick two servers at random and send to the less busy one. Nearly as good as least
+  connections, and it doesn't need every load balancer to have a perfectly up-to-date view of every server, which
+  matters when there are many load balancers.
+- **Hashing** (by client IP, user ID, or URL): the same key always goes to the same server. Useful when servers keep
+  a per-key <Term t="cache">cache</Term>. Plain hashing reshuffles almost every key when a server is added; consistent hashing fixes that
+  (<L id="05.03" />).
+
+Try them. Four servers, requests arriving at random, each server working through its own <Term t="message-queue">queue</Term> one request at a time:
+
+<Lab
+  id="sd-03-06-load-balancer"
+  title="Load balancing algorithms"
+  tasks={[
+    "At 80% busy with even requests, compare round robin and random. Why does random have a much worse p99?",
+    "Turn on 'Server 4 at half speed'. What happens to round robin, and why does least connections barely notice?",
+    "Turn on 'Some requests 10× heavier' instead. Which algorithms cope, and what do they know that round robin doesn't?",
+    "Push to 95% busy. How close does 'two random choices' get to least connections?",
+  ]}
+>
+  <LoadBalancerLab />
+</Lab>
+
+The slow-server case is the one to remember. Round robin keeps sending a quarter of all traffic to a server that can
+only handle a seventh of it, so its queue grows without limit. Algorithms that look at how busy each server is route
+around the problem automatically.
+
+## Health checks, in more detail
+
+Health checks decide which servers are in the pool at all. Two kinds work together:
+
+- **Active checks:** the load balancer requests `/health` every few seconds, and removes a server after, say, three
+  failures in a row; it adds it back after a few successes. The thresholds stop one slow check from flapping a server
+  in and out.
+- **Passive checks:** the load balancer watches real traffic, and backs off a server that's returning errors or
+  timing out, without waiting for the next check.
+
+Be careful what `/health` tests. If it checks the database and the database blips, **every** server fails its health
+check at once and the load balancer has nothing left to send traffic to. Many teams keep the health check to "this
+process can serve requests" and handle dependency failures in the request path instead (<L id="03.11" />).
+
+## Draining: removing a server politely
+
+To deploy or retire a server, you **drain** it: stop sending it new requests or connections, let the ones in progress
+finish (up to a time limit), then take it out. Without draining, every deploy cuts off requests mid-flight. For
+long-lived connections like WebSockets (<L id="03.05" />), draining can take a long time, so servers usually close
+connections gently and let clients reconnect elsewhere.
+
+<Analogy>
+  **Supermarket checkouts.** Round robin sends shoppers to tills in turn, even if till 4 has a trainee and a queue out the door. Least connections is shoppers glancing along the tills and joining the shortest queue. Draining is the "this till is closing" sign: nobody new joins, and the people already in line still get served.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="GitHub"
+    system="GLB Director"
+    year={2018}
+    href="https://github.blog/2018-08-08-glb-director-open-source-load-balancer/"
+    source="GLB: GitHub's open source load balancer"
+    found="A stateless layer 4 tier in front of layer 7 proxies, using rendezvous hashing so proxies can be drained without breaking connections."
+  >
+    GLB Director is a layer 4 load balancer that spreads a single IP address across many machines. It sits in front of
+    proxies like haproxy and nginx rather than replacing them. The director tier keeps no per-connection state: it
+    uses rendezvous hashing over a table of primary and secondary servers, and a "second chance" mechanism lets packets
+    for existing connections reach the server that holds them while that server drains.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="One of your eight app servers has a failing disk and is answering five times slower than the others. Health checks still pass. Which algorithm limits the damage best?"
+  options={[
+    { text: "Round robin", why: "It keeps sending one eighth of all requests to the slow server, whose queue grows and grows. Those users see terrible latency." },
+    { text: "Least connections", correct: true, why: "Slow requests pile up on that server, so it shows more open connections and gets fewer new ones. The algorithm routes around trouble the health check can't see." },
+    { text: "Hash by user ID", why: "Every user who hashes to that server keeps going there. An eighth of users get a consistently awful experience." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Assuming round robin is fair.** It's fair in turns, not in work. Uneven requests or servers make it unfair fast.</li>
+    <li>**Deep health checks.** A health check that fails whenever a shared dependency blips can take every server out at once.</li>
+    <li>**Deploying without draining.** Requests in flight on a removed server just fail.</li>
+    <li>**Forgetting the load balancer is a single point of failure.** Run it as a redundant pair or a managed, multi-machine service.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Layer 4 balances connections without reading them; layer 7 reads and routes each HTTP request.</li>
+    <li>Round robin is fine when everything is uniform; least connections and two random choices adapt to slow requests and servers.</li>
+    <li>Active and passive health checks decide who's in the pool; keep active checks shallow.</li>
+    <li>Drain servers before removing them so requests in flight can finish.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between a layer 4 and a layer 7 load balancer?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why would you put a layer 4 tier in front of layer 7 proxies?", "Where would you terminate TLS?"]}
+>
+  <p>A layer 4 load balancer works with TCP or UDP connections: it picks a backend when a connection opens and forwards packets without reading them. It's fast and works with any protocol, but every request on a connection goes to the same server and it can't route on content. A layer 7 load balancer terminates the connection, parses each HTTP request, and can route on path, host, headers or cookies, terminate TLS, retry on another backend, and balance requests individually.</p>
+  <p>At scale they're often layered: a layer 4 tier spreads connections over many layer 7 proxies, which do the request-level routing.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "Which load balancing algorithm would you choose, and why?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["What is the 'power of two choices'?", "When would you hash requests to servers?"]}
+>
+  <p>Round robin is fine when requests and servers are uniform. When request costs vary or a server can slow down, I'd prefer least outstanding requests, which naturally sends less to a struggling server. With many load balancer instances that each have a partial view, picking two servers at random and choosing the less loaded one gets most of the benefit cheaply.</p>
+  <p>I'd use hashing, ideally consistent hashing, when servers keep per-key state like a local cache, so the same key keeps landing on the same server.</p>
+</InterviewCard>

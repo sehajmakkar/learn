@@ -1,0 +1,121 @@
+export const meta = {
+  summary: "TCP delivers every byte in order and pays for it in waiting. UDP delivers what it can, now. When each fits, and why HTTP/3 moved to UDP.",
+  uses: ["03.01"],
+  usedIn: ["03.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.01" />. You'll need the TCP handshake from there.
+</BeforeYouStart>
+
+## Two ways to send data
+
+Underneath every request, data travels as small **packets**. The network makes no promises about them: a packet can
+be lost, arrive twice, or arrive after one sent later. The two main transport protocols make different choices about
+what to do with that mess.
+
+| | TCP | UDP |
+| --- | --- | --- |
+| **Connection** | A handshake first (one round trip) | None: just send |
+| **Delivery** | Every byte arrives, or the connection fails | Packets may be lost; nobody resends them |
+| **Order** | Bytes arrive in the order sent | Packets may arrive in any order |
+| **Speed control** | Slows down when the network is congested | None built in; the app decides |
+| **Overhead** | More: acknowledgements, retransmissions | Less: a small header and the data |
+| **Used by** | Web pages, <Term t="api">APIs</Term>, databases, email, file transfer | <Term t="dns">DNS</Term> lookups, video calls, games, live streams, QUIC |
+
+## TCP: reliable, ordered, and sometimes waiting
+
+TCP numbers every byte. The receiver acknowledges what it gets; anything not acknowledged in time is sent again. The
+receiving side hands data to the application strictly in order.
+
+That last part has a cost called **head-of-line blocking**: if one packet is lost, everything after it waits until
+the lost one is resent and arrives, even if the later packets are already sitting there. For a file download that's
+fine; you need every byte anyway. For a video call it's not: a frame that arrives 300 ms late is worse than a frame
+that never arrives.
+
+## UDP: whatever arrives, right now
+
+UDP sends each packet on its own, with no handshake, no acknowledgements and no resending. The application gets
+whatever arrives, as it arrives. That suits two kinds of traffic:
+
+- **Small, one-shot questions** where a retry is simpler than a connection. A DNS lookup is a single small packet
+  each way; if the answer doesn't come back, the resolver just asks again.
+- **Real-time data** where late is useless: voice, video, game state. The app would rather skip a lost packet and
+  play the next one, or send a fresh update, than wait.
+
+If an app on UDP does need reliability or ordering for some of its data, it builds just that part itself.
+
+<Analogy>
+  **Registered post versus shouting across a room.** Registered post (TCP) gets a signature for every parcel and the parcels are opened in order, even if that means waiting for a late one. Shouting (UDP) is instant, and if someone misses a word you just carry on; in a fast conversation that's better than stopping everything to repeat it.
+</Analogy>
+
+## QUIC: building a better TCP on top of UDP
+
+HTTP/2 sends many requests over one TCP connection at once. That cut the number of handshakes, but brought back
+head-of-line blocking at a new level: one lost packet stalls **every** request on the connection, because TCP only
+knows about one stream of bytes.
+
+Changing TCP itself is very slow: it lives in operating systems and in network equipment along the way. So Google
+built **QUIC**, which runs on UDP and does the reliability work in the application instead:
+
+- Many independent **streams** in one connection, so a lost packet only delays the stream it belongs to.
+- **Encryption built in**, with the transport and <Term t="tls">TLS</Term> handshakes combined into one round trip, or none when
+  reconnecting to a server it has seen before.
+- Connections that survive the client's network changing, say from Wi-Fi to mobile data.
+
+QUIC became the transport for **HTTP/3**. The lesson for designers: UDP isn't only for "unreliable" traffic. It's
+also the base you build on when you want reliability with different trade-offs than TCP's.
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="QUIC"
+    year={2017}
+    href="https://research.google/pubs/the-quic-transport-protocol-design-and-internet-scale-deployment/"
+    source="The QUIC Transport Protocol: Design and Internet-Scale Deployment (SIGCOMM 2017)"
+    found="Moving the transport onto UDP, in the application, let Google change it at app-update speed and measurably cut latency."
+  >
+    Google built QUIC in user space on UDP and deployed it in Chrome, the YouTube app and the Google Search app. The
+    paper reports that, on average, QUIC cut Google Search response latency by 8.0% for desktop users and 3.6% for
+    mobile users, and cut YouTube rebuffer rates by 18.0% on desktop and 15.3% on mobile. It carried over 30% of
+    Google's egress traffic, an estimated 7% of all Internet traffic.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="You're designing a multiplayer game that sends each player's position 30 times a second. A packet is lost. What should happen?"
+  options={[
+    { text: "Resend it, so the client sees every position in order", why: "By the time it's resent, a newer position has already been sent. Waiting for the old one only delays the new one." },
+    { text: "Skip it; the next update, a few tens of milliseconds later, replaces it", correct: true, why: "Position updates go stale almost immediately, so UDP's 'whatever arrives, now' fits. Reliable channels can still be built for things that matter, like chat messages or purchases." },
+    { text: "Close the connection and reconnect", why: "Losing an occasional packet is normal on real networks. Reconnecting would cost far more than the lost update." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**"UDP is unreliable, so never use it."** It's the right choice for real-time data and the base of HTTP/3. Reliability can be added where it's needed.</li>
+    <li>**Forgetting head-of-line blocking.** One lost packet on a TCP connection stalls everything behind it, including unrelated requests sharing the connection.</li>
+    <li>**Picking UDP to "go faster" for ordinary request–response APIs.** You'd end up rebuilding TCP's guarantees, badly.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>TCP: handshake, every byte delivered, in order, with congestion control. One lost packet holds up what follows.</li>
+    <li>UDP: no handshake, no resending, no ordering. The app decides what to do about losses.</li>
+    <li>Use TCP for most request–response traffic; UDP for DNS, real-time media and games.</li>
+    <li>QUIC runs on UDP to get independent streams and faster handshakes, and carries HTTP/3.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What's the difference between TCP and UDP? Give an example where you'd use each.", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What is head-of-line blocking?", "Why is HTTP/3 built on UDP?"]}
+>
+  <p>TCP is connection-oriented: a handshake first, then every byte is acknowledged, retransmitted if lost, and delivered in order, with congestion control. UDP just sends datagrams: no handshake, no retransmission, no ordering, very little overhead.</p>
+  <p>I'd use TCP for anything that needs every byte, like web pages, APIs and database connections. I'd use UDP where late data is useless or a retry is cheap: video calls, game state updates, DNS lookups. HTTP/3 uses QUIC over UDP so it can multiplex independent streams without TCP's head-of-line blocking and combine the transport and TLS handshakes.</p>
+</InterviewCard>

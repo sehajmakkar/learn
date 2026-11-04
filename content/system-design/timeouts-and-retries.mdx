@@ -1,0 +1,169 @@
+export const meta = {
+  summary: "Every remote call needs a timeout, and most failures deserve a retry, but careless retries turn a small outage into a big one. How to set timeouts, when to retry, and why to add randomness.",
+  uses: ["03.08", "01.03"],
+  usedIn: ["03.10", "03.11", "03.12"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.08" />. This lesson is the first half of the answer to "what do we do when a call's outcome is
+  unknown?"
+</BeforeYouStart>
+
+## Timeouts: never wait forever
+
+Snip's <Term t="worker">workers</Term> call an outside safety-check service for every new link (<L id="02.06" />). One afternoon the service
+doesn't fail; it just gets **slow**, taking 60 seconds instead of 200 ms. Workers with no timeout sit waiting, one
+by one, until every worker is stuck and the check <Term t="message-queue">queue</Term> backs up for hours.
+
+A slow dependency is often worse than a dead one: a dead one fails fast, while a slow one ties up your threads,
+connections and memory. So **every network call gets a timeout.**
+
+How long? Too short and you give up on requests that would have succeeded; too long and you're stuck. A good method:
+decide what share of good calls you're willing to cut off, say 0.1%, then set the timeout at that **percentile** of
+the dependency's latency. If the safety check's p99.9 is 800 ms, a 1-second timeout fails very few healthy calls
+and caps the damage of a slow day at one second per call.
+
+## Retries: often right, sometimes dangerous
+
+Many failures are brief: a dropped packet, a server restarting, a deploy in progress. Trying again a moment later
+often just works. But a retry is more load on something that may already be struggling, so retry with rules:
+
+1. **Only retry what can safely be repeated.** Reads, deletes and `PUT`s are fine. A `POST` that creates or charges
+   something isn't, unless it carries an <Term t="idempotent">idempotency</Term> key (<L id="03.10" />).
+2. **Only retry errors that might go away.** Timeouts, connection errors, `503` and `429` are worth another try. A
+   `400` will fail the same way every time.
+3. **Cap the attempts**, typically at two or three, and give up with an error after that.
+4. **Wait between attempts, longer each time, with randomness.** That's backoff and jitter, below.
+5. **Retry at one layer only.** See the next section.
+
+## The retry storm
+
+Retries multiply across layers. Say each of five layers of services retries three times:
+
+<Flow
+  title="Retries at every layer multiply"
+  steps={[
+    { label: "Layer 1", detail: "3 tries" },
+    { label: "Layer 2", detail: "3 × 3 = 9" },
+    { label: "Layer 3", detail: "27" },
+    { label: "Layer 4", detail: "81" },
+    { label: "Layer 5", detail: "243 queries reach the database, for one user request" },
+  ]}
+/>
+
+When the database is struggling, it gets **243 times** the load from the requests it's already failing, which keeps
+it down. Two defences:
+
+- **Retry at one point in the stack**, usually the layer closest to the user or the one that knows whether the
+  operation is safe to repeat. Inner layers fail fast.
+- **A retry budget.** Allow retries only while they're a small share of traffic: a token bucket where each retry
+  costs a token and tokens refill slowly. In a brief blip, every call can retry; in a long outage, retries drop to a
+  trickle automatically.
+
+## Backoff and jitter
+
+If a server hiccups and a thousand clients all retry after exactly 100 ms, they arrive together and knock it over
+again, then again at 200 ms, and so on. Two fixes, used together:
+
+- **Exponential backoff:** wait longer after each failure (100 ms, 200 ms, 400 ms…), up to a cap, giving the server
+  room to recover.
+- **Jitter:** pick the wait at random within that range, so clients spread out instead of arriving in waves.
+
+```ts
+async function callWithRetry<T>(call: (signal: AbortSignal) => Promise<T>, { attempts = 3, base = 100, cap = 2000, timeout = 1000 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call(AbortSignal.timeout(timeout)); // every attempt has its own timeout
+    } catch (err) {
+      if (attempt + 1 >= attempts || !isRetryable(err)) throw err;
+      // "Full jitter": wait a random time between 0 and the exponential backoff.
+      const backoff = Math.min(cap, base * 2 ** attempt);
+      await sleep(Math.random() * backoff);
+    }
+  }
+}
+
+// Timeouts, connection errors, 429 and 5xx might go away; 4xx won't.
+const isRetryable = (err: unknown) => err instanceof TimeoutError || err instanceof NetworkError || (err instanceof HttpError && (err.status === 429 || err.status >= 500));
+```
+
+If the server sends a `Retry-After` header with a `429` or `503`, wait at least that long instead.
+
+<Analogy>
+  **A crowded shop after a power cut.** When the lights come back on, if everyone who was waiting outside rushes the door at the same second, nobody gets in and someone gets hurt. If each person waits a random minute or two, the queue flows. The more often the door jams, the longer people wait before trying again.
+</Analogy>
+
+## Circuit breakers, briefly
+
+A **circuit breaker** watches calls to a dependency, and after too many failures it "opens": calls fail immediately
+without trying, for a while, then a few test calls are let through to see if it has recovered. It stops a service
+wasting time and threads on a dependency that's down. The cost is a new mode of behaviour that's hard to test, and
+which can make a partial outage look total. Many teams prefer retry budgets and timeouts first, and add breakers
+where they've measured a need.
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Builders' Library"
+    year={2019}
+    href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
+    source="Timeouts, retries, and backoff with jitter"
+    found="Set timeouts from the dependency's latency percentiles, and retry at a single layer, because retries multiply."
+  >
+    Amazon suggests choosing an acceptable rate of false timeouts, such as 0.1%, and setting the timeout at the
+    matching percentile of the downstream service's latency (p99.9). It describes a five-deep stack where each layer
+    retries three times, so the database sees 243 times the load, and recommends retrying at a single point in the
+    stack and limiting retries locally with a token bucket.
+  </Seen>
+  <Seen
+    company="AWS"
+    system="Architecture Blog"
+    year={2015}
+    href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/"
+    source="Exponential Backoff And Jitter"
+    found="Backoff without jitter was the clear loser; adding randomness cut both total work and time."
+  >
+    A simulation of many clients competing to update the same record compared backoff without jitter against several
+    jittered versions. Backoff without jitter took more work and more time than all of them. With 100 contending
+    clients, jitter cut the number of calls by more than half.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A request passes through three services before reaching the database. Each service retries failed calls up to 3 times (4 attempts in all). The database starts timing out. How many database calls can one user request cause?"
+  options={[
+    { text: "4", why: "That's one layer's attempts. Each layer's attempts call the next layer, which makes its own attempts." },
+    { text: "12", why: "That adds the layers' attempts instead of multiplying them." },
+    { text: "64", correct: true, why: "4 × 4 × 4: each of the first service's 4 attempts causes 4 at the second, and each of those causes 4 at the third. Retry at one layer, and give inner layers short timeouts and no retries." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**No timeout, or the library default.** Many defaults are minutes or infinite. Choose one from the dependency's latency.</li>
+    <li>**Retrying non-idempotent calls blindly.** A retried "charge card" can charge twice. Add idempotency keys first.</li>
+    <li>**Retrying at every layer.** Retries multiply. Pick one layer.</li>
+    <li>**Fixed retry delays.** Everyone retries in lockstep. Add backoff and jitter.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Every remote call needs a timeout, set from a high percentile of the dependency's latency.</li>
+    <li>Retry only safe operations and errors that might go away, a capped number of times.</li>
+    <li>Retries multiply across layers: retry at one layer and limit retries with a budget.</li>
+    <li>Wait with exponential backoff plus random jitter so clients don't retry in waves.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you make calls to an unreliable downstream service robust?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How do you choose the timeout value?", "Why add jitter to backoff?"]}
+>
+  <p>Give every call a timeout based on the dependency's high-percentile latency, so a slow dependency can't tie up all my resources. Retry only idempotent operations, or ones with idempotency keys, and only on errors that might be transient: timeouts, connection errors, 429 and 5xx. Cap attempts at two or three, use exponential backoff with jitter so clients don't retry in synchronised waves, and honour Retry-After.</p>
+  <p>To avoid retry storms, retry at a single layer, limit retries with a token-bucket budget, and consider a circuit breaker or a fallback if the dependency is often down for long periods.</p>
+</InterviewCard>

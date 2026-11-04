@@ -1,0 +1,133 @@
+export const meta = {
+  summary: "When more work arrives than a system can do, something has to give. Bounded queues push back, load shedding says no early and cheaply, and priorities decide who gets served.",
+  uses: ["03.09", "03.06", "02.06"],
+  usedIn: ["03.12", "14.03"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.09" />. Retries add load exactly when a system is struggling; this lesson is about the server's side
+  of that story.
+</BeforeYouStart>
+
+## The problem: too much at once
+
+A celebrity posts a Snip link to 50 million followers, and redirects jump to three times Snip's usual peak. Snip can
+add servers, but that takes minutes, and the spike is now.
+
+Without a plan, here's what happens. Requests arrive faster than servers finish them, so they <Term t="message-queue">queue</Term>. Each request
+waits longer, until it's waiting longer than the client's timeout. The client gives up and retries, adding more load.
+The server eventually reaches each abandoned request and does the full work anyway, for nobody. It's **busy at
+100%**, and almost **none of its work is useful**.
+
+That's the key distinction:
+
+- **Throughput** is how many requests a second the server handles.
+- **Goodput** is how many it handles **in time for the client to use the answer**.
+
+Past capacity, throughput can stay high while goodput collapses towards zero. The goal of this lesson is to keep
+goodput at capacity even when demand is far beyond it.
+
+## Backpressure: bounded queues
+
+Every queue in a system should have a **limit**. When it's full, the producer is told so, and slows down or fails
+fast, instead of the queue growing without end. That push upstream is **backpressure**.
+
+- A server's request queue that's full answers new requests with `503` straight away.
+- A job queue that's full makes producers wait, or reject new jobs, instead of holding hours of backlog.
+- A client that sees backpressure (a `503` or `429`, maybe with `Retry-After`) backs off (<L id="03.09" />).
+
+Unbounded queues feel safe ("we never drop anything!"), but all they do is turn an overload into very high latency
+and, eventually, running out of memory.
+
+## Load shedding: say no early and cheaply
+
+**Load shedding** is a server deciding, as each request arrives, whether it has room to serve it well. If not, it
+rejects it immediately with a cheap error, before doing any real work. A rejected request costs microseconds; an
+accepted one that times out costs the full work and helps nobody.
+
+Common signals for "no room": too many requests in progress, a queue past its limit, CPU above a threshold, or
+recent latency climbing towards the timeout.
+
+## Not all requests are equal
+
+When you must turn some work away, choose which. Snip ranks its traffic:
+
+| Priority | Traffic | Why |
+| --- | --- | --- |
+| 1 | <Term t="load-balancer">Load balancer</Term> <Term t="health-check">health checks</Term> | Fail these and the load balancer removes the server, making everything worse. |
+| 2 | Redirects | The core promise; every failed redirect is a broken link on someone else's site. |
+| 3 | Creating links | Important, but a short delay is tolerable, and clients can retry with <Term t="idempotent">idempotency</Term> keys. |
+| 4 | Dashboard and stats | Owners can wait a minute. |
+| 5 | Bulk exports and reports | Can be paused entirely during a spike. |
+
+As load rises, Snip sheds from the bottom of the table up.
+
+## Don't work on requests nobody is waiting for
+
+Two more habits keep goodput high:
+
+- **Deadlines.** The client sends how long it will wait (or each hop passes on the time remaining). A server that
+  picks up a request whose deadline has already passed drops it instead of doing it. A request halfway through that
+  runs out of time stops early.
+- **Graceful degradation.** Instead of failing outright, return something cheaper: a cached stats page from a minute
+  ago, the dashboard without its live counter, the redirect without recording the click.
+
+<Analogy>
+  **A restaurant on a packed night.** A good host says "the wait is two hours" at the door, rather than seating everyone and letting the kitchen drown so that nobody's food arrives hot. Diners who already have a table are served first, takeaway orders are paused, and the dessert menu might be trimmed. Saying no at the door is what keeps the dining room working.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Builders' Library"
+    year={2019}
+    href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/"
+    source="Using load shedding to avoid overload"
+    found="Shedding excess load keeps goodput high; prioritise the requests that matter and drop ones whose clients have already given up."
+  >
+    Amazon distinguishes throughput, all the requests sent to a server, from goodput, those handled without errors and
+    fast enough for the client to use. A server near overload should reject excess requests so that it can reply to the
+    ones it accepts before the client times out. The article names the load balancer's ping as the most important
+    request a server receives, and describes passing the remaining time between hops so servers can stop work on
+    requests that are already doomed.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's redirect servers are overloaded. Each request now queues for 3 seconds; clients time out after 1 second. CPU is at 100%. How much useful work are the servers doing?"
+  options={[
+    { text: "As much as ever: CPU is at 100%", why: "The CPU is busy, but on requests whose clients gave up seconds ago. Throughput is high; goodput is close to zero." },
+    { text: "Almost none: nearly every answer arrives after its client has stopped waiting", correct: true, why: "Bound the queue and shed early: rejecting the excess immediately lets the servers answer the requests they accept within a second, restoring goodput to full capacity." },
+    { text: "About a third, since one in three requests finishes within a second", why: "With a 3-second wait for everyone, almost no request finishes within a second." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Unbounded queues.** They hide overload as latency, then run out of memory. Set limits and reject when full.</li>
+    <li>**Shedding health checks.** Failing them makes the load balancer remove servers, concentrating load on fewer. Serve them first.</li>
+    <li>**Treating all traffic the same.** Decide in advance what to drop first, so the core feature survives.</li>
+    <li>**Finishing doomed requests.** If the client has given up, stop. Pass deadlines along each hop.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Past capacity, throughput can stay high while goodput (useful, on-time answers) collapses.</li>
+    <li>Bound every queue; when full, push back upstream instead of growing.</li>
+    <li>Shed load early and cheaply, lowest priority first; keep health checks and core requests.</li>
+    <li>Pass deadlines along and drop requests nobody is waiting for; degrade gracefully where you can.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Your service gets three times its capacity in traffic for ten minutes. What should happen?", level: "Senior", frequency: 2, importance: "Must-know", kind: "Scenario" }}
+  followUps={["How does the server decide it's overloaded?", "What should clients do when they get a 503?"]}
+>
+  <p>The service should keep serving as many requests as it can within their deadlines, and quickly reject the rest, rather than accepting everything and timing out on all of it. That means bounded queues, admission control based on in-flight requests or latency, and cheap 503s with Retry-After for rejected work. I'd shed by priority: health checks and core user-facing requests last, background and bulk work first, and degrade features where possible, like serving cached data.</p>
+  <p>Deadlines should propagate so no hop works on requests the client has abandoned, clients should retry with backoff, jitter and a retry budget, and autoscaling adds capacity over the following minutes.</p>
+</InterviewCard>

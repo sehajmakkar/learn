@@ -1,0 +1,138 @@
+export const meta = {
+  summary: "Follow one click on a Snip link from the browser to the server and back: DNS, TCP, TLS and HTTP, and what each costs in round trips.",
+  uses: ["01.04", "02.05"],
+  usedIn: ["03.02", "03.06", "03.12"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.04" /> for round-trip times. It also helps to have seen <L id="02.05" />, since <Term t="cdn">CDNs</Term> exist to cut the
+  round trips this lesson counts.
+</BeforeYouStart>
+
+## One click, many steps
+
+Someone in Berlin clicks `https://snip.link/x7Kp`. Snip's servers spend about 5 ms finding the long URL. Yet the
+person waits several hundred milliseconds before anything happens. Almost all of that time is spent **setting up the
+conversation**, not having it.
+
+Four protocols take turns, each building on the one before:
+
+| Step | Protocol | The question it answers |
+| --- | --- | --- |
+| 1 | **DNS** | Which IP address is `snip.link`? |
+| 2 | **<Term t="tcp">TCP</Term>** | Can we open a reliable connection to that address? |
+| 3 | **TLS** | Is this really Snip, and can we talk privately? |
+| 4 | **HTTP** | Where does `/x7Kp` go? |
+
+## Step through it
+
+Here's the first click from a browser that has never visited Snip, with Snip's servers about 100 ms round trip away:
+
+<Sequence
+  title="A first click on a Snip link"
+  walk
+  participants={[{ id: "b", label: "Browser" }, { id: "r", label: "DNS resolver" }, { id: "ns", label: "Name servers" }, { id: "s", label: "Snip" }]}
+  messages={[
+    { from: "b", to: "r", label: "snip.link?", explain: "The browser and operating system check their own caches first. Nothing there, so they ask a DNS resolver, usually run by the internet provider or a public service." },
+    { from: "r", to: "ns", label: "root → .link → snip.link", explain: "If the resolver hasn't cached the answer, it asks the root servers who handles .link, then the .link servers who handles snip.link, then Snip's own name servers. Each hop can be a round trip." },
+    { from: "ns", to: "r", label: "203.0.113.10, TTL 300", reply: true, explain: "Snip's name servers answer with an IP address and a TTL: how many seconds the answer may be cached. Here, five minutes." },
+    { from: "r", to: "b", label: "203.0.113.10", reply: true, explain: "The resolver passes the answer on and keeps it, so the next person using this resolver skips the lookup." },
+    { from: "b", to: "s", label: "TCP SYN", explain: "Now the browser opens a TCP connection: a three-way handshake (SYN, SYN-ACK, ACK) that costs one round trip before any data can flow." },
+    { from: "s", to: "b", label: "SYN-ACK", reply: true, explain: "The server agrees. One round trip gone: about 100 ms." },
+    { from: "b", to: "s", label: "TLS ClientHello", explain: "Next, TLS. The browser proposes encryption settings and a key share." },
+    { from: "s", to: "b", label: "certificate, key share", reply: true, explain: "The server proves it owns snip.link with a certificate and completes the key exchange. With TLS 1.3 this is one more round trip; older TLS 1.2 needed two." },
+    { from: "b", to: "s", label: "GET /x7Kp", explain: "Finally the actual request, encrypted." },
+    { from: "s", to: "b", label: "302 Location: …", reply: true, explain: "Snip spends about 5 ms on the lookup and answers. Then the browser does this whole dance again for the long URL's site." },
+  ]}
+/>
+
+Count the round trips: one or more for DNS, one for TCP, one for TLS, one for the request. At 100 ms each that's
+**400 ms or more** for 5 ms of real work, before the browser even starts on the destination site.
+
+## The second click is much cheaper
+
+Almost every step has a <Term t="cache">cache</Term> or a reusable result:
+
+- **DNS answers are cached** by the browser, the operating system and the resolver, for as long as the <Term t="ttl">TTL</Term> allows.
+- **Connections are kept open.** HTTP keep-alive lets the browser reuse the TCP and TLS connection for later
+  requests, so it pays the handshakes once.
+- **TLS sessions can resume**, skipping some of the work on reconnect.
+
+So a returning visitor's click often costs a single round trip. That's why the first visit to a site feels slower
+than the rest, and why benchmarks that only measure warm connections can mislead.
+
+<Analogy>
+  **Making a phone call to a business.** You look up the number (DNS), dial and wait for someone to pick up (TCP), confirm you're talking to the right company and agree to speak privately (TLS), and only then ask your question (HTTP). Calling the same person back later is quicker: you already have the number, and if they kept the line open, you just keep talking.
+</Analogy>
+
+## What this means for design
+
+- **Round trips, not bandwidth, dominate small requests.** Snip's redirect is a few hundred bytes. Making it faster
+  means fewer or shorter round trips: keep connections open, and put servers closer (<L id="02.05" />).
+- **DNS TTLs decide how fast you can move.** If Snip's record has a TTL of a day and you move to new servers, some
+  users keep going to the old address for up to a day. Teams lower the TTL ahead of a planned move, then raise it
+  again afterwards.
+- **DNS can send users to different places.** Many services answer the same name with different addresses depending
+  on where the user is, or which servers are healthy. It's a coarse form of load balancing (<L id="03.06" />), limited
+  by caching: a change only takes effect as caches expire.
+- **DNS is part of your availability.** If nobody can look up your name, it doesn't matter that every server is up.
+  That's why serious services use more than one DNS provider or name server location.
+
+Newer HTTP versions cut the setup cost further. HTTP/2 sends many requests over one connection at once, and HTTP/3
+runs over <Term t="quic">QUIC</Term>, which combines the transport and encryption handshakes into one round trip. That's
+<L id="03.02" />.
+
+<SeenInProduction>
+  <Seen
+    company="Meta"
+    system="DNS and backbone"
+    year={2021}
+    href="https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/"
+    source="More details about the October 4 outage"
+    found="Servers that were running fine became unreachable because nobody could look up their names."
+  >
+    During routine maintenance, a command meant to assess Facebook's backbone capacity took down every connection in
+    the backbone, and a bug in an audit tool failed to stop it. Facebook's DNS servers are built to stop advertising
+    themselves when they can't reach the data centres, so they did, and became unreachable even though they were still
+    running. Recovery was slow because the same failure broke internal tools, and engineers had to go on site to
+    secured data centres.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip moves to a new hosting provider and updates its DNS record to the new IP address. The old record had a TTL of 86,400 seconds. What happens?"
+  options={[
+    { text: "Everyone switches to the new servers within a minute", why: "Resolvers and browsers that cached the old answer keep using it until it expires." },
+    { text: "Some users keep reaching the old servers for up to a day, so the old ones must keep running", correct: true, why: "86,400 seconds is a day. The usual practice is to lower the TTL to a few minutes a day or more before the move, then switch." },
+    { text: "Users get an error until DNS updates", why: "Cached answers still point at the old address, which works as long as the old servers are up." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Ignoring setup cost.** A 5 ms handler behind three handshakes across an ocean is a 400 ms request. Measure from the user's side.</li>
+    <li>**Long DNS TTLs before a move.** Lower them well ahead of time, or old caches keep sending traffic to old servers.</li>
+    <li>**Treating DNS as someone else's problem.** If your name doesn't resolve, your whole service is down.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A first request costs a DNS lookup, a TCP handshake, a TLS handshake, then the HTTP request: several round trips.</li>
+    <li>Caching DNS answers and reusing connections makes later requests far cheaper.</li>
+    <li>DNS TTLs control how quickly traffic moves when you change an address.</li>
+    <li>DNS is part of your availability; if names don't resolve, nothing works.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What happens when you type a URL into a browser and press Enter?", level: "Junior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Which of those steps can be cached or skipped on the next request?", "Where would you look if the first request is slow but later ones are fast?"]}
+>
+  <p>The browser resolves the hostname to an IP address with DNS, checking its own cache and the operating system's, then asking a recursive resolver, which may walk from the root servers to the top-level domain's servers to the site's own name servers. It opens a TCP connection with a three-way handshake, then a TLS handshake to verify the certificate and agree on keys, one round trip in TLS 1.3. Then it sends the HTTP request and the server responds; the browser parses the HTML and fetches the other resources it references, usually reusing the connection.</p>
+  <p>On later requests, DNS answers are cached for their TTL and the connection is kept alive, so most of the setup round trips disappear.</p>
+</InterviewCard>

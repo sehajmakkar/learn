@@ -1,0 +1,142 @@
+export const meta = {
+  summary: "A reverse proxy stands in front of your servers; an API gateway is one that also handles the jobs every API needs. What belongs there, and what doesn't.",
+  uses: ["03.06", "02.03"],
+  usedIn: ["03.08", "03.11"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.06" />. A <Term t="layer-7">layer 7</Term> <Term t="load-balancer">load balancer</Term> is already a reverse proxy; this lesson looks at the other jobs that
+  layer can do.
+</BeforeYouStart>
+
+## Forward and reverse proxies
+
+A **proxy** is a server that passes requests along on someone's behalf. Which side it works for gives it its name:
+
+- A **forward proxy** works for **clients**. A company's office proxy sends employees' requests out to the internet,
+  filtering or logging them on the way. The websites see the proxy, not the employees.
+- A **reverse proxy** works for **servers**. Clients send requests to it thinking it's the site; it passes them to
+  the real servers behind it. The clients see the proxy, not the servers.
+
+Every load balancer from <L id="03.06" /> that reads HTTP is a reverse proxy. Common software for the job includes
+nginx, HAProxy and Envoy, and every cloud provider sells a managed one.
+
+## Jobs a reverse proxy does well
+
+Because every request passes through it, a reverse proxy is a natural home for work that's the **same for every
+request**, so each application doesn't have to do it:
+
+| Job | What it means |
+| --- | --- |
+| **<Term t="tls">TLS</Term> termination** | Decrypt once at the edge; certificates live in one place. |
+| **Load balancing and <Term t="health-check">health checks</Term>** | <L id="03.06" />. |
+| **Compression** | Gzip or Brotli responses on the way out. |
+| **<Term t="cache">Caching</Term>** | Keep copies of cacheable responses, like a small <Term t="cdn">CDN</Term> in your own datacenter. |
+| **Connection handling** | Hold thousands of slow client connections and keep a small pool of fast ones to the app. |
+| **Request limits** | Reject huge bodies, slow uploads and malformed requests before they reach the app. |
+| **Request IDs and logs** | Tag each request with an ID and log it uniformly. |
+
+## API gateways
+
+An **API gateway** is a reverse proxy that also handles the cross-cutting jobs of an **API**:
+
+- **Authentication**: check the API key or token once, and pass the caller's identity to the services behind.
+- **Rate limiting**: each key gets so many requests a minute; the rest get `429` (designed fully in <L id="14.03" />).
+- **Routing to services**: `/links/*` to the links service, `/stats/*` to the stats service, so clients see one API
+  even when there are many services behind it.
+- **Request shaping**: version routing, adding or stripping headers, sometimes combining several calls into one.
+- **Usage metering**: counting calls per key for billing and dashboards.
+
+<Arch
+  title="Snip's public API behind a gateway"
+  nodes={[
+    { id: "dev", label: "Developers", kind: "client", sub: "API keys", x: 0, y: 1 },
+    { id: "gw", label: "API gateway", kind: "lb", sub: "auth, limits", x: 1, y: 1 },
+    { id: "keys", label: "Key store", kind: "cache", x: 1, y: 0 },
+    { id: "links", label: "Links service", kind: "service", x: 2.4, y: 0.5 },
+    { id: "stats", label: "Stats service", kind: "service", x: 2.4, y: 1.5 },
+  ]}
+  edges={[
+    { from: "dev", to: "gw" },
+    { from: "gw", to: "keys", label: "check key" },
+    { from: "gw", to: "links", label: "/links/*" },
+    { from: "gw", to: "stats", label: "/stats/*" },
+  ]}
+  steps={[
+    { caption: "A developer's request arrives with an API key. The gateway terminates TLS and assigns a request ID.", edges: ["dev>gw"] },
+    { caption: "It looks the key up (cached in memory) to find the account, and checks the account's rate limit. Over the limit means a 429 here, before any service does work.", edges: ["gw>keys"] },
+    { caption: "It routes by path. The services receive a verified account ID in a header, so none of them parse API keys.", edges: ["gw>links", "gw>stats"] },
+  ]}
+  caption="Redirects don't go through the gateway: they need no API key, and every extra hop on the busiest path costs latency."
+/>
+
+<Analogy>
+  **A hotel reception desk.** Guests don't wander the corridors looking for housekeeping or the restaurant. Reception checks who you are once, answers the simple questions itself, and sends each request to the right department. The departments trust that anyone reception sent along is a real guest.
+</Analogy>
+
+## What doesn't belong in the gateway
+
+A gateway sees every request, so it's tempting to put logic there. Resist:
+
+- **Business logic.** "Free accounts can't create custom codes" belongs in the links service. Logic in the gateway is
+  hidden from the team that owns the feature and is shared by every route, so every change is risky.
+- **Slow work.** Everything the gateway does adds latency to every request. Keep checks to in-memory lookups.
+- **Being a single point of failure.** Run several instances behind a layer 4 or managed load balancer, like any other
+  stateless tier.
+
+A good rule: the gateway handles **who you are and how much you may call**; services handle **what you may do**.
+
+<SeenInProduction>
+  <Seen
+    company="Cloudflare"
+    system="Pingora"
+    year={2022}
+    href="https://blog.cloudflare.com/how-we-built-pingora-the-proxy-that-connects-cloudflare-to-the-internet/"
+    source="How we built Pingora, the proxy that connects Cloudflare to the Internet"
+    found="At reverse-proxy scale, connection reuse is a big lever: sharing connection pools cut new connections, CPU and latency."
+  >
+    Cloudflare replaced NGINX with Pingora, its own proxy in Rust, serving over a trillion requests a day. A key
+    reason was connection reuse: NGINX's connection pools are per worker process, so connections to origins were
+    scattered and reused less. Pingora shares pools across threads. Cloudflare reported about 70% less CPU and 67% less
+    memory for the same traffic, a third as many new connections per second, and a 5 ms lower median time to first
+    byte.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's links service and stats service both check API keys and rate limits, with slightly different code. What's the main benefit of moving that into an API gateway?"
+  options={[
+    { text: "Requests get faster, because the gateway is closer to users", why: "The gateway is an extra hop, not a shortcut. Any speed-up comes from rejecting bad requests earlier, not from location." },
+    { text: "Authentication and limits happen once, the same way, for every route, and services receive a verified identity", correct: true, why: "Cross-cutting concerns in one place means one implementation to secure and change, and over-limit requests are rejected before any service does work." },
+    { text: "The services no longer need their own access rules", why: "They still decide what an identified account may do. The gateway answers 'who is this and may they call at all'." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Business rules in the gateway.** They end up far from the team that owns them, and every change risks every route.</li>
+    <li>**Putting the busiest path through every layer.** Snip's redirects skip the gateway; check which features actually need it.</li>
+    <li>**One gateway instance.** It's on the path of every API request; run it redundantly.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A forward proxy acts for clients; a reverse proxy acts for servers. Layer 7 load balancers are reverse proxies.</li>
+    <li>Reverse proxies do per-request chores: TLS, compression, caching, connection handling, limits, logging.</li>
+    <li>An API gateway adds API concerns: authentication, rate limiting, routing to services, metering.</li>
+    <li>Keep business logic and slow work out of it, and run it redundantly.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is an API gateway, and what would you put in it?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What's the difference between an API gateway and a load balancer?", "What are the risks of a gateway?"]}
+>
+  <p>An API gateway is a reverse proxy in front of a set of services that gives clients one entry point and handles cross-cutting concerns: TLS termination, authentication of API keys or tokens, rate limiting, routing requests to the right service, request IDs and logging, and usage metering. Services behind it receive an already-verified identity.</p>
+  <p>I'd keep business logic out of it, since it should be owned by the service teams, and keep everything it does fast, because it adds latency to every request. It must run as several instances so it isn't a single point of failure.</p>
+</InterviewCard>

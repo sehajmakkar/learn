@@ -54,7 +54,7 @@ for a few seconds after a user writes, send that user's reads to the primary.
 ## Fix 2: a cache
 
 A **cache** keeps copies of frequently read data in memory, in a store like Redis or Memcached. Reading memory takes
-about 100 ns, while a database query costs a network round trip plus index and disk work (<L id="01.04" />), and the
+about 100 ns, while a database query costs a network <Term t="round-trip">round trip</Term> plus index and disk work (<L id="01.04" />), and the
 cache can serve far more lookups per machine.
 
 Snip uses the most common pattern, **cache-aside**: the app checks the cache first, and only on a miss asks the

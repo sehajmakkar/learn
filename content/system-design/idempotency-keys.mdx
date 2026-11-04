@@ -1,0 +1,159 @@
+export const meta = {
+  summary: "Retries are only safe if doing something twice has the same effect as doing it once. Idempotency keys make that true for 'create' and 'charge' calls.",
+  uses: ["03.08", "03.09", "03.04"],
+  usedIn: ["07.03", "15.01"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.09" />. It said "only retry what can safely be repeated". This lesson makes more things safe to repeat.
+</BeforeYouStart>
+
+## The problem: the duplicate link
+
+A developer's script calls Snip's <Term t="api">API</Term> to create a short link for each of 10,000 products. One request reaches Snip,
+the link is created, and the response is lost to a network blip. The script times out and, following good practice
+from the last lesson, retries. Snip creates a **second** link for the same product.
+
+For Snip that's untidy. For a payment API it's a customer charged twice. The client did the right thing; the API made
+the retry unsafe.
+
+An operation is **idempotent** if doing it twice has the same effect as doing it once. Reading is idempotent.
+"Set the link's target to X" is idempotent. "Delete link x7Kp" is idempotent: it's gone either way. "Create a link"
+and "charge £20" are not: each call does it again. The fix is to give the server a way to recognise the retry.
+
+## Idempotency keys
+
+The client generates a unique key for each **logical operation** (a random <Term t="uuid">UUID</Term> is typical) and sends it with the
+request. Retries of the same operation send the **same key**:
+
+```http
+POST /links
+Idempotency-Key: 5f1c9a2e-7b41-4d0e-9a8f-0c3e6d2b1a77
+{ "long_url": "https://shop.example/products/4471" }
+```
+
+The server remembers each key it has seen, with the response it gave:
+
+<Sequence
+  title="A retried create, with an idempotency key"
+  walk
+  participants={[{ id: "c", label: "Client" }, { id: "api", label: "Snip API" }, { id: "db", label: "Database" }]}
+  messages={[
+    { from: "c", to: "api", label: "POST /links, key K", explain: "The first attempt carries key K." },
+    { from: "api", to: "db", label: "insert link + record K", explain: "In one transaction, Snip creates the link and records key K with the response it's about to send: 201 and code b2Qe." },
+    { from: "api", to: "c", label: "201 b2Qe", reply: true, fail: true, explain: "The response is lost on the way back." },
+    { from: "c", to: "api", label: "POST /links, key K (retry)", explain: "The client times out and retries with the same key." },
+    { from: "api", to: "db", label: "look up K", explain: "Snip finds key K already recorded, with the same request body." },
+    { from: "api", to: "c", label: "201 b2Qe (saved)", reply: true, explain: "It returns the saved response instead of creating another link. The client sees one link, whatever happened in between." },
+  ]}
+/>
+
+## Getting the details right
+
+The idea is simple; the edge cases are where implementations go wrong:
+
+- **Record the key and the effect together.** If the link is created but the key isn't recorded (or the reverse), a
+  retry does the wrong thing. Write both in the **same database transaction**.
+- **Same key, different request.** If a client reuses a key with a different body, it's a bug on their side. Store a
+  fingerprint of the request with the key, and return an error rather than guessing.
+- **Two attempts at once.** A fast retry can arrive while the first attempt is still running. The first attempt
+  claims the key (a unique constraint does this), and the second gets a `409` "still in progress" and retries later.
+- **How long to remember.** Keys only need to outlive the client's retries. A day is common; after that keys can be
+  deleted.
+- **Scope keys to the caller.** Two different accounts may pick the same key by chance. Store it per account.
+
+A minimal table:
+
+```sql
+CREATE TABLE idempotency_keys (
+  account_id    bigint      NOT NULL,
+  key           text        NOT NULL,
+  request_hash  bytea       NOT NULL,   -- reject reuse with a different body
+  status        int,                    -- null while the first attempt is in progress
+  response      jsonb,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, key)
+);
+```
+
+<Analogy>
+  **A cloakroom ticket.** You hand in your coat and get ticket 47. If you come back and show ticket 47 twice, you don't get two coats; the attendant sees it's already been handled. The ticket number, not the request, is what makes the second visit harmless.
+</Analogy>
+
+## Other ways to be idempotent
+
+Keys aren't the only tool. Often the cleanest fix is to change the operation itself:
+
+- **Let the client choose the ID.** `PUT /links/{id}` with a client-generated ID: a retry writes the same row again.
+- **Unique constraints.** If each product may have one link, a unique index on `(account, product_id)` turns a
+  duplicate into a clean "already exists" answer.
+- **Set, don't add.** "Set the count to 18,431" can be repeated; "add 1" can't. <Term t="message-queue">Queue</Term> consumers (<L id="07.03" />)
+  use the same idea, recording which messages or batches they've already applied.
+
+<SeenInProduction>
+  <Seen
+    company="Stripe"
+    system="Idempotent requests"
+    year={2017}
+    href="https://stripe.com/blog/idempotency"
+    source="Designing robust and predictable APIs with idempotency"
+    found="Payments APIs make retries safe with a client-supplied key, and the server replays the saved result."
+  >
+    Stripe's API accepts an `Idempotency-Key` header on its mutating (`POST`) endpoints. If an operation succeeded but
+    the client didn't get the result, a retry with the same key gets the saved result instead of a second charge.
+    Stripe's documentation adds that keys can be pruned after they're at least 24 hours old, and that a retry with the
+    same key but different parameters returns an error. Its client libraries retry automatically with <Term t="backoff">backoff</Term>, <Term t="jitter">jitter</Term>
+    and a key.
+  </Seen>
+  <Seen
+    company="Amazon"
+    system="Builders' Library"
+    year={2019}
+    href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/"
+    source="Making retries safe with idempotent APIs"
+    found="Record the caller's token and the change atomically, and treat the same token with different parameters as an error."
+  >
+    AWS APIs such as EC2's take a caller-provided client request token. Requests from the same caller with the same
+    token are treated as duplicates and get an equivalent response, not an error. The token and the change must be
+    recorded atomically, and the service stores the original parameters so that a reused token with different
+    parameters is rejected with a validation error.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A client sends POST /links with key K. While Snip is still processing it, a retry with key K arrives. What should Snip do?"
+  options={[
+    { text: "Process the retry too; the key check happens after the insert", why: "Then two links get created: exactly what the key was meant to prevent." },
+    { text: "Return 409 'in progress' for the retry, because the first attempt has already claimed K", correct: true, why: "Claiming the key first (with a unique constraint) means only one attempt does the work. The client retries later and gets the saved response." },
+    { text: "Return 400, because keys can't be reused", why: "Reusing a key for the same operation is the whole point. Only reuse with a different request body is an error." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Recording the key separately from the effect.** A crash between the two leaves them out of step. Use one transaction.</li>
+    <li>**A new key per retry.** The key identifies the operation, not the attempt. Generate it once, before the first try.</li>
+    <li>**Global keys.** Scope them per account so different callers can't collide.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Idempotent: doing it twice has the same effect as once. Creates and charges usually aren't.</li>
+    <li>An idempotency key names one logical operation; the server saves the result and replays it for retries.</li>
+    <li>Record key and effect in one transaction, reject reuse with a different body, and handle concurrent attempts.</li>
+    <li>Client-chosen IDs, unique constraints and "set, don't add" can make operations idempotent without keys.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you prevent a payment from being charged twice when the client retries?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["What if the retry arrives while the first request is still running?", "How long would you keep the keys?"]}
+>
+  <p>Have the client generate an idempotency key per payment attempt and send it with every retry. The server stores the key, scoped to the account, along with a hash of the request and the eventual response. On a new key it claims the key with a unique insert, performs the charge, and saves the response in the same transaction as the charge record. On a repeated key with the same request it returns the saved response; with a different request it returns an error.</p>
+  <p>If the first attempt is still in progress, the retry gets a conflict and tries again later. Keys are kept long enough to cover the client's retry window, typically around a day.</p>
+</InterviewCard>

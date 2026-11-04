@@ -1,0 +1,137 @@
+export const meta = {
+  summary: "Once a system is several services, every call between them can fail in ways a function call can't. Sync versus async, finding each other, and the call that may or may not have happened.",
+  uses: ["03.03", "03.07", "02.06", "01.03"],
+  usedIn: ["03.09", "03.10", "08.01"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.03" /> for <Term t="grpc">gRPC</Term> and <L id="02.06" /> for queues. The "parts in a chain multiply" rule from
+  <L id="01.03" /> comes back here.
+</BeforeYouStart>
+
+## A function call that crosses a network
+
+As Snip grows, its team splits the app into services: a **links** service that owns links, a **redirect** service on
+the hot path, and a **stats** service that owns counts. Now, when the dashboard needs a link and its stats, one
+service calls another over the network.
+
+It looks like a function call. It isn't. A local call either returns or throws. A network call goes through many
+steps, and **any of them can fail**: the request may not arrive, the server may crash halfway, the reply may be lost.
+The nastiest case is when the caller hears nothing at all:
+
+<Sequence
+  title="The call that may or may not have happened"
+  walk
+  participants={[{ id: "app", label: "Dashboard API" }, { id: "links", label: "Links service" }, { id: "db", label: "Its database" }]}
+  messages={[
+    { from: "app", to: "links", label: "DeleteLink(x7Kp)", explain: "The dashboard asks the links service to delete a link, and starts a 1-second timer." },
+    { from: "links", to: "db", label: "DELETE x7Kp", explain: "The links service deletes the row. The work is done." },
+    { from: "db", to: "links", label: "ok", reply: true, explain: "The database confirms." },
+    { from: "links", to: "app", label: "ok", reply: true, fail: true, explain: "The reply is lost: a network blip, or the links service is paused for garbage collection past the timeout." },
+    { note: "1 second passes: timeout", over: ["app"] },
+    { from: "app", to: "app", label: "unknown outcome", explain: "The caller can't tell 'never happened' from 'happened, reply lost'. It must decide what to do without knowing. Retrying a delete is harmless; retrying a 'create' or a 'charge' might not be." },
+  ]}
+/>
+
+Every design for service calls has to answer: **what do we do when the outcome is unknown?** The next two lessons
+(<L id="03.09" /> and <L id="03.10" />) are the standard answers: retry carefully, and make retries safe.
+
+## Sync or async?
+
+There are two basic ways for one service to involve another:
+
+- **Synchronous request–response** (HTTP, gRPC): call and wait for the answer. Simple to reason about, and the only
+  option when you need the answer to continue. But the caller is now only as available and as fast as everything it
+  calls.
+- **Asynchronous messages** (a <Term t="message-queue">queue</Term> or event log, <L id="02.06" />): publish "link x7Kp was deleted" and carry on.
+  Whoever cares (stats, search, billing) reacts in their own time. The publisher doesn't depend on them being up, at
+  the cost of results arriving later.
+
+A useful default: **ask synchronously when you need the answer now; announce asynchronously when others need to know
+something happened.** Snip's dashboard asks the links service for a link (sync). When a link is deleted, the links
+service publishes an event, and stats and the redirect <Term t="cache">cache</Term> react to it (async).
+
+## Chains multiply
+
+Each synchronous hop adds its latency and its failure chance:
+
+| Calls in a chain, each 99.9% available and 5 ms at p50 | Availability | Typical latency |
+| --- | --- | --- |
+| 1 | 99.9% | 5 ms |
+| 3 | 99.7% | 15 ms |
+| 10 | 99.0% | 50 ms |
+
+And the slowest call in any chain sets the pace (<L id="03.12" />). So keep synchronous chains short: fetch in
+parallel where you can, cache answers that rarely change, and move anything that doesn't need an answer to async
+events.
+
+## Finding each other
+
+Services run on many machines that come and go. A caller needs to find a healthy instance:
+
+- **<Term t="dns">DNS</Term> or a virtual address**: call `links.internal`, which resolves to a <Term t="load-balancer">load balancer</Term> or a set of instances.
+  Simple; updates are only as fast as DNS caching allows.
+- **A service registry**: instances register themselves and send heartbeats; callers (or their proxies) ask the
+  registry for the current list and balance across it themselves.
+- **A service mesh**: a small proxy runs next to every service instance (a "sidecar") and handles discovery, load
+  balancing, retries, timeouts, encryption between services and metrics, so each service just calls `localhost`.
+  It gives consistent behaviour everywhere, at the cost of an extra hop per call and a lot of infrastructure to run.
+
+<Analogy>
+  **Asking a colleague versus posting in the team channel.** If you need an answer before you can continue, you call them and wait (sync), and you're stuck if they're out. If you're just letting people know something happened, you post it in the channel (async) and get on with your day; each person reads it when they can.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Builders' Library"
+    year={2019}
+    href="https://aws.amazon.com/builders-library/challenges-with-distributed-systems/"
+    source="Challenges with distributed systems"
+    found="One request–reply has eight steps that can each fail, and a timeout leaves the result unknown, which code must handle."
+  >
+    Amazon's article breaks a single request and reply into eight steps: the client posts the request, the network
+    delivers it, the server validates it and updates its state, then posts a reply, which is delivered, validated and
+    acted on by the client. Each step can fail independently. When the client times out, the result is "UNKNOWN": the
+    request may have succeeded, failed, or been received but not processed, and the client must handle that case
+    correctly.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="When a Snip link is deleted, the stats service should stop showing it and the redirect cache should drop it. The delete request shouldn't fail just because stats is down. How should the links service tell them?"
+  options={[
+    { text: "Call both synchronously and fail the delete if either call fails", why: "That makes deleting a link only as available as the least available of three services, for work the owner doesn't need to wait for." },
+    { text: "Publish a 'link deleted' event that both consume", correct: true, why: "The delete succeeds on its own; stats and the cache catch up when they process the event, even if one is down for a while. They need to handle seeing an event twice." },
+    { text: "Have stats and the cache poll the links service every second for deletions", why: "It works, but it's a lot of load and delay to reinvent what an event does directly." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Treating a remote call like a local one.** It can be slow, fail, or leave you not knowing what happened. Plan for all three.</li>
+    <li>**Long synchronous chains.** Each hop multiplies failure and adds latency. Parallelise, cache, or go async.</li>
+    <li>**Calls with no timeout.** One stuck dependency can tie up every thread in the caller. <L id="03.09" /> covers this.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A network call has many steps that can fail; a timeout leaves the outcome unknown.</li>
+    <li>Ask synchronously when you need the answer; announce asynchronously when others need to know.</li>
+    <li>Synchronous chains multiply failures and add up latency. Keep them short.</li>
+    <li>Services find each other via DNS, a registry, or a service mesh of sidecar proxies.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "When should one service call another synchronously, and when should it use events?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What happens to availability as a synchronous call chain grows?", "What do consumers of events need to be careful about?"]}
+>
+  <p>Synchronously when the caller needs the answer to continue, such as fetching data to render a response or validating something before accepting a request. Asynchronously when the caller is announcing that something happened and other services need to react, such as updating search, analytics or caches after a change.</p>
+  <p>Synchronous calls couple availability and latency: a chain of services that are each 99.9% available is less available than any one of them, and the slowest call sets the pace. Events decouple the publisher from consumers being up, but results arrive later, and consumers must handle duplicates and out-of-order events.</p>
+</InterviewCard>

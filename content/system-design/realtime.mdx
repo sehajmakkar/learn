@@ -1,0 +1,172 @@
+export const meta = {
+  summary: "Getting updates to a browser as they happen: polling, long polling, server-sent events and WebSockets, and what it takes to hold millions of open connections.",
+  uses: ["03.01", "03.02", "02.03"],
+  usedIn: ["07.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.01" /> for connections and <L id="02.03" /> for <Term t="stateless">stateless</Term> servers. Long-lived connections bend that
+  "stateless" rule, and this lesson shows how to cope.
+</BeforeYouStart>
+
+## The problem: HTTP only answers questions
+
+Snip adds a live counter to the dashboard: during a product launch, an owner wants to watch clicks tick up as they
+happen. But plain HTTP is request and response. The server can only speak when the browser asks. How does the
+server tell the browser "another click just happened"?
+
+There are four standard answers, from simplest to most capable.
+
+## 1. Polling
+
+The browser asks every few seconds: "any new clicks?"
+
+```text
+GET /links/x7Kp/stats   → { clicks: 18420 }
+… 5 seconds later …
+GET /links/x7Kp/stats   → { clicks: 18420 }      nothing new
+… 5 seconds later …
+GET /links/x7Kp/stats   → { clicks: 18431 }
+```
+
+Dead simple, works everywhere, and uses ordinary stateless servers and <Term t="cache">caches</Term>. But updates are up to one interval
+late, and most requests come back with nothing new. A thousand dashboards polling every 2 seconds is 500 requests a
+second, mostly wasted.
+
+## 2. Long polling
+
+The browser asks, and the server **holds the request open** until there's something to say (or a timeout of, say,
+30 seconds passes), then answers. The browser immediately asks again. Updates arrive almost instantly with far fewer
+empty answers. The cost: every waiting browser holds an open request on a server.
+
+## 3. Server-sent events (SSE)
+
+The browser opens one ordinary HTTP request and the server **keeps the response open**, writing events into it
+whenever it likes:
+
+```text
+GET /links/x7Kp/live
+Accept: text/event-stream
+
+← id: 1042
+← data: {"clicks": 18431}
+
+← id: 1043
+← data: {"clicks": 18440}
+```
+
+It's one-way, server to browser, and plain HTTP, so it passes through proxies and <Term t="load-balancer">load balancers</Term> easily. Browsers
+reconnect automatically and send the last event ID they saw, so the server can fill in anything missed.
+
+## 4. WebSockets
+
+A WebSocket starts as an HTTP request that asks to **upgrade** the connection. After that, it's a long-lived,
+two-way channel: either side can send messages at any time, with very little overhead per message. It's the right
+tool when the **browser** also sends a stream of messages: chat, multiplayer editing, games.
+
+| | Polling | Long polling | SSE | WebSocket |
+| --- | --- | --- | --- | --- |
+| **Direction** | Client asks | Client asks, server waits | Server → client | Both ways |
+| **Delay** | Up to the interval | Near instant | Near instant | Near instant |
+| **Wasted requests** | Many | Few | None | None |
+| **Open connections** | None between polls | One per waiting client | One per client | One per client |
+| **Works with plain HTTP tooling** | Yes | Yes | Yes | Needs upgrade support |
+| **Good for** | Slow-changing data | Fallback, older setups | Live feeds, notifications, counters | Chat, collaboration, games |
+
+<Analogy>
+  **Waiting for a parcel.** Polling is checking the doorstep every ten minutes. Long polling is waiting by the door until the courier arrives, then going back to wait for the next one. SSE is the courier phoning you each time one of your parcels is near. A WebSocket is an open phone line you both keep, where either of you can speak whenever you like.
+</Analogy>
+
+## The hard part: holding connections at scale
+
+Every SSE or WebSocket client is a connection that stays open for minutes or hours. That changes the design:
+
+- **Servers hold state again.** Each connection lives on one particular server. When a click for `x7Kp` is counted,
+  the system has to find the server(s) holding connections that are watching `x7Kp`.
+- **So you add a <Term t="fan-out">fan-out</Term> layer.** Connection servers subscribe to the topics their clients care about, usually
+  through a pub/sub system, and the code that counts clicks publishes to the topic.
+- **Memory per connection** adds up. Each open connection costs some memory and a file descriptor; a server can
+  hold many thousands, but you size for connections, not just requests per second.
+- **Deploys and failures cause reconnect storms.** Restart a server holding 50,000 connections and 50,000 clients
+  reconnect at once. Clients should wait a random short delay before reconnecting (<L id="03.09" />).
+
+<Arch
+  title="Snip's live counter"
+  nodes={[
+    { id: "b", label: "Dashboards", kind: "client", sub: "SSE", x: 0, y: 1 },
+    { id: "lb", label: "Load balancer", kind: "lb", x: 1, y: 1 },
+    { id: "live", label: "Live servers", kind: "service", sub: "hold connections", x: 2, y: 1 },
+    { id: "pubsub", label: "Pub/sub", kind: "queue", sub: "topic per link", x: 3, y: 1 },
+    { id: "worker", label: "Stats workers", kind: "worker", x: 3, y: 2 },
+  ]}
+  edges={[
+    { from: "b", to: "lb" },
+    { from: "lb", to: "live" },
+    { from: "live", to: "pubsub", label: "subscribe" },
+    { from: "worker", to: "pubsub", label: "publish" },
+  ]}
+  steps={[
+    { caption: "An owner opens the dashboard. The browser opens an SSE stream, and the load balancer pins it to one live server for as long as it stays open.", edges: ["b>lb", "lb>live"] },
+    { caption: "That live server subscribes to the topic for x7Kp, if it isn't subscribed already.", edges: ["live>pubsub"] },
+    { caption: "When the stats workers fold a batch of clicks into the count (02.06), they also publish the new count to the topic.", edges: ["worker>pubsub"] },
+    { caption: "Pub/sub delivers it to every live server subscribed to x7Kp, and each writes it into the streams of its watching dashboards.", edges: ["live>pubsub", "lb>live", "b>lb"] },
+  ]}
+  caption="The counting path from Module 02 doesn't change; a separate set of servers holds the open connections and fans updates out to them."
+/>
+
+Snip uses **SSE**: updates only flow one way, it's plain HTTP, and reconnection is built in. Polling every 10
+seconds would also have been reasonable for a first version; the click counts already lag by a few seconds.
+
+<SeenInProduction>
+  <Seen
+    company="Slack"
+    system="Real-time messaging"
+    year={2023}
+    href="https://slack.engineering/real-time-messaging/"
+    source="Real-time Messaging"
+    found="Persistent WebSockets terminate on gateway servers; stateful channel servers, found by consistent hashing, fan messages out to them."
+  >
+    Every Slack client keeps a persistent WebSocket to Slack's servers. Clients connect to gateway servers in the
+    nearest region, which track each user's channel subscriptions. Channel servers are stateful and in memory; each
+    owns a subset of channels, assigned by consistent hashing. When a message arrives, its channel server sends it to
+    every gateway subscribed to that channel, and Slack says messages are delivered across the world in about 500 ms.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="You're adding live notifications ('your export is ready') to a web app. Users never send anything back over the channel. Which is the simplest good fit?"
+  options={[
+    { text: "WebSockets", why: "They'd work, but two-way messaging isn't needed, and WebSockets need upgrade support in every proxy and load balancer along the way." },
+    { text: "Server-sent events", correct: true, why: "One-way, server to browser, over plain HTTP, with automatic reconnection and resume. Exactly the shape of notifications." },
+    { text: "Polling every 100 ms", why: "That's ten requests a second per user, almost all empty. It would cost far more than an open stream." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Reaching for WebSockets by default.** If data only flows to the browser, SSE or even polling is simpler to run.</li>
+    <li>**Forgetting the fan-out.** Holding the connections is half the job; you also need a way to get each update to the right servers.</li>
+    <li>**Reconnecting all at once.** After a deploy, every client reconnecting immediately can knock the servers over. Add random delay.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Polling: simple, delayed, wasteful. Long polling: near-instant, one held request per client.</li>
+    <li>SSE: a one-way stream over plain HTTP, with reconnect built in. WebSockets: a two-way channel.</li>
+    <li>Long-lived connections make servers stateful; add a pub/sub layer to route updates to the right ones.</li>
+    <li>Size for open connections, and spread out reconnects after deploys.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Compare polling, long polling, server-sent events and WebSockets. When would you use each?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How would you route a message to a user connected to one of 100 servers?", "What happens to connected clients when you deploy?"]}
+>
+  <p>Polling asks on a timer: simplest, but delayed and mostly empty responses. Long polling holds each request open until there's data, then the client asks again: near-instant, with one held request per client. Server-sent events keep one HTTP response open and stream events from server to client, with built-in reconnect and resume. WebSockets upgrade a connection into a two-way channel for low-overhead messages in both directions.</p>
+  <p>I'd poll for slow-changing data, use SSE for one-way live updates like notifications or dashboards, and WebSockets for chat, collaboration or games where the client also streams messages. With either long-lived option, connection servers subscribe to topics in a pub/sub system so updates reach whichever server holds each client.</p>
+</InterviewCard>

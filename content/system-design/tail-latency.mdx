@@ -1,0 +1,134 @@
+export const meta = {
+  summary: "The slowest 1% of requests decide how a large system feels, because one user action touches many servers. Where the tail comes from, and how to cut it. With a calculator.",
+  uses: ["01.03", "03.08", "03.09"],
+  usedIn: ["06.05", "13.01"],
+};
+
+<BeforeYouStart>
+  Read <L id="01.03" /> for percentiles. You'll also use timeouts from <L id="03.09" /> and the idea of fan-out from
+  <L id="03.08" />.
+</BeforeYouStart>
+
+## Why the slowest 1% matters more than it sounds
+
+Snip promised redirects under 50 ms at p99: 99 in 100 requests faster than that. It's tempting to treat the other 1%
+as noise. In a large system it isn't, for two reasons.
+
+**Users make many requests.** Opening Snip's dashboard loads the page, its scripts, the link list and stats: maybe
+20 requests. If each has a 1% chance of being slow, about **18% of dashboard loads** hit at least one slow one. The
+p99 of a request becomes the typical experience of a page.
+
+**One request often waits for many servers.** Snip's stats are split across 100 shards. The dashboard's "clicks for
+all my links" query asks every shard and waits for all of them. Now the request is as slow as the **slowest of 100**.
+
+The arithmetic is the same in both cases: if each part is slow with probability *p*, a whole made of *N* parts is
+slow with probability 1 − (1 − *p*)ᴺ. Try it:
+
+<Lab
+  id="sd-03-12-tail"
+  title="Fan-out and the tail"
+  tasks={[
+    "With 100 servers each slow 1% of the time, what share of whole requests are slow?",
+    "Set the fan-out to 1, then 10. At what fan-out does a 1-in-100 problem become a 1-in-10 problem?",
+    "With 100 servers, how rare must slowness on each server be for whole requests to be slow under 1% of the time?",
+    "Turn on hedging. Why does it help so much, and what does it assume?",
+  ]}
+>
+  <TailLatencyLab />
+</Lab>
+
+With 100 servers each slow 1% of the time, **63%** of whole requests are slow. A server-level p99 problem has become
+the common case.
+
+## Where the tail comes from
+
+Most slow requests aren't caused by the request itself. They're caused by what else the server was doing:
+
+- **Queueing:** a burst arrives and requests wait behind each other (<L id="03.11" />).
+- **Pauses:** garbage collection, a background compaction, a log rotation.
+- **Shared machines:** another program on the same host using the CPU, disk or network.
+- **Cold <Term t="cache">caches</Term>:** the first request after a restart or eviction goes to disk.
+- **Retries:** a request that needed a retry took at least two round trips (<L id="03.09" />).
+
+Some of these you can reduce (tune GC, schedule background jobs at quiet times, isolate noisy workloads), but you
+can't remove them all. At scale, something is always having a bad moment.
+
+## Cutting the tail
+
+Since you can't make every server fast all the time, design so one slow server doesn't make the request slow:
+
+- **Hedged requests.** Send the request to one <Term t="replica">replica</Term>. If it hasn't answered by about the 95th-percentile time, send
+  a second copy to another replica and use whichever answers first. Only the slow 5% get a second copy, so extra load
+  is small, but a request is now slow only if **both** copies are.
+- **Fewer, bigger fan-outs.** Asking 10 servers instead of 100 cuts the odds of meeting a slow one tenfold. Keep data
+  a request needs together where you can.
+- **Partial results.** For some features, "results from 98 of 100 <Term t="sharding">shards</Term>, now" beats "all 100, in two seconds".
+  Set a deadline and answer with what you have, saying so if it matters.
+- **Separate slow work.** Keep bulk and background work off the servers that answer users, or behind lower priority.
+
+<Analogy>
+  **A group dinner order.** The table is served when the last dish is ready. With 2 people, one slow dish is bad luck; with 30, it's almost certain one dish holds everyone up. Restaurants handle big groups by simplifying the menu (smaller fan-out) and having a second cook start any dish that's running late (hedging).
+</Analogy>
+
+## Measure it properly
+
+- **Look at percentiles, not averages.** An average hides the tail entirely.
+- **Don't average percentiles.** The p99 of a whole fleet isn't the average of each server's p99. Collect latency
+  histograms and combine those.
+- **Measure from the client's side too.** Server timing misses time spent queued before the server picked the request
+  up, which is often where the tail lives.
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="Tail-tolerant services"
+    year={2013}
+    href="https://research.google/pubs/the-tail-at-scale/"
+    source="The Tail at Scale (Dean & Barroso, Communications of the ACM)"
+    found="At large scale, rare slow episodes dominate overall performance, so systems must be built to stay fast despite slow parts."
+  >
+    The article opens with Google search updating results as the user types, consulting data spread across thousands
+    of servers and responding within a few tens of milliseconds. It argues that keeping the latency tail low gets
+    harder as systems grow, because brief slow episodes that don't matter in a small system come to dominate a large
+    one. Just as fault-tolerant systems build a reliable whole from unreliable parts, large services need to be
+    "tail-tolerant", building a predictably fast whole from less predictable parts.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A search request fans out to 50 index servers and waits for all of them. Each server answers within 10 ms 99% of the time, and occasionally takes 500 ms. Roughly what share of searches take 500 ms?"
+  options={[
+    { text: "About 1%", why: "That would be true for one server. With 50, the search waits for the slowest of them." },
+    { text: "About 40%", correct: true, why: "1 − 0.99⁵⁰ ≈ 0.39. Hedging requests, or answering with partial results after a deadline, would bring that right down." },
+    { text: "About 99%", why: "Most searches still avoid every slow server; it's 1 − 0.99⁵⁰, not 1 − 0.01⁵⁰." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Optimising the average.** Users feel the tail; at scale, most of them meet it on most pages.</li>
+    <li>**Waiting for every shard.** If a feature can live with partial results, set a deadline and answer.</li>
+    <li>**Hedging without limits.** Only send a second copy after a delay, and only for idempotent reads, or you double your load.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A page makes many requests and a request may wait for many servers, so the tail becomes the common case.</li>
+    <li>If each part is slow with probability p, a whole of N parts is slow with probability 1 − (1 − p)ᴺ.</li>
+    <li>The tail comes from queueing, pauses, shared machines, cold caches and retries.</li>
+    <li>Cut it with hedged requests, smaller fan-outs, partial results and separating background work.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Why does p99 latency matter more in a system with large fan-out?", level: "Senior", frequency: 2, importance: "Must-know", kind: "Concept" }}
+  followUps={["What is a hedged request, and when is it safe?", "How would you measure p99 across a fleet?"]}
+>
+  <p>Because a request that waits for many servers is as slow as the slowest one. If each server is slow 1% of the time and a request fans out to 100, about 63% of requests hit at least one slow server, so the server-level tail becomes the user-level norm. The same happens to a page that makes many requests.</p>
+  <p>To cut it: hedge requests, sending a second copy to another replica if the first hasn't answered by around the 95th percentile, so only rare cases cost extra load; reduce fan-out; return partial results after a deadline where the feature allows; and isolate background work. I'd measure with histograms combined across servers, not averaged percentiles.</p>
+</InterviewCard>

@@ -1,0 +1,197 @@
+export const meta = {
+  summary: "Designing Snip's public API: resources and verbs, status codes and errors, paging through long lists, and changing the API without breaking anyone.",
+  uses: ["03.03", "01.07"],
+  usedIn: ["03.10", "05.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.03" />. Snip's public <Term t="api">API</Term> is <Term t="rest">REST</Term>, so this lesson designs it in REST terms; most of the ideas carry
+  over to other styles.
+</BeforeYouStart>
+
+## An API is a promise
+
+Once other people's code calls your API, every detail becomes something you've promised: field names, status codes,
+the order of results, what an error looks like. Changing any of them can break someone's integration at 3 a.m. Good
+API design is mostly about making promises you can keep for years.
+
+## Resources and verbs
+
+Name the **things** (nouns) and let HTTP's methods say what to do with them:
+
+```http
+POST   /links                 create a link            → 201 Created
+GET    /links/{code}          read one link            → 200 OK
+GET    /links?owner=me        list my links            → 200 OK
+DELETE /links/{code}          delete a link            → 204 No Content
+GET    /links/{code}/stats    click counts for a link  → 200 OK
+```
+
+Each method carries a meaning clients and proxies rely on:
+
+| Method | Changes anything? | Safe to repeat? | Typical use |
+| --- | --- | --- | --- |
+| `GET` | No | Yes | Read |
+| `PUT` | Yes | Yes: setting the same value twice ends the same | Replace a whole resource |
+| `DELETE` | Yes | Yes: it's gone either way | Remove |
+| `PATCH` | Yes | Not necessarily | Change some fields |
+| `POST` | Yes | **No**: twice can mean two links | Create, or actions |
+
+That last row matters more than it looks. If a client's `POST /links` times out, it can't tell whether the link was
+created. Retrying might create a duplicate. <L id="03.10" /> fixes that with <Term t="idempotent">idempotency</Term> keys.
+
+## Status codes and errors
+
+Use the status code for the broad outcome, and a consistent body for the details. Clients write code against both:
+
+| Code | Meaning | Snip example |
+| --- | --- | --- |
+| 200, 201, 204 | Worked | Link returned, created, deleted |
+| 302 | Go elsewhere | The redirect itself |
+| 400 | Your request is malformed | `long_url` isn't a URL |
+| 401 / 403 | Not signed in / not allowed | Deleting someone else's link |
+| 404 | No such thing | Unknown code |
+| 409 | Conflicts with current state | Custom code already taken |
+| 429 | Too many requests, slow down | <Term t="rate-limit">Rate limit</Term> hit |
+| 500, 503 | Our fault; may be worth retrying | Database down |
+
+```json
+{
+  "error": {
+    "type": "invalid_request",
+    "code": "code_taken",
+    "message": "The short code 'launch' is already in use.",
+    "param": "custom_code"
+  }
+}
+```
+
+A machine-readable `code` lets clients handle each case; the `message` is for humans. The 4xx/5xx split also tells
+clients something important: **4xx means don't retry the same request; 5xx means a retry might work.**
+
+## Paging through long lists
+
+An owner with 50,000 links can't get them in one response. There are two common ways to page:
+
+**Offset pagination**: `GET /links?limit=50&offset=100`. Simple, and lets users jump to page 7. But the database
+still walks past the first 100 rows to find the next 50, which gets slow deep into a list. And if a new link is added
+while someone is paging, everything shifts by one: they see an item twice, or miss one.
+
+**Cursor pagination**: the response includes an opaque `next_cursor`, and the client sends it back:
+
+```http
+GET /links?limit=50
+→ { "data": [ … ], "next_cursor": "eyJjcmVhdGVkX2F0Ijo…" }
+
+GET /links?limit=50&cursor=eyJjcmVhdGVkX2F0Ijo…
+```
+
+The cursor encodes where the last page ended (say, the last link's creation time and code), so the server asks for
+"the next 50 after this one" using an index. It's fast at any depth and stable when items are added. You lose
+"jump to page 7", which most APIs don't need. Snip uses cursors; <L id="05.07" /> shows the query behind them.
+
+## Changing the API without breaking anyone
+
+Some changes are safe for existing clients, and some aren't:
+
+| Safe (additive) | Breaking |
+| --- | --- |
+| Adding a new endpoint | Removing or renaming a field or endpoint |
+| Adding an optional request field | Making an optional field required |
+| Adding a field to a response | Changing a field's type or meaning |
+| Adding a new error code (if clients handle unknown ones) | Changing which status code a case returns |
+
+Make additive changes freely. For breaking ones, you need **versioning**: old clients keep the old behaviour while
+new ones opt in. Two common forms:
+
+- **In the URL:** `/v1/links`, then `/v2/links`. Easy to see and route, but each major version is a big step, and you
+  run both for years.
+- **By date, per client:** each account is pinned to the API version that was current when it started, and can move
+  forward when ready. More work inside, much smoother for users. That's Stripe's approach, below.
+
+<Analogy>
+  **A building's floor plan.** Adding a room is fine: nobody's route to the kitchen changes. Moving the kitchen breaks everyone's morning. If you must move it, you leave clear signs for a long while, and some buildings keep the old kitchen open until the last tenant has moved on.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Stripe"
+    system="API versioning"
+    year={2017}
+    href="https://stripe.com/blog/api-versioning"
+    source="APIs as infrastructure: future-proofing Stripe with versioning"
+    found="Pinning each account to a dated version, and translating responses backwards in code, let Stripe keep every old version working."
+  >
+    Stripe names versions by release date, such as `2017-05-24`. An account is pinned to the newest version on its
+    first API request, and can override it per request with a `Stripe-Version` header. Each breaking change is
+    written as a module that transforms a response back to the previous version, and these are applied in order back
+    to the caller's version. Stripe said this had carried almost a hundred backwards-incompatible upgrades while
+    keeping compatibility with every version since 2011.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's 'list my links' API uses offset pagination, newest first. While a user pages through, another of their links is created. What do they see?"
+  options={[
+    { text: "Nothing unusual; offsets are stable", why: "Offsets count from the top of the list, and the new link was added at the top, so everything shifts down one." },
+    { text: "One link appears twice: the last item of one page shows up again at the top of the next", correct: true, why: "Everything shifted by one, so offset 50 now points at what was offset 49. Cursor pagination avoids this by continuing after a specific item, not a position." },
+    { text: "The request fails with a conflict error", why: "Nothing checks for this; the client silently gets shifted results." },
+  ]}
+/>
+
+## Try it
+
+<DesignIt
+  id="sd-03-04-pastebin-api"
+  minutes={10}
+  levels={["junior"]}
+  patterns={["api-design"]}
+  rubric={[
+    "Resources named as nouns, with methods matching their meaning",
+    "Correct status codes for create, read, not found and expired",
+    "A consistent error body with a machine-readable code",
+    "Cursor pagination for listing a user's pastes",
+    "A versioning plan, and at least one change named as safe or breaking",
+  ]}
+>
+  Design the public REST API for a Pastebin: create a paste (with optional expiry), read one, delete one, and list
+  your own. Write each endpoint with its method, path, request and response, plus the error format.
+</DesignIt>
+
+<Mistakes>
+  <ul>
+    <li>**Verbs in URLs.** `POST /createLink` and `POST /deleteLink` hide what HTTP already says, and lose its guarantees.</li>
+    <li>**200 for errors.** Returning `200 {"error": …}` breaks every client, proxy and monitor that reads status codes.</li>
+    <li>**Offset pagination on big, changing lists.** It gets slow deep in, and skips or repeats items when the list changes.</li>
+    <li>**Breaking changes without a version.** Renaming one field can break every client that reads it.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Name resources as nouns; let HTTP methods carry the action and its guarantees.</li>
+    <li>Status codes for the outcome, a consistent error body for details: 4xx don't retry, 5xx maybe.</li>
+    <li>Prefer cursor pagination: fast at any depth and stable while data changes.</li>
+    <li>Additive changes are free; breaking changes need a version, in the URL or pinned per client.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you design pagination for an API that lists a user's items?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["What goes inside the cursor?", "How would you support sorting by a different field?"]}
+>
+  <p>I'd use cursor pagination. The response returns a page of items plus an opaque next_cursor that encodes the sort key of the last item, such as its creation time plus its ID to break ties. The next request passes the cursor, and the server queries for items after that key using an index, so every page is equally fast and items added meanwhile don't cause duplicates or gaps.</p>
+  <p>Offset pagination is simpler and allows jumping to a page number, but the database scans past every skipped row and results shift when the list changes. I'd only use it for small or rarely changing lists.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "How do you evolve an API without breaking existing clients?", level: "Mid", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Which changes are safe to make without a new version?", "How long would you support an old version?"]}
+>
+  <p>Prefer additive changes, which old clients ignore: new endpoints, new optional fields, new response fields. For breaking changes, version the API, either with a version in the URL or by pinning each client to the version it started on, with an explicit way to upgrade. Internally, keep one current implementation and translate responses back to older versions, rather than maintaining parallel code.</p>
+  <p>Announce deprecations early, track which clients still use old versions, and only retire one when its usage is close to zero.</p>
+</InterviewCard>
