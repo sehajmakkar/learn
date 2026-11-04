@@ -1,0 +1,139 @@
+export const meta = {
+  summary: "Running schema changes on a busy production database: the lock queue that turns an instant ALTER into an outage (demonstrated), lock timeouts and retries, building indexes and constraints without blocking, throttled backfills, and tools that copy tables online.",
+  uses: ["04.09", "14.05", "04.04", "04.07"],
+  usedIn: ["15.02", "16.02"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.09" /> first: it covers expand and contract. This lesson is about executing each step safely on a
+  database that never stops taking traffic.
+</BeforeYouStart>
+
+## The problem: an instant change that froze redirects
+
+Snip adds a nullable `title` column to `links`. In Postgres that's a metadata-only change that completes instantly.
+Yet when it ran in production, every redirect query hung for several seconds and the error rate spiked. The table was
+never rewritten. What happened was the **lock queue**.
+
+## The lock queue, demonstrated
+
+`ALTER TABLE` needs an `ACCESS EXCLUSIVE` lock, which conflicts with everything, even plain reads. If any transaction
+is using the table, the `ALTER` waits. And while it waits, **every new query on the table queues behind it**, because
+the database won't let new readers jump ahead of a waiting exclusive lock.
+
+Tested on PostgreSQL 16 with a 100,000-row `links` table:
+
+| Step | Without lock timeout | With `lock_timeout = '1s'` |
+| --- | --- | --- |
+| A 6-second report query holds the table | Running | Running |
+| `ALTER TABLE links ADD COLUMN title text` starts | Waits for the report | Waits up to 1 s, then gives up with an error |
+| A one-row redirect `SELECT` arrives | **Waited about 4 seconds**, behind the `ALTER` | Finished in about 0.7 s, once the `ALTER` gave up |
+
+At 100,000 redirects a second, four seconds of queueing is 400,000 stuck requests, from a change that itself does no
+work at all.
+
+## The safety rules
+
+**1. Always set a lock timeout for migrations, and retry.** `SET lock_timeout = '2s'` makes the migration fail fast
+instead of freezing the table; the migration tool retries a few seconds later, ideally when no long query is running.
+Also set a `statement_timeout` so a migration that turns out to be slow doesn't hold its lock for minutes.
+
+**2. Avoid long transactions on hot tables.** Reports and analytics go to replicas (<L id="04.07" />), so the primary
+rarely has a long-running query to wait behind.
+
+**3. Build indexes concurrently.** `CREATE INDEX CONCURRENTLY` builds without blocking writes, taking longer and
+needing a retry if it fails partway (it leaves an invalid index to drop).
+
+**4. Add constraints in two steps.** Adding a foreign key or check constraint normally scans the whole table under a
+heavy lock. Add it `NOT VALID` first, which skips the scan and applies only to new rows, then run `VALIDATE
+CONSTRAINT`, which scans under a much weaker lock (`SHARE UPDATE EXCLUSIVE`) that doesn't block reads or writes.
+
+**5. Backfill in throttled batches.** Update a few thousand rows per transaction by primary-key range, pause between
+batches, and back off when replication lag grows (<L id="04.09" />).
+
+## When the table must be rebuilt
+
+Some changes really do rewrite the table: changing a column's type, or reorganising a huge table. For those, **online
+schema change** tools build a new copy beside the old one, keep it in sync, and swap at the end. GitHub's gh-ost, for
+MySQL, creates a "ghost" table, copies rows into it incrementally, follows ongoing changes by reading the database's
+binary log rather than using triggers, throttles itself on load and replication lag, and cuts over by swapping the
+tables, a moment the operator can postpone until they're ready.
+
+## Migrations in the deploy pipeline
+
+- **Migrations deploy separately from code**, each step backward-compatible (<L id="14.05" />): add the column, deploy
+  code that uses it, and only drop old columns in a later release.
+- **Run them at quiet times** when they need any heavy lock, and watch the same dashboards as a code deploy.
+- **Rehearse on a copy** of production-sized data: a migration that's instant on 1,000 rows can take an hour on 600
+  million.
+
+<Analogy>
+  **A queue at a single-lane bridge.** The repair crew only needs a moment on the bridge, but they're waiting for a slow lorry to cross, and they've told everyone behind them to stop too. The whole road jams for the sake of a moment's work. A crew that agrees to wait only a few seconds, then steps aside and tries again later, never holds up the traffic.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="PostgreSQL"
+    system="ALTER TABLE locks"
+    year="Docs"
+    href="https://www.postgresql.org/docs/current/sql-altertable.html"
+    source="ALTER TABLE (PostgreSQL documentation)"
+    found="ALTER TABLE takes ACCESS EXCLUSIVE unless noted; NOT VALID skips the scan, and VALIDATE takes a weaker lock."
+  >
+    An ACCESS EXCLUSIVE lock is acquired unless explicitly noted for a particular form. Adding a constraint with NOT
+    VALID skips the potentially lengthy scan of existing rows while still applying it to subsequent inserts and updates,
+    and VALIDATE CONSTRAINT later checks the existing rows while acquiring only a SHARE UPDATE EXCLUSIVE lock.
+  </Seen>
+  <Seen
+    company="GitHub"
+    system="gh-ost"
+    year={2016}
+    href="https://github.blog/news-insights/company-news/gh-ost-github-s-online-migration-tool-for-mysql/"
+    source="gh-ost: GitHub's online schema migration tool for MySQL (Shlomi Noach)"
+    found="Copy into a ghost table, follow changes from the binary log, throttle, and cut over when the operator is ready."
+  >
+    gh-ost is GitHub's triggerless online schema migration tool for MySQL. Like other online tools, it creates a ghost
+    table and slowly, incrementally copies data into it; unlike trigger-based tools, it intercepts ongoing changes by
+    tailing the binary logs. It throttles on load, replication lag or a flag file, and the cut-over, the moment the
+    tables are swapped, can be postponed with a flag file until the operator chooses.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A migration adding a nullable column (an instant change) has been 'running' for 3 minutes, and the API is timing out. What's most likely happening?"
+  options={[
+    { text: "Postgres is rewriting the table", why: "Adding a nullable column without a default doesn't rewrite the table." },
+    { text: "The ALTER is waiting for a lock behind a long transaction, and every new query is queued behind the ALTER", correct: true, why: "Cancel the migration (queries resume at once), find and end the long transaction, and rerun with a lock timeout." },
+    { text: "The new column is full of nulls", why: "Nulls cost nothing to add; the problem is waiting for the lock." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Migrations without a lock timeout.** One long query turns an instant change into an outage.</li>
+    <li>**Plain CREATE INDEX on a busy table.** It blocks writes; build concurrently.</li>
+    <li>**Validating constraints in one step.** Add NOT VALID, then VALIDATE separately.</li>
+    <li>**Testing migrations only on small data.** Rehearse at production size.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A waiting exclusive lock blocks every query behind it, so even instant changes can cause outages.</li>
+    <li>Use lock and statement timeouts with retries, and keep long transactions off the primary.</li>
+    <li>Build indexes concurrently, add constraints NOT VALID then validate, backfill in throttled batches.</li>
+    <li>For real rewrites, use online schema change tools; deploy migrations separately and rehearse them at scale.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you run schema migrations on a large, busy production database without downtime?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["Why can an instant ALTER cause an outage?", "How do you add an index to a 500-million-row table?"]}
+>
+  <p>Use expand and contract so every step is compatible with running code, and deploy migrations separately from code. Each DDL statement runs with a short lock timeout and statement timeout and is retried, because an ALTER waiting for an exclusive lock behind a long transaction blocks every new query on the table. Long-running reads go to replicas so there's rarely anything to wait behind.</p>
+  <p>Indexes are built concurrently; constraints are added as NOT VALID and validated separately under a weaker lock; backfills run in small batches by primary key, throttled on replication lag. Changes that rewrite a table use an online schema change tool that builds a shadow copy, follows changes from the log and swaps at the end. Everything is rehearsed on production-sized data first.</p>
+</InterviewCard>

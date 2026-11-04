@@ -1,0 +1,144 @@
+export const meta = {
+  summary: "How to know what a running system is doing: metrics for trends and alerts, logs for individual events, traces for following one request across services. The four golden signals, what makes each kind of data expensive, and how they connect during an incident.",
+  uses: ["03.12", "11.05", "03.08", "11.01"],
+  usedIn: ["14.02", "14.05"],
+};
+
+<BeforeYouStart>
+  Read <L id="03.12" /> for why percentiles, not averages, and <L id="11.05" /> for how they're aggregated across
+  servers.
+</BeforeYouStart>
+
+## The problem: "redirects are slow" at 14:07
+
+An owner reports that Snip links "hang for a second" since lunchtime. Snip has 40 app servers, Redis, Postgres shards,
+a CDN and a dozen services. Somewhere among them, something changed. The team needs to answer three questions, fast:
+**is something wrong** (and for whom), **where**, and **why**.
+
+Each question is best answered by a different kind of telemetry.
+
+## Metrics: is something wrong?
+
+**Metrics** are numbers over time: requests per second, error rate, p99 latency, queue depth, CPU. They're cheap to
+store (one number per series per interval, however much traffic there is), fast to query over months, and what alerts
+are built on.
+
+Google's SRE book names the **four golden signals** to measure for any user-facing service:
+
+- **Latency**: how long requests take. Track successful and failed requests separately: a fast error and a slow
+  success mean different things.
+- **Traffic**: demand, in the service's own terms (redirects per second).
+- **Errors**: the rate of failing requests, whether explicit (500s), implicit (wrong content) or by policy (too slow).
+- **Saturation**: how "full" the service is: the resource closest to its limit.
+
+The cost to watch is **cardinality**: every distinct combination of labels is a separate series. `latency{route,
+status}` is fine; `latency{link_code}` across 600 million links is 600 million series and will sink the metrics
+system. Per-link numbers belong in the analytics pipeline (<L id="11.01" />), not in operational metrics.
+
+## Logs: what happened, exactly?
+
+**Logs** are records of individual events: this request, this error, this retry. They have all the detail metrics
+throw away, so they answer "which requests?" and "what did the error say?".
+
+- **Structured logs** (JSON with fields such as `route`, `status`, `duration_ms`, `trace_id`) can be filtered and
+  counted; free text can only be searched.
+- **Volume is the cost.** At 100,000 redirects a second, a log line per redirect is billions a day. Log every error
+  and every slow request, and sample the rest.
+- **Never log secrets or personal data** you don't need: passwords, tokens, full <Term t="signed-url">signed URLs</Term> (<L id="13.05" />).
+
+## Traces: where did the time go?
+
+A request for `x7Kp` passes through the load balancer, an app server, Redis, maybe a Postgres shard. **Distributed
+tracing** follows it: each step is a **span** with a start time, a duration and attributes, and spans link into a tree
+by passing a **trace ID** (and the parent span's ID) along with every call. Google's Dapper paper, the ancestor of most
+tracing systems, describes exactly this: a trace tree of spans, with context propagated through common libraries.
+
+Tracing everything is expensive, so traces are **sampled**. Dapper found that even sampling 1 in 1,024 requests still
+gave enough data for high-volume services. Many systems also keep every trace that errored or was unusually slow
+(tail-based sampling), since those are the ones you'll want.
+
+Today, **OpenTelemetry** is the common standard for producing all three signals, with spans, attributes and context
+propagation defined the same way across languages and vendors.
+
+## How they fit together during an incident
+
+1. A **metric** alert fires: p99 redirect latency over 200 ms for 5 minutes.
+2. The dashboard narrows it: only redirects that miss the cache; only on shard 7.
+3. An exemplar **trace** from the slow requests shows 900 ms in one Postgres query.
+4. That trace's ID finds the **logs**: the query plan changed after a deploy at 13:58 dropped an index.
+
+Linking them is what makes them powerful: every log line and metric exemplar carries the trace ID.
+
+<Analogy>
+  **A hospital patient.** The monitor beside the bed shows vital signs continuously (metrics), and beeps when one goes out of range. The chart records each event in detail: doses, symptoms, times (logs). And the patient's journey through admissions, scans and wards, with how long each took, is the trace. A nurse starts from the monitor, the doctor reads the chart, and the trace shows where the delay was.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="The four golden signals"
+    year={2017}
+    href="https://sre.google/sre-book/monitoring-distributed-systems/"
+    source="Monitoring Distributed Systems (Site Reliability Engineering, chapter 6)"
+    found="Latency, traffic, errors and saturation; and alert on symptoms users feel more than on causes."
+  >
+    The chapter names the four golden signals of monitoring: latency, the time to service a request; traffic, the
+    demand on the system; errors, the rate of failing requests, explicitly, implicitly or by policy; and saturation,
+    how "full" the service is. It stresses distinguishing the latency of successful and failed requests, since a slow
+    error is even worse than a fast one, and says monitoring should answer what's broken and why, putting more effort
+    into catching symptoms than causes.
+  </Seen>
+  <Seen
+    company="Google"
+    system="Dapper"
+    year={2010}
+    href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/"
+    source="Dapper, a Large-Scale Distributed Systems Tracing Infrastructure (Sigelman et al.)"
+    found="Traces as trees of spans, low overhead through sampling and instrumenting a few common libraries."
+  >
+    Dapper's design goals were low overhead, transparency to applications and deployment everywhere, met by sampling
+    and by instrumenting a small number of common libraries. The paper represents each request as a trace tree of
+    spans, and reports that for high-volume services, a sampling rate as low as 1 in 1,024 still yields enough trace
+    data. [OpenTelemetry](https://opentelemetry.io/docs/concepts/signals/traces/) now defines spans as units of work
+    and context propagation as the core concept that makes distributed tracing possible.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A developer adds a metric label for the user ID to Snip's request latency histogram, to find slow users. The metrics bill and query times explode. Why, and what's better?"
+  options={[
+    { text: "Histograms are expensive; use averages", why: "The problem isn't the histogram type; it's the number of distinct label values." },
+    { text: "Every user ID creates a separate time series; keep metric labels low-cardinality and find slow users through traces or logs", correct: true, why: "Millions of users means millions of series. Per-request detail belongs in sampled traces and structured logs, which carry the user ID as a field." },
+    { text: "The metrics system needs more servers", why: "That pays for the mistake instead of fixing it; cardinality can grow without bound." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**High-cardinality metric labels.** User IDs, link codes and URLs belong in logs and traces, not metric labels.</li>
+    <li>**Averages for latency.** Use percentiles, and separate successes from failures.</li>
+    <li>**Unstructured logs.** Use fields, including a trace ID, so logs can be filtered and joined.</li>
+    <li>**Alerting on causes.** Page on symptoms users feel (errors, latency); use causes for diagnosis.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Metrics say whether something is wrong; logs say what happened; traces say where the time went.</li>
+    <li>Measure the four golden signals: latency, traffic, errors, saturation.</li>
+    <li>Watch cardinality in metrics and volume in logs; sample traces but keep the slow and failed ones.</li>
+    <li>Link everything with a trace ID so an alert leads to a trace and then to logs.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you set up observability for a set of microservices?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What metrics would you alert on?", "How do you trace a request across services?"]}
+>
+  <p>Three signals, linked. Metrics for each service's golden signals, rate, errors, latency percentiles and saturation, with low-cardinality labels, used for dashboards and symptom-based alerts. Structured logs with consistent fields and a trace ID, logging errors and slow requests fully and sampling the rest, without secrets or unnecessary personal data. Distributed tracing with OpenTelemetry: each service creates spans and propagates trace context in headers, sampled at a low rate but keeping slow and failed traces.</p>
+  <p>During an incident, an alert on error rate or p99 points to the affected service and route, an exemplar trace shows which hop is slow, and its trace ID pulls the related logs. I'd watch cardinality and log volume closely, since those drive cost.</p>
+</InterviewCard>

@@ -1,0 +1,193 @@
+export const meta = {
+  summary: "Four ways to cap how many requests a client can make: fixed windows, sliding logs, sliding window counters and token buckets. What each allows at window boundaries and in bursts, what each costs in memory, a lab to compare them on the same traffic, and tested code.",
+  uses: ["03.11", "03.07", "11.04"],
+  usedIn: ["14.04", "15.03"],
+};
+
+<BeforeYouStart>
+  <L id="03.11" /> covered shedding load when a whole service is overloaded. Rate limiting is per client: each one gets
+  a fair share, whatever the others do.
+</BeforeYouStart>
+
+## The problem: one customer creating 50,000 links a minute
+
+Snip's API lets paid customers create links programmatically. One customer's buggy script loops, creating 50,000 links
+a minute. The database slows for everyone, and the free plan's spammers are also hammering link creation to churn out
+phishing links. Snip needs to say: **each API key may create at most 100 links per minute**, and turn away the rest
+with a `429 Too Many Requests`.
+
+The question is what "100 per minute" means precisely, and how cheaply it can be checked on every request.
+
+## Four algorithms
+
+**Fixed window.** Keep a counter per key per calendar minute. Allow while the counter is below the limit; reset at the
+start of each minute. One number per key, trivially cheap. Its flaw is the **boundary**: 100 requests at 12:00:59 and
+100 more at 12:01:00 are both allowed, so 200 get through in one second.
+
+**Sliding log.** Keep the timestamp of every allowed request in the last minute; allow if there are fewer than the
+limit. Exact, with no boundary problem, but it stores up to the limit's worth of timestamps per key: fine for 100, too
+costly for 10,000.
+
+**Sliding window counter.** Keep only two counters, this minute and the previous one, and estimate the last 60 seconds
+as the current count plus the previous count weighted by how much of the previous minute is still inside the window.
+Cloudflare's example: 42 requests last minute and 18 so far this minute, 15 seconds in, estimates 42 × 45/60 + 18 =
+49.5. Two numbers per key, nearly as smooth as the log.
+
+**Token bucket.** Each key has a bucket holding up to **capacity** tokens, refilled at a steady **rate**. A request takes
+a token; with no token, it's rejected. The capacity sets the largest burst allowed; the rate sets the long-run
+average. Stripe uses token buckets for its request rate limiter.
+
+## Try it
+
+<Lab
+  id="sd-14-03-rate-limiter"
+  title="Same traffic, four limiters"
+  tasks={[
+    "With 'Burst at a boundary' and a limit of 10 per 10 s, how many requests does the fixed window allow within 10 seconds? Why?",
+    "Compare the sliding log and the sliding window counter on the same pattern. How close is the counter?",
+    "Switch to 'Bursts'. Why does the token bucket allow more in some 10-second stretches than the limit?",
+    "Raise the limit to 20. Which limiter's behaviour changes most?",
+  ]}
+>
+  <RateLimiterLab />
+</Lab>
+
+With a limit of 10 per 10 seconds and 30 requests crowded around the 10-second mark, the fixed window let **20**
+through within ten seconds, twice the limit; the sliding log allowed at most 10; the sliding window counter at most 12.
+The token bucket allowed up to 14 there, and 17 to 19 in other patterns: by design, it permits a full bucket's burst
+plus whatever refills during the window. That's a feature, not a bug: real clients are bursty, and a bucket lets them
+burst while capping the average.
+
+| Algorithm | Memory per key | Boundary bursts | Best for |
+| --- | --- | --- | --- |
+| Fixed window | 1 counter | Up to 2× the limit | Simple quotas (per day, per month) |
+| Sliding log | Up to limit timestamps | None | Small, exact limits |
+| Sliding window counter | 2 counters | Slight | Most per-second or per-minute limits |
+| Token bucket | 2 numbers | Allows a set burst | <Term t="api">APIs</Term> where bursts are fine but the average isn't |
+
+## Tested code
+
+```ts
+export class TokenBucket {
+  private tokens: number;
+  private last: number;
+
+  constructor(readonly capacity: number, readonly refillPerSec: number, now = Date.now()) {
+    this.tokens = capacity;
+    this.last = now;
+  }
+
+  allow(now = Date.now()): boolean {
+    this.tokens = Math.min(this.capacity, this.tokens + ((now - this.last) / 1000) * this.refillPerSec);
+    this.last = now;
+    if (this.tokens < 1) return false;
+    this.tokens -= 1;
+    return true;
+  }
+}
+
+/** Cloudflare-style approximation: this window's count plus the previous window's, weighted by overlap. */
+export class SlidingWindowCounter {
+  private window = -1;
+  private current = 0;
+  private previous = 0;
+
+  constructor(readonly limit: number, readonly windowMs: number) {}
+
+  allow(now = Date.now()) {
+    const w = Math.floor(now / this.windowMs);
+    if (w !== this.window) {
+      this.previous = w === this.window + 1 ? this.current : 0; // a gap of more than one window resets it
+      this.current = 0;
+      this.window = w;
+    }
+    const estimate = this.previous * (1 - (now % this.windowMs) / this.windowMs) + this.current;
+    if (estimate >= this.limit) return false;
+    this.current++;
+    return true;
+  }
+}
+```
+
+Tested on a burst of 20 requests straddling a window boundary, with a limit of 10 per 10 seconds: a fixed window
+allowed all 20, the sliding log 10, the sliding window counter 11, and a token bucket of capacity 10 refilling one per
+second allowed 10. Against a steady 2 requests a second for 20 seconds, the token bucket allowed its 10-token burst
+and then about one a second: 29 of 40.
+
+## Telling the client
+
+Reject with **429 Too Many Requests**, defined in RFC 6585, which may include a `Retry-After` header saying how long to
+wait. Many APIs also return the limit and what's left on every response, as GitHub does with `x-ratelimit-limit`,
+`x-ratelimit-remaining` and `x-ratelimit-reset`, so well-behaved clients can slow down before they hit the wall.
+
+<Analogy>
+  **A ticket machine at a deli counter.** A fixed window is "50 customers per hour, reset on the hour": 50 at 1:59 and 50 at 2:00 swamp the counter. A token bucket is a jar of numbered tickets topped up one a minute: a group can take several at once, but once the jar is empty, newcomers wait for the next ticket to drop in.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Stripe"
+    system="API rate limiters"
+    year={2017}
+    href="https://stripe.com/blog/rate-limiters"
+    source="Scaling your API with rate limiters (Paul Tarjan)"
+    found="Token buckets in Redis, plus concurrency limits and load shedders; the request limiter rejects millions of requests a month."
+  >
+    Stripe runs four kinds of limiter in production: a request rate limiter (N requests per second per user), a
+    concurrent requests limiter, a fleet usage load shedder and a worker utilisation load shedder. It uses the token
+    bucket algorithm, implemented in Redis. The request rate limiter rejects millions of requests a month, while the
+    concurrent requests limiter triggered about 12,000 times in the month described.
+  </Seen>
+  <Seen
+    company="Cloudflare"
+    system="Sliding window rate limiting"
+    year={2017}
+    href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"
+    source="How we built rate limiting capable of scaling to millions of domains (Cloudflare Blog)"
+    found="Two counters per key approximate a sliding window; on 400 million real requests, 0.003% were wrongly allowed or limited."
+  >
+    Cloudflare estimates the request rate by weighting the previous window's count by how much of it overlaps the
+    current sliding window and adding the current count: 42 × (45/60) + 18 = 49.5 in its example. It uses only two
+    numbers per counter, and in an analysis of 400 million requests from 270,000 distinct sources, 0.003% of requests
+    were wrongly allowed or rate limited.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip limits link creation with a fixed window of 100 per minute. Spammers send 100 requests at :59 and 100 at :00 every minute. What's the simplest effective fix?"
+  options={[
+    { text: "Lower the limit to 50", why: "The boundary trick still doubles whatever the limit is." },
+    { text: "Use a sliding window counter or a token bucket", correct: true, why: "Both smooth over window boundaries: the counter weights the previous window in, and the bucket refills steadily, so a burst at the boundary can't double the rate." },
+    { text: "Use a longer window, like 100 per hour", why: "A longer window allows even larger bursts at its boundary, and changes the product's limit." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Fixed windows for short limits.** Boundaries let twice the limit through. Use a sliding counter or bucket.</li>
+    <li>**Storing every timestamp for large limits.** Memory grows with the limit; approximate with two counters.</li>
+    <li>**A bare 429.** Include Retry-After and remaining-quota headers.</li>
+    <li>**One limit for everything.** Expensive endpoints (creating links) deserve tighter limits than cheap ones (reading).</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Fixed windows are cheapest but allow up to twice the limit across a boundary.</li>
+    <li>Sliding logs are exact but store a timestamp per request; sliding window counters approximate them with two numbers.</li>
+    <li>Token buckets allow bursts up to a capacity while capping the long-run rate.</li>
+    <li>Reject with 429, Retry-After and quota headers, with limits per endpoint and plan.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Compare rate limiting algorithms. Which would you use for a public API?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What's wrong with fixed windows?", "How does a token bucket handle bursts?"]}
+>
+  <p>Fixed window keeps one counter per key per interval; it's cheap but lets up to twice the limit through around a window boundary. A sliding log stores each request's timestamp in the window and is exact, but memory grows with the limit. A sliding window counter keeps the current and previous window's counts and weights the previous by its overlap, which is nearly as accurate with two numbers per key. A token bucket refills tokens at a fixed rate up to a capacity; each request spends one, so it allows bursts up to the capacity while enforcing the average rate.</p>
+  <p>For a public API I'd use a token bucket per API key, since clients are naturally bursty and it expresses "average rate plus allowed burst", or a sliding window counter for strict per-minute quotas. Rejections return 429 with Retry-After and remaining-quota headers, and different endpoints and plans get different limits.</p>
+</InterviewCard>

@@ -1,0 +1,133 @@
+export const meta = {
+  summary: "Replication protects against machines failing; backups protect against people and bugs. Recovery point and recovery time objectives, point-in-time recovery from a base backup plus the log, keeping copies out of reach of mistakes, and restores that are tested, not assumed.",
+  uses: ["04.06", "04.07", "09.05", "09.06"],
+  usedIn: ["14.08", "14.11"],
+};
+
+<BeforeYouStart>
+  Read <L id="04.06" /> for the write-ahead log, which point-in-time recovery replays, and <L id="04.07" /> for
+  replication, which this lesson contrasts with backups.
+</BeforeYouStart>
+
+## The problem: a script deletes the wrong links
+
+A Snip engineer runs a clean-up script meant to delete expired links for one customer. A bug in its filter deletes
+2.3 million live links across 900 customers. The delete is committed, replicated to every replica in seconds, and
+removed from the cache. Replication did its job perfectly: every copy now faithfully lacks the links.
+
+**Replicas copy mistakes.** Only a copy taken **before** the mistake, kept where the mistake couldn't reach, can undo
+it. That's what backups are for.
+
+## Two numbers to decide first
+
+- **RPO** (recovery point objective): how much recent data you can afford to lose. "No more than 5 minutes of
+  changes."
+- **RTO** (recovery time objective): how long you can afford to be without the data. "Restored within 4 hours."
+
+They drive everything else. Nightly backups give an RPO of up to 24 hours. Restoring a 2 TB database from object
+storage takes hours, which sets a floor on RTO.
+
+## Point-in-time recovery
+
+Postgres's approach (and most databases have an equivalent): take a **base backup**, a full copy of the data files,
+regularly, and **archive every write-ahead log segment** as it fills (<L id="04.06" />). To recover, restore the base
+backup and replay the archived log up to any moment you choose: 14:31:59, one second before the script ran.
+
+That gives an RPO of minutes (how often log segments are archived) and lets you recover to just before a mistake,
+not just to last night.
+
+For Snip's accident, a full restore would also roll back every legitimate change since 14:32. So the usual move is to
+**restore to a separate database** at 14:31:59 and copy just the deleted links back into production.
+
+## Keep backups out of reach
+
+Backups protect only if the thing that destroyed production can't destroy them too:
+
+- **Separate account and credentials.** A compromised or mistaken production credential shouldn't be able to delete
+  backups.
+- **Immutable or versioned storage** with retention locks, so backups can't be deleted early, even by an admin.
+- **Another region**, against losing a whole region (<L id="14.08" />).
+- **Checksums** on every backup file, verified (<L id="09.06" />).
+
+## Test the restore
+
+A backup you've never restored is a hope, not a backup. Restore regularly into a scratch environment, automatically,
+check row counts and a few known records, and time it: that measured time is your real RTO. Postgres's own
+documentation tells you to set up and test WAL archiving before taking your first base backup.
+
+Also test the **shape** of restore you'll need. Restoring a whole database is one thing; restoring 900 customers'
+links from it, while the other customers keep working, is a different procedure, and it should exist before the day
+you need it.
+
+<Analogy>
+  **A photocopy of your passport, kept at a friend's house.** Your phone's photo of it syncs to every device you own, so when you delete it by mistake, it vanishes from all of them (replication). The paper copy at a friend's house, taken last month, is still there. And you only know it's legible if you've actually looked at it.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Atlassian"
+    system="April 2022 outage"
+    year={2022}
+    href="https://www.atlassian.com/engineering/post-incident-review-april-2022-outage"
+    source="Post-Incident Review on the Atlassian April 2022 outage"
+    found="Backups met the recovery point, but restoring hundreds of customers at once had never been built, so recovery took up to 14 days."
+  >
+    A script deleted 883 sites, belonging to 775 customers, in about 23 minutes. Atlassian could recover a
+    single site, but had not built capabilities and processes for restoring a large batch of sites with their
+    interconnected products. The outage lasted up to 14 days for some customers; no customer lost more than five minutes
+    of data. Atlassian wrote that it met its RPO but missed its RTO, and its lessons included universal soft deletes and
+    automating restoration for large, multi-site deletion events.
+  </Seen>
+  <Seen
+    company="PostgreSQL"
+    system="Continuous archiving and PITR"
+    year="Docs"
+    href="https://www.postgresql.org/docs/current/continuous-archiving.html"
+    source="Continuous Archiving and Point-in-Time Recovery (PostgreSQL documentation)"
+    found="A file-system backup plus archived WAL restores the database to any moment since the backup."
+  >
+    Combining a file-system-level backup with archived WAL files lets you restore the backup and replay the WAL,
+    recovering the database to its state at any time since the base backup. It needs a continuous sequence of archived
+    WAL files back to the backup's start, and the documentation advises setting up and testing WAL archiving before
+    taking the first base backup. Logical dumps from pg_dump can't be used for continuous archiving.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip runs synchronous replication to a standby in another zone. A manager says 'so we don't need backups'. What's the flaw?"
+  options={[
+    { text: "Synchronous replication is too slow to be reliable", why: "It's reliable at what it does: keeping a second copy up to date." },
+    { text: "Replication copies deletions and corruption too; only an older, separate copy can undo a mistake", correct: true, why: "Replicas protect against hardware failure. Backups with point-in-time recovery protect against bugs, bad scripts and attackers." },
+    { text: "The standby might be in the same building", why: "Even in another region it would faithfully replicate the bad delete." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Treating replicas as backups.** They copy mistakes within seconds.</li>
+    <li>**Backups reachable with production credentials.** Separate accounts, immutable storage.</li>
+    <li>**Never restoring.** Test restores regularly and measure the time.</li>
+    <li>**Only whole-database restores.** Practise partial restores, like one customer's data, before you need them.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Replication protects against failures; backups protect against mistakes, bugs and attackers.</li>
+    <li>Set RPO (data you can lose) and RTO (time to recover) first; they drive the design.</li>
+    <li>Base backups plus archived WAL give point-in-time recovery to just before a mistake.</li>
+    <li>Keep backups isolated and immutable, and test full and partial restores on a schedule.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you design backups for a production database? What are RPO and RTO?", level: "Mid", frequency: 2, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why aren't replicas enough?", "How do you recover from an accidental delete without losing other changes?"]}
+>
+  <p>RPO is how much data you can afford to lose, and RTO is how long recovery may take. For a relational database I'd take regular base backups and continuously archive the write-ahead log, enabling point-in-time recovery with an RPO of minutes. Backups go to immutable, versioned storage in a separate account and region, with checksums, so the same mistake or attacker can't remove them.</p>
+  <p>Replicas aren't backups because they replicate deletes and corruption immediately. For an accidental delete I'd restore to a separate instance at a point just before it and copy back only the affected rows, so other changes aren't lost. And I'd restore automatically on a schedule to verify backups and measure the actual RTO, including partial restores for a single customer.</p>
+</InterviewCard>

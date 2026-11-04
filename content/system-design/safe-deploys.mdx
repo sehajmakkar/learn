@@ -1,0 +1,130 @@
+export const meta = {
+  summary: "Most outages start with a change. Rolling, blue-green and canary deploys, waves with bake time and automatic rollback, and feature flags that separate shipping code from turning it on. What makes a release small, observable and reversible.",
+  uses: ["14.01", "14.02", "02.03", "04.09"],
+  usedIn: ["14.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="14.01" /> and <L id="14.02" />: a safe deploy is one that watches the right metrics and stops itself.
+  Stateless servers (<L id="02.03" />) are what make replacing them gradually possible.
+</BeforeYouStart>
+
+## The problem: the deploy at 13:58
+
+Snip's lunchtime incident (<L id="14.01" />) began with a deploy: a migration dropped an index, and redirect latency
+climbed. The deploy went to all 40 servers in two minutes, and it took the team half an hour to notice and roll back.
+Most incidents start like this, with a change. The goal isn't to stop changing; it's to make every change **small,
+observed and quickly reversible**.
+
+## Ways to replace running code
+
+- **Rolling**: replace servers a batch at a time, behind the load balancer. Old and new versions run side by side for
+  a while, so every change must work with both (<L id="04.09" />).
+- **Blue-green**: bring up a full new fleet (green) beside the old (blue), then switch traffic over in one step.
+  Rolling back is switching back. It needs twice the capacity during the switch.
+- **Canary**: send a small share of traffic (1%, then 5%, then 25%) to the new version, compare its errors and latency
+  with the old version's, and continue only if they match.
+
+## Waves, bake time and automatic rollback
+
+Amazon's deployment pipelines, described by Clare Liguori, show the full shape:
+
+1. **One box first.** Deploy to a single server, or the smallest unit, serving at most about 10% of a region's
+   requests, and watch its error rate specifically.
+2. **Waves of increasing size.** Then a first region, then groups of regions, never everything at once.
+3. **Bake time.** Wait between waves, so slow-burning problems (memory leaks, daily jobs) have time to show: at least
+   an hour after the one-box stage and at least 12 hours after the first regional wave.
+4. **Automatic rollback.** The pipeline watches alarms, and if they fire, it rolls back on its own, without waiting for
+   a person.
+
+Snip's smaller version: one server, wait 15 minutes, 25% of servers, wait 30 minutes, the rest; the pipeline rolls
+back if the canary's error rate or p99 is worse than the rest of the fleet's.
+
+## Feature flags: deploy is not release
+
+A **feature flag** wraps new behaviour in a runtime switch. The code ships turned off, then is turned on separately: for
+staff, then 1% of users, then everyone. Turning a misbehaving feature off takes seconds, with no deploy. It also makes
+big changes into many small ones, since unfinished work can be merged and deployed dark.
+
+Flags have costs: two code paths to test, and stale flags that linger for years. Give each a planned removal date.
+
+## Global config is a deploy too
+
+Configuration, feature flags, firewall rules and data files can break everything as fast as code, and are often pushed
+everywhere at once. Cloudflare's July 2019 outage was caused by a single firewall rule with a regular expression that
+backtracked catastrophically, pushed globally in one step; CPU on every core of every server hit 100% and traffic was
+down for 27 minutes. Among its fixes: roll out rule changes in stages, like other software.
+
+<Analogy>
+  **Changing a recipe in a restaurant chain.** You don't send the new recipe to every branch on the same night. One kitchen tries it, the chef watches what comes back uneaten, a few more branches follow next week, and if diners complain you put the old recipe card back. A new dessert can even be cooked in advance and simply left off the menu until you're ready.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Deployment pipelines"
+    year={2020}
+    href="https://builder.aws.com/content/3ErTKQOTKc5NIw031UePBPxTQ6I/automating-safe-hands-off-deployments"
+    source="Automating safe, hands-off deployments (Clare Liguori, Amazon Builders' Library)"
+    found="One box, then waves of increasing size with bake time between them, and automatic rollback on alarms."
+  >
+    Amazon's pipelines deploy first to a one-box stage that typically serves at most 10% of a region's or zone's
+    requests, then in waves of increasing size. A typical pipeline waits at least an hour after each one-box stage, at
+    least 12 hours after the first regional wave, and two to four hours after each later wave, and the deployment system
+    monitors alarms and rolls back automatically. Reaching every region typically takes four or five business days.
+  </Seen>
+  <Seen
+    company="Cloudflare"
+    system="WAF rule outage"
+    year={2019}
+    href="https://blog.cloudflare.com/details-of-the-cloudflare-outage-on-july-2-2019/"
+    source="Details of the Cloudflare outage on July 2, 2019"
+    found="A config-style change pushed globally at once took everything down; the fix was staged rollouts for rules too."
+  >
+    A single firewall rule containing a poorly written regular expression caused excessive backtracking and exhausted
+    CPUs on every core, taking Cloudflare's service down for 27 minutes. The standard procedure allowed a non-emergency
+    rule change to go globally into production without a staged rollout. Cloudflare's changes included staged rollouts
+    of rules in the same way as its other software, performance profiling of rules in tests, and moving to a regex
+    engine with run-time guarantees.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A new redirect code path is deployed to 5% of Snip's servers as a canary. Its error rate is 0.3%, against 0.1% on the rest of the fleet. What should the pipeline do?"
+  options={[
+    { text: "Continue: 0.3% is still low", why: "It's three times the baseline. Comparing with the current fleet, not an absolute number, is the point of a canary." },
+    { text: "Stop and roll the canary back automatically", correct: true, why: "The canary is measurably worse than the version it's replacing. Rolling back costs a few minutes; continuing could triple errors for everyone." },
+    { text: "Deploy to everyone, then investigate", why: "That turns a contained problem into an incident." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Deploying everywhere at once.** Start with one box, then waves.</li>
+    <li>**No bake time.** Leaks and daily jobs surface hours later; wait between waves.</li>
+    <li>**Rollback as a manual decision.** Wire alarms to roll back automatically.</li>
+    <li>**Treating config as safer than code.** Stage config, rules and flags too.</li>
+    <li>**Flags that never die.** Give each one a removal date.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Most incidents start with a change; make changes small, observed and reversible.</li>
+    <li>Rolling, blue-green and canary deploys each limit how much traffic a bad version touches.</li>
+    <li>Deploy to one box, then waves, with bake time and automatic rollback on alarms.</li>
+    <li>Feature flags separate shipping from turning on; stage config and rule changes like code.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you deploy changes to a high-traffic service safely?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Blue-green or canary?", "How do feature flags help?"]}
+>
+  <p>Make changes small and backward-compatible, then roll them out progressively: a canary on one server or a small percentage of traffic, compared automatically against the existing fleet on error rate and latency, then increasing waves with bake time between them, and automatic rollback if alarms fire. Blue-green gives instant switch and rollback at the cost of double capacity; canaries limit exposure more finely.</p>
+  <p>Feature flags let me deploy code turned off and enable it gradually by user percentage, so a bad feature is turned off in seconds without a deploy. Database changes go through expand and contract so every intermediate state works with both versions, and configuration and flag changes get the same staged rollout as code.</p>
+</InterviewCard>

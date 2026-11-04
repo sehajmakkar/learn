@@ -1,0 +1,140 @@
+export const meta = {
+  summary: "Where limits are enforced decides what they can protect: at the edge, in the gateway, in each service, or in the client. Sharing counters across servers with Redis, local limits that need no network call, choosing what to key on, and failing open or closed.",
+  uses: ["14.03", "03.07", "02.05", "05.02"],
+  usedIn: ["15.03"],
+};
+
+<BeforeYouStart>
+  Read <L id="14.03" /> for the algorithms, and <L id="03.07" /> for the gateway that often enforces them.
+</BeforeYouStart>
+
+## The problem: 40 servers, one limit
+
+Snip's limit is "100 link creations per minute per <Term t="api">API</Term> key". But requests from one key are spread across 40 app
+servers by the load balancer. If each server keeps its own count, the key really gets 4,000 a minute. Where the
+counting happens, and what it's keyed on, matters as much as the algorithm.
+
+## The layers
+
+| Where | Protects against | Knows |
+| --- | --- | --- |
+| **Edge / CDN** | Floods and abuse before they reach you | IP address, URL, headers |
+| **API gateway** | Per-key and per-plan quotas, across all services | API key, user, plan, route |
+| **Each service** | Overload of its own dependencies, expensive operations | Everything about the request |
+| **Client** | Its own retries and bursts | Its own behaviour |
+
+Most systems use several. Snip limits by IP at the CDN (stopping floods of redirects or link creation from one
+address), by API key and plan in the gateway (100 link creations a minute on the basic plan), and inside the link
+service on the database's capacity (a cap on concurrent writes, <L id="03.11" />).
+
+## Sharing counts across servers
+
+For a global "100 per minute per key", the count has to be shared. The usual store is **Redis**, with the check done
+atomically on the server so two app servers can't both read 99 and both allow:
+
+- A fixed or <Term t="sliding-window">sliding window counter</Term>: `INCR` the current window's key and set an expiry, in one script, compare with
+  the limit.
+- A <Term t="token-bucket">token bucket</Term>: a short script that reads the bucket, refills it for the elapsed time, takes a token and writes it
+  back, all as one atomic step.
+
+That adds a network round trip (around half a millisecond, <L id="01.04" />) to every limited request, and Redis
+becomes a dependency of the API.
+
+## Local limits: no round trip
+
+Alternatives trade precision for speed:
+
+- **Divide the limit.** With 40 servers, each allows 100 ÷ 40 per key. No coordination, but uneven load balancing makes
+  it inaccurate, and it changes whenever the fleet resizes.
+- **Local buckets, synced periodically.** Each server counts locally and reconciles with a shared store every second
+  or so. Limits are approximately right, overshooting briefly.
+
+For abuse protection, approximate is fine; for billing quotas ("10,000 API calls a month"), use the shared, exact
+counter.
+
+## What to key on
+
+- **API key or user**: the normal choice for authenticated APIs. Fair and hard to evade.
+- **IP address**: for unauthenticated traffic. Many users can share one IP (offices, mobile carriers), and attackers
+  can rotate through many, so set it generously and combine it with other signals.
+- **Route or cost**: creating a link costs far more than reading one; weight requests by cost, or give expensive
+  routes their own limit.
+- **Hot keys**: one enormous customer's counter in Redis is a hot key (<L id="05.02" />); a local pre-check before the
+  shared one keeps it off the shard.
+
+## When the limiter is down
+
+If Redis is unreachable, should requests be allowed (**fail open**) or rejected (**fail closed**)? For most APIs, fail
+open: a brief window without per-key limits is better than rejecting every customer, and the service's own
+concurrency limits still protect it. Fail closed only where the limit protects something critical, such as a costly
+third-party quota.
+
+<Analogy>
+  **Security at a festival.** The perimeter fence stops crowds and anyone obviously unwelcome (the edge). The wristband check at each stage limits how often a ticket holder can enter VIP areas, and every stage shares the same list (the gateway with a shared counter). And each bar has its own cap on how many it can serve at once (the service), whatever the wristbands say.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="GitHub"
+    system="REST API rate limits"
+    year="Docs"
+    href="https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"
+    source="Rate limits for the REST API (GitHub documentation)"
+    found="Per-user primary limits with headers on every response, plus secondary limits on concurrency and cost."
+  >
+    Authenticated requests count towards a personal limit of 5,000 requests per hour, and unauthenticated ones are
+    limited to 60 per hour. Every response carries x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-used and
+    x-ratelimit-reset. Separate secondary limits cap, for example, concurrent requests at 100 and REST usage at 900
+    points per minute, and can change without notice.
+  </Seen>
+  <Seen
+    company="IETF"
+    system="429 Too Many Requests"
+    year={2012}
+    href="https://www.rfc-editor.org/rfc/rfc6585.txt"
+    source="RFC 6585: Additional HTTP Status Codes (Nottingham and Fielding)"
+    found="The standard status code for rate limiting, optionally with Retry-After."
+  >
+    RFC 6585 defines 429 Too Many Requests: the user has sent too many requests in a given amount of time ("rate
+    limiting"). The response may include a Retry-After header indicating how long to wait before making a new request.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip enforces '100 per minute per API key' with an in-memory counter on each of 40 app servers. A customer reports they can make 3,000 requests a minute. Why, and what's the fix?"
+  options={[
+    { text: "The limiter has a bug in its window logic", why: "Each server's limiter works; the problem is that each one only sees its own share of the traffic." },
+    { text: "Each server counts separately, so the key gets up to 100 per server; keep the counter in a shared store like Redis with an atomic check", correct: true, why: "A global limit needs a global count. Atomic scripts in Redis stop servers racing past the limit." },
+    { text: "Rate limits can't work behind a load balancer", why: "They can, with a shared counter or limits divided across servers." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Per-server counters for global limits.** Share the count, or divide the limit deliberately.</li>
+    <li>**Read-then-write checks.** Two servers race past the limit; make the check atomic in the store.</li>
+    <li>**Keying only on IP.** Shared IPs punish innocent users; prefer API keys and users where you can.</li>
+    <li>**Failing closed by accident.** Decide what happens when the limiter's store is down.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Enforce limits in layers: IP floods at the edge, per-key quotas at the gateway, capacity in each service.</li>
+    <li>Global limits need a shared, atomic counter (often Redis); local limits are faster but approximate.</li>
+    <li>Key on API key or user where possible, weight by cost, and watch for hot keys.</li>
+    <li>Decide in advance whether to fail open or closed when the limiter is unavailable.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a distributed rate limiter for an API served by many servers.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you avoid a network call on every request?", "What happens if the counter store is down?"]}
+>
+  <p>Enforce at the API gateway, keyed by API key and route, with a token bucket or sliding window counter stored in Redis. Each check runs as one atomic script that reads, updates and decides, so concurrent servers can't both pass the limit, with keys expiring after the window. Responses return 429 with Retry-After and remaining-quota headers. Coarse IP-based limits sit at the edge to absorb floods, and services keep their own concurrency limits.</p>
+  <p>To avoid a round trip per request, servers can hold local token buckets for a share of the limit and sync with Redis periodically, accepting slight overshoot for abuse protection but not for billing quotas. Very hot keys get a local pre-check. If Redis is unavailable I'd usually fail open, relying on per-service concurrency limits for safety.</p>
+</InterviewCard>

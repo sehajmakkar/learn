@@ -1,0 +1,135 @@
+export const meta = {
+  summary: "Surviving the loss of a data centre or a whole region: static stability within a region, the four recovery strategies from backup-and-restore to active-active, what replication lag means for lost data, and why failover must be practised.",
+  uses: ["14.07", "08.03", "04.07", "08.01", "14.02"],
+  usedIn: ["14.09"],
+};
+
+<BeforeYouStart>
+  Read <L id="14.07" /> for <Term t="rpo">RPO</Term> and <Term t="rto">RTO</Term>, and <L id="08.03" /> for the consistency you give up across regions.
+</BeforeYouStart>
+
+## The problem: Virginia goes dark
+
+Snip runs in two regions (<L id="08.02" />), but until now, the second one only served reads; all writes went to
+Virginia. What happens if Virginia, all of it, becomes unreachable for six hours? And, more commonly, what happens
+when one of its three availability zones fails?
+
+Disasters come in sizes, and each size has its own answer.
+
+## Losing a zone: static stability
+
+A region has several **availability zones**: separate data centres with independent power and networking, close enough
+for fast replication. Spreading servers and replicas across three zones means losing one is routine.
+
+The subtle part is what recovery **requires**. If surviving zones must launch new servers to absorb the lost zone's
+load, recovery depends on the control plane that launches servers working perfectly during an incident, exactly when
+it's busiest. A **statically stable** design needs no such action: each zone runs with enough spare capacity that the
+other two can carry the full load as they are. With three zones, that means running about 50% over, each zone at
+about two-thirds of what it can take. Amazon describes this as the system continuing to work even when a dependency
+becomes impaired.
+
+## Losing a region: four strategies
+
+From cheapest and slowest to most expensive and fastest:
+
+| Strategy | Second region holds | Recovery time | Data loss |
+| --- | --- | --- | --- |
+| **Backup and restore** | Backups only | Hours to days: rebuild everything | Since the last backup |
+| **Pilot light** | Replicated data, servers switched off | Tens of minutes to start servers | Replication lag |
+| **Warm standby** | A scaled-down, running copy | Minutes: scale it up | Replication lag |
+| **Active-active** | A full copy, serving traffic | Near zero | Near zero for local writes |
+
+Snip chooses **warm standby** for its write path: Frankfurt runs a small copy of every service and a replica of every
+database. Failing over means promoting Frankfurt's replicas to primaries, scaling up, and pointing traffic there.
+Redirects are already **active-active**, served from both regions' caches and replicas.
+
+## Data loss is replication lag
+
+Cross-region replication is asynchronous: waiting for an ocean round trip on every write would slow everything
+(<L id="08.03" />). So whatever Virginia committed but hadn't yet shipped to Frankfurt is lost if Virginia vanishes.
+Snip's cross-region lag is usually under a second, so its RPO for a region loss is about a second, a few minutes in a
+bad case. For writes that can't be lost, the options are synchronous cross-region commits (slow) or designs where each
+region owns some data and accepts some unavailability during a split.
+
+## Failover is a procedure, not a switch
+
+- **Decide who decides.** Automatic regional failover risks flapping on a false alarm (<L id="08.01" />); most teams
+  make it a deliberate human decision with a pre-written runbook.
+- **Avoid split-brain.** Before promoting Frankfurt, make sure Virginia can't also take writes when it comes back
+  (fencing, <L id="08.08" />).
+- **Fail back carefully.** Writes made in Frankfurt during the outage must be reconciled with whatever Virginia had
+  that never replicated.
+- **Practise.** Fail over in a planned exercise every quarter. A failover that's never been run will fail in some way
+  nobody predicted.
+
+<Analogy>
+  **A theatre's understudies.** Covering for one sick actor shouldn't require rehearsing the whole cast that night (static stability: the understudy already knows the part). Losing the whole theatre is different: you might have only the scripts (backup and restore), a second venue ready but dark (pilot light), a smaller touring company already performing (warm standby), or two full productions running nightly (active-active). And the switch only works smoothly if you've rehearsed it.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Static stability"
+    year={2019}
+    href="https://builder.aws.com/content/3K9SiqiJ369TGkkGzqPM95BuYWI/static-stability-using-availability-zones"
+    source="Static stability using Availability Zones (Mike Furr, Amazon Builders' Library)"
+    found="Provision enough in each zone that losing one needs no new capacity: with three zones, about 50% over."
+  >
+    In a statically stable design, the overall system keeps working even when a dependency becomes impaired. Rather
+    than launching new instances when a zone fails, a statically stable service overprovisions so it continues
+    operating correctly without launching any. With three availability zones, that means overprovisioning by 50
+    percent, each zone running at about 66 percent of the level it has been load-tested for.
+  </Seen>
+  <Seen
+    company="Amazon"
+    system="Disaster recovery strategies"
+    year="Docs"
+    href="https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html"
+    source="Disaster recovery options in the cloud (AWS whitepaper)"
+    found="Backup and restore, pilot light, warm standby, and multi-site active/active, in order of cost and recovery speed."
+  >
+    The whitepaper describes four approaches. With backup and restore, backup frequency determines the achievable
+    recovery point. Pilot light keeps data replicated and core infrastructure available with servers switched off, so it
+    can't serve requests without action first; warm standby runs a scaled-down copy that can handle traffic immediately
+    at reduced capacity. Multi-site active/active can reduce recovery time to near zero for most disasters.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's three-zone service runs each zone at 90% of its capacity, relying on autoscaling to replace a lost zone. A zone fails during a large outage of the cloud provider's control plane. What happens?"
+  options={[
+    { text: "Autoscaling adds servers in the other zones within minutes", why: "Autoscaling depends on the control plane, which is impaired exactly when it's needed." },
+    { text: "The two surviving zones are asked to carry 135% of their capacity and fail; the design wasn't statically stable", correct: true, why: "Running each zone at about two-thirds of capacity lets the other two absorb a lost zone without launching anything." },
+    { text: "Traffic fails over to another region automatically", why: "Only if that's been built and tested, and it's a far bigger step than losing one zone should need." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Recovery that needs new capacity.** Provision so surviving zones can carry the load as they stand.</li>
+    <li>**Assuming zero data loss across regions.** Asynchronous replication loses the lag; plan for it.</li>
+    <li>**Automatic regional failover without fencing.** Risk of two primaries; make it a deliberate, fenced step.</li>
+    <li>**Never practising.** Run failovers on a schedule, including failing back.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Survive a zone with static stability: enough spare capacity that nothing needs launching.</li>
+    <li>Survive a region with backup and restore, pilot light, warm standby or active-active, trading cost for recovery speed.</li>
+    <li>Cross-region data loss equals replication lag at the moment of failure.</li>
+    <li>Failover needs a runbook, fencing, a fail-back plan, and regular practice.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you design a service to survive the loss of an entire region?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["Active-active or warm standby?", "How much data would you lose?"]}
+>
+  <p>First, survive zones within a region with static stability: spread across three zones with enough headroom that two can carry everything without scaling. For a region, choose by RTO, RPO and cost: backup and restore, pilot light with replicated data, a warm standby running at reduced scale, or active-active. I'd typically run reads active-active and keep a warm standby for the write path, with databases replicating asynchronously to the second region.</p>
+  <p>Data loss equals the replication lag when the region fails, usually seconds. Failover means promoting replicas, scaling up and moving traffic by DNS or global load balancing, with fencing so the old primary can't accept writes on return, and a plan to reconcile on fail-back. It's practised regularly, since an untested failover is unlikely to work under pressure.</p>
+</InterviewCard>

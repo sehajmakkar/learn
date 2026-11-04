@@ -27,6 +27,7 @@ import { Bm25Lab } from "@/components/labs/bm25";
 import { HyperLogLogLab } from "@/components/labs/hyperloglog";
 import { GeohashLab } from "@/components/labs/geohash";
 import { ChunkingLab } from "@/components/labs/chunking";
+import { RateLimiterLab } from "@/components/labs/rate-limiter";
 
 /** Fenced code blocks (```ts … ```) get the same highlighted, scrollable frame as <Code>. */
 function Pre({ children }: { children?: ReactNode }) {
@@ -78,6 +79,7 @@ const components: MDXComponents = {
   HyperLogLogLab,
   GeohashLab,
   ChunkingLab,
+  RateLimiterLab,
 };
 
 export function useMDXComponents(): MDXComponents {

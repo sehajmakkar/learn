@@ -1,0 +1,165 @@
+export const meta = {
+  summary: "Who are you, what may you do, and are you trying to misuse the system? Password storage done properly (tested), sessions versus tokens and the revocation problem, authorisation models from roles to relationships, and defending a link shortener against phishing and bots.",
+  uses: ["13.05", "14.04", "08.02", "06.04"],
+  usedIn: ["13.05", "14.11"],
+};
+
+<BeforeYouStart>
+  <L id="13.05" /> showed signed URLs as bearer tokens; session tokens have the same strengths and weaknesses. Abuse
+  defences build on rate limiting (<L id="14.04" />).
+</BeforeYouStart>
+
+## The problem: three different questions
+
+Snip's security review lists three areas, often blurred together:
+
+- **Authentication**: is this really Ana? (Logins, passwords, tokens.)
+- **Authorisation**: may Ana edit link `x7Kp`? (She owns it; her teammate can view it; an outsider can't.)
+- **Abuse**: is someone using Snip legitimately but for harm? (Phishing links, spam, bots inflating click counts.)
+
+## Store passwords so a leak is survivable
+
+Assume the user table will leak one day. Passwords must be stored so that a leak doesn't reveal them:
+
+- **Hash, never encrypt.** Encrypted passwords can be decrypted by whoever has the key; a hash can't be reversed.
+- **Use a slow, salted, memory-hard function.** OWASP's recommendation is Argon2id (at least 19 MiB of memory, 2
+  iterations, parallelism 1), or scrypt if that's unavailable (N = 2¹⁷, r = 8, p = 1), with bcrypt for legacy systems.
+  General-purpose hashes like SHA-256 are far too fast: attackers can try billions of guesses a second.
+- **A unique random salt per password**, so identical passwords produce different hashes and precomputed tables are
+  useless.
+
+```ts
+import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+
+const scrypt = promisify(scryptCb) as (pw: string, salt: Buffer, len: number, opts: object) => Promise<Buffer>;
+const PARAMS = { N: 2 ** 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 }; // OWASP's minimum for scrypt
+
+export async function hashPassword(password: string) {
+  const salt = randomBytes(16);
+  const hash = await scrypt(password, salt, 32, PARAMS);
+  return `scrypt$${salt.toString("base64")}$${hash.toString("base64")}`;
+}
+
+export async function checkPassword(password: string, stored: string) {
+  const [, salt, hash] = stored.split("$");
+  const candidate = await scrypt(password, Buffer.from(salt, "base64"), 32, PARAMS);
+  return timingSafeEqual(candidate, Buffer.from(hash, "base64"));
+}
+```
+
+Tested: the right password verified, a version differing only in one capital letter didn't, the same password hashed
+twice gave two different strings (different salts), and each check took about a third of a second. That cost is the
+point: negligible for one login, ruinous for an attacker trying billions. Better still, let users sign in with a
+passkey or an identity provider, and don't store passwords at all.
+
+## Sessions or tokens
+
+After login, each request must prove who it's from:
+
+- **Server-side sessions**: a random session ID in a cookie, looked up in a session store. Revoking is deleting the row.
+  Every request costs a lookup (usually a cache hit).
+- **Self-contained tokens** (such as signed JWTs): the token carries the user ID and expiry, signed, so any server can
+  verify it without a lookup. But like signed URLs (<L id="13.05" />), they're bearer tokens that **can't be revoked
+  before they expire** without adding a lookup back in.
+
+The common compromise: short-lived access tokens (minutes) plus a long-lived refresh token checked against the server
+when renewing; revoking the refresh token cuts access off within minutes. Cookies carrying sessions should be
+`HttpOnly`, `Secure` and `SameSite`.
+
+## Authorisation: from roles to relationships
+
+- **Ownership checks** in code ("is `link.owner_id` the current user?") work until sharing arrives.
+- **Roles** (RBAC): admin, editor, viewer per team. Simple and auditable.
+- **Relationships** (ReBAC): permissions follow relationships, "Ana can edit this link because she's an editor of the
+  workspace that owns its folder". Google's Zanzibar handles Google's authorisation this way, as a central service
+  storing relationships, at trillions of access control lists and millions of checks a second.
+
+Whatever the model, check authorisation **on the server, on every request**, for the specific object: the commonest
+serious bug is an API that checks you're logged in but not that the link ID in the URL is yours.
+
+## Abuse: when the user is the threat
+
+A link shortener is a favourite tool for phishing, because the short link hides the destination. Snip layers its
+defences:
+
+- **Check destinations** against blocklists before and after creation (<L id="05.08" />), and re-check periodically,
+  since a clean page can turn malicious later.
+- **Friction proportional to trust**: new accounts get low rate limits (<L id="14.04" />); limits rise with account age,
+  payment and good history.
+- **Interstitial warnings** for suspicious destinations, and the ability to disable a link globally in seconds,
+  including purging it from the CDN (<L id="06.04" />).
+- **Bot detection on clicks**, so click counts reflect people.
+- **A reporting path** for the public, handled quickly.
+
+<Analogy>
+  **An office building.** Authentication is the badge check at the door; authorisation is which floors your badge opens; abuse is the visitor with a valid badge who uses the meeting rooms to run a scam. Each needs its own guard, and the badge readers store fingerprints of badges, never the master keys.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="OWASP"
+    system="Password Storage Cheat Sheet"
+    year="Docs"
+    href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html"
+    source="Password Storage Cheat Sheet (OWASP)"
+    found="Hash with a slow, salted algorithm, Argon2id first, scrypt or bcrypt otherwise; never encrypt or store plain text."
+  >
+    Passwords should be hashed with modern, adaptive algorithms such as Argon2id, bcrypt or PBKDF2, rather than
+    encrypted or stored in plain text, with a unique salt per password. The recommended minimum for Argon2id is 19 MiB
+    of memory, 2 iterations and 1 degree of parallelism; for scrypt, a cost of 2^17, block size 8 and parallelism 1;
+    bcrypt, with a work factor of at least 10, is for legacy systems.
+  </Seen>
+  <Seen
+    company="Google"
+    system="Zanzibar"
+    year={2019}
+    href="https://www.usenix.org/conference/atc19/presentation/pang"
+    source="Zanzibar: Google's Consistent, Global Authorization System (USENIX ATC 2019)"
+    found="One authorisation service for many products, at trillions of ACLs and under 10 ms at the 95th percentile."
+  >
+    Zanzibar provides a uniform data model and configuration language for expressing access control policies across
+    Google's services. It scales to trillions of access control lists and millions of authorisation requests per
+    second, has maintained 95th-percentile latency under 10 milliseconds, and has had availability above 99.999% over
+    three years of production use.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's API checks that a request has a valid session, then updates the link whose ID is in the URL. What's the vulnerability?"
+  options={[
+    { text: "None: only logged-in users can call it", why: "Logged in isn't the same as allowed. Any user can put another user's link ID in the URL." },
+    { text: "Any logged-in user can edit anyone's link by changing the ID; check the user may access that specific object on every request", correct: true, why: "This is one of the commonest serious API bugs: authentication without object-level authorisation." },
+    { text: "Sessions should be replaced by JWTs", why: "The token format doesn't matter; the missing per-object check does." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Fast or unsalted password hashes.** Use Argon2id, scrypt or bcrypt with unique salts.</li>
+    <li>**Long-lived bearer tokens.** They can't be revoked early; keep access tokens short and refresh tokens checkable.</li>
+    <li>**Checking login but not ownership.** Authorise every request against the specific object.</li>
+    <li>**Treating abuse as someone else's problem.** Any public creation feature will be abused; design limits and kill switches in.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Authentication, authorisation and abuse are separate problems with separate defences.</li>
+    <li>Store passwords with a slow, salted, memory-hard hash (Argon2id, scrypt); prefer passkeys or an identity provider.</li>
+    <li>Sessions revoke easily; self-contained tokens verify cheaply but can't be revoked early, so keep them short.</li>
+    <li>Authorise per object on every request; defend against abuse with trust-based limits, destination checks and kill switches.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you store passwords and manage user sessions?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["JWTs or server sessions?", "How do you log a user out everywhere?"]}
+>
+  <p>Never store passwords in plain text or encrypted. Hash them with a deliberately slow, memory-hard function like Argon2id or scrypt, with a unique random salt per password and parameters tuned so a check takes tens to hundreds of milliseconds, and compare in constant time. Better still, support passkeys or a trusted identity provider so there's no password to store.</p>
+  <p>For sessions, a random session ID in an HttpOnly, Secure, SameSite cookie mapped to server-side state is simple and easy to revoke. Signed tokens like JWTs avoid a lookup but can't be revoked before expiry, so I'd keep access tokens to minutes and pair them with refresh tokens checked against the server; logging out everywhere revokes the refresh tokens, and access ends within minutes.</p>
+</InterviewCard>

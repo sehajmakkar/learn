@@ -34,7 +34,7 @@ shape, for Postgres:
 | Add a `NOT NULL` constraint | Scans the table to check every row |
 | Rename a column | Instant for the database, but breaks every running app that uses the old name |
 
-Two habits avoid most outages: build indexes **concurrently**, and set a short **lock timeout** on migration
+Two habits avoid most outages: build indexes **concurrently**, and set a short **<Term t="lock-timeout">lock timeout</Term>** on migration
 sessions. Even an instant change must first acquire its lock; if a long query holds the table, the migration waits,
 and every new query queues behind the waiting migration. A lock timeout makes the migration give up and retry instead
 of freezing the table.

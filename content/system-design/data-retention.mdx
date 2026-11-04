@@ -1,0 +1,160 @@
+export const meta = {
+  summary: "Deleting a user is a distributed systems problem: their data lives in the database, caches, search, analytics, logs and backups. Retention schedules, deletion pipelines with deadlines, crypto-shredding for copies you can't reach, and collecting less in the first place.",
+  uses: ["14.07", "11.06", "10.03", "06.04", "14.10"],
+  usedIn: ["16.02"],
+};
+
+<BeforeYouStart>
+  You'll need backups (<L id="14.07" />), raw versus derived data (<L id="11.06" />), and the copies kept in sync by
+  pipelines (<L id="10.03" />) and caches (<L id="06.04" />).
+</BeforeYouStart>
+
+## The problem: "delete my account"
+
+A Snip customer in Germany closes their account and asks for their data to be erased. Under the EU's GDPR, Snip must
+erase personal data without undue delay when one of the listed grounds applies, such as the data no longer being needed
+or consent being withdrawn. "Delete the row in `users`" is the easy 1%. The customer's data is also in:
+
+- the `links` and `links_by_owner` shards (<L id="05.01" />) and every Redis cache entry for their links;
+- the search index (<L id="10.03" />) and the analytics rollups and click archives (<L id="11.06" />);
+- their uploaded files in object storage, and copies at CDN edges (<L id="13.05" />);
+- application logs, support tickets, the data warehouse;
+- and every backup taken in the last 90 days (<L id="14.07" />).
+
+## Collect less, keep it shorter
+
+The cheapest data to delete is data never stored:
+
+- **Minimise**: Snip stores a click's country and a salted hash of the IP address, not the IP itself; it doesn't need
+  the address to count unique visitors (<L id="11.03" />).
+- **Retention schedules** per data type, enforced automatically: raw click events 13 months, application logs 30
+  days, support tickets 2 years after closure. Expiry by TTL or partition drops (dropping a whole month's partition) is
+  far cheaper than deleting row by row.
+- **Separate identity from activity**: analytics keyed by an internal ID that maps to a person only through one table,
+  which is easy to delete.
+
+## A deletion pipeline
+
+Treat erasure like any other change that must reach many systems: as an **event** that every system consumes
+(<L id="07.06" />).
+
+1. **Soft delete immediately**: mark the account deleted, block sign-in, stop serving its links (and purge them from
+   caches and the CDN).
+2. **Grace period**: keep the data briefly, say 14 days, for accidental closures and fraud checks.
+3. **Publish `account.erased`**: every service that holds personal data consumes it and deletes or anonymises its
+   copy, then reports back.
+4. **Track to completion**: a deletion ledger records which systems have confirmed, with alerts for stragglers.
+5. **Let backups age out**: backups aren't edited one record at a time; they expire on their own schedule, and if one
+   is ever restored, the deletion ledger is replayed against it before use.
+
+Google Cloud documents the same shape: a deletion request, soft deletion, logical deletion from active systems
+(generally about two months), then expiry from backups, with a commitment to delete customer data within about six
+months.
+
+## Crypto-shredding: deleting what you can't reach
+
+Some copies are impractical to edit: backups, archives, logs replicated to many places. **Crypto-shredding** solves
+this by encrypting each user's sensitive data with a **key of its own**, and deleting the key to erase the data
+everywhere at once:
+
+```ts
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+
+const keys = new Map<number, Buffer>(); // in production: a key store, one key per user
+
+export function encryptFor(userId: number, plaintext: string) {
+  let key = keys.get(userId);
+  if (!key) keys.set(userId, (key = randomBytes(32)));
+  const iv = randomBytes(12);
+  const c = createCipheriv("aes-256-gcm", key, iv);
+  const body = Buffer.concat([c.update(plaintext, "utf8"), c.final()]);
+  return Buffer.concat([iv, c.getAuthTag(), body]).toString("base64");
+}
+
+export function decryptFor(userId: number, blob: string) {
+  const key = keys.get(userId);
+  if (!key) throw new Error("key destroyed: data is unreadable");
+  const b = Buffer.from(blob, "base64");
+  const d = createDecipheriv("aes-256-gcm", key, b.subarray(0, 12));
+  d.setAuthTag(b.subarray(12, 28));
+  return Buffer.concat([d.update(b.subarray(28)), d.final()]).toString("utf8");
+}
+
+export const forgetUser = (userId: number) => keys.delete(userId); // every copy, everywhere, becomes unreadable
+```
+
+Tested: a record decrypted correctly; after `forgetUser`, the same stored ciphertext could no longer be read. The key
+store must itself be backed up carefully, without keeping deleted keys, and it becomes critical infrastructure: lose it,
+and you lose every user's data.
+
+<Analogy>
+  **Moving out of a shared house.** Taking your things from your room is quick, but your name is also on the post pile, in the shared calendar, in photos on the fridge and in last year's photo albums. A good housemate keeps a list of everywhere your name appears, and for the albums nobody wants to reprint, you agree to black out your face with a marker that can't be undone.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="European Union"
+    system="GDPR Article 17"
+    year={2016}
+    href="https://gdpr-info.eu/art-17-gdpr/"
+    source="Art. 17 GDPR: Right to erasure ('right to be forgotten') (unofficial text, gdpr-info.eu)"
+    found="Erase without undue delay on listed grounds, with exceptions such as legal obligations and legal claims."
+  >
+    The controller must erase personal data without undue delay where one of the listed grounds applies, including
+    that the data is no longer necessary for its purposes, that consent was withdrawn, or that it was processed
+    unlawfully. Exceptions include compliance with a legal obligation, archiving or research where erasure would make it
+    impossible, and the establishment, exercise or defence of legal claims.
+  </Seen>
+  <Seen
+    company="Google Cloud"
+    system="Data deletion"
+    year={2026}
+    href="https://docs.cloud.google.com/docs/security/deletion"
+    source="Data deletion on Google Cloud"
+    found="A staged pipeline: soft delete, deletion from active systems in about two months, backups expiring within about six."
+  >
+    Google Cloud describes deletion in stages: the request, soft deletion (aimed at within 24 hours, with a recovery
+    period of up to 30 days for some services), logical deletion from active systems, which generally takes about two
+    months, and expiry from backups within six months. It commits to deleting customer data within a maximum of about
+    180 days, and uses cryptographic erasure, deleting the keys needed to decrypt data, for some storage.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip deletes a closed account's rows from Postgres and considers the request done. Two weeks later, the user's email still appears in search autocomplete. Why, and what's the fix?"
+  options={[
+    { text: "The search index is buggy", why: "The index is doing its job: nothing told it to remove the data." },
+    { text: "Deletion only reached one copy; publish an erasure event every system with personal data consumes, and track each one to completion", correct: true, why: "Personal data spreads to caches, indexes, analytics and logs. Erasure must reach all of them, with a ledger confirming each." },
+    { text: "Autocomplete should be turned off", why: "That hides one symptom; the data is still in many other places." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Deleting only from the primary database.** Map every copy: caches, indexes, analytics, logs, files, backups.</li>
+    <li>**Keeping everything forever.** Set retention schedules and expire automatically.</li>
+    <li>**Logging personal data by default.** Logs are copied widely and kept long; keep personal data out.</li>
+    <li>**Crypto-shredding with backed-up keys.** If deleted keys survive in a backup, nothing was shredded.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A user's data spreads to many systems; deleting it means reaching every copy.</li>
+    <li>Collect less, separate identity from activity, and expire data on schedules.</li>
+    <li>Run erasure as an event with a ledger: soft delete, grace period, every system confirms, backups age out.</li>
+    <li>Crypto-shredding erases unreachable copies by destroying a per-user key.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you implement 'delete my account' across a large system, including GDPR erasure?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["What about backups?", "How do you know every system has deleted the data?"]}
+>
+  <p>Start by inventorying every system holding personal data: primary stores, caches, search indexes, analytics, object storage, logs, third-party processors and backups. The account is soft-deleted immediately so it stops being used and served, then after a short grace period an erasure event is published that each owning service consumes to delete or anonymise its copy and acknowledge. A deletion ledger tracks completion per system with alerts for stragglers.</p>
+  <p>Backups aren't edited; they expire on a bounded schedule, and any restore replays the ledger before use. For data that's impractical to delete everywhere, crypto-shredding encrypts it with a per-user key and deletes the key. Underneath, data minimisation and retention schedules keep the problem small, along with keeping personal data out of logs.</p>
+</InterviewCard>

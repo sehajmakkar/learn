@@ -56,7 +56,7 @@ it down. Two defences:
 
 - **Retry at one point in the stack**, usually the layer closest to the user or the one that knows whether the
   operation is safe to repeat. Inner layers fail fast.
-- **A retry budget.** Allow retries only while they're a small share of traffic: a token bucket where each retry
+- **A retry budget.** Allow retries only while they're a small share of traffic: a <Term t="token-bucket">token bucket</Term> where each retry
   costs a token and tokens refill slowly. In a brief blip, every call can retry; in a long outage, retries drop to a
   trickle automatically.
 

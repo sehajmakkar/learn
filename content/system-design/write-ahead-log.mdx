@@ -53,7 +53,7 @@ millisecond or so.
 Once you have an ordered record of every change, it turns out to be useful well beyond crash recovery:
 
 - **Replication.** Send the log to another server and have it replay the records: that's a replica (<L id="04.07" />).
-- **Point-in-time recovery.** Take a full **base backup** now and then, and archive every WAL file since. To recover
+- **<Term t="pitr">Point-in-time recovery</Term>.** Take a full **base backup** now and then, and archive every WAL file since. To recover
   to "10:42 yesterday, just before someone ran the bad `DELETE`", restore the base backup and replay the archived log
   up to 10:41.
 - **<Term t="change-data-capture">Change data capture</Term>.** Read the log to stream every change to other systems: search <Term t="index">indexes</Term>, caches, analytics

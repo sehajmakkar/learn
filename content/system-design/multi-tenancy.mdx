@@ -1,0 +1,116 @@
+export const meta = {
+  summary: "Many customers sharing one system, and the one whose traffic hurts everyone else. Pooled, partitioned and dedicated tenancy, per-tenant quotas and fair queuing, cells that cap the blast radius, and shuffle sharding, where each tenant's bad day touches almost nobody else.",
+  uses: ["14.03", "05.02", "03.11", "14.08"],
+  usedIn: ["16.10"],
+};
+
+<BeforeYouStart>
+  Read <L id="14.03" /> for per-key limits, and <L id="05.02" />: a noisy tenant is a hot key with a contract.
+</BeforeYouStart>
+
+## The problem: one agency slows down everyone
+
+Snip's 40,000 paying customers share the same servers, queues and databases. One agency launches a campaign that sends
+a burst of 2 million link creations through the <Term t="api">API</Term>, plus an export of three years of click history. For an hour, every
+other customer's link creation is slow and their exports sit queued. Nobody broke a rule; one tenant simply used a lot.
+
+That's the **noisy neighbour** problem, and every shared (multi-tenant) system has it.
+
+## How much to share
+
+| Model | What tenants share | Isolation | Cost per tenant |
+| --- | --- | --- | --- |
+| **Pooled** | Everything: servers, tables (with a tenant ID column), queues | Lowest | Lowest |
+| **Partitioned** | Infrastructure, but each tenant's data in its own schema, shard or queue | Medium | Medium |
+| **Dedicated (silo)** | Nothing: a separate stack per tenant | Highest | Highest |
+
+Most products mix them: pooled for the long tail, dedicated for the largest customers or those with strict compliance
+needs. Snip pools everyone, gives its top 20 agencies their own database shards and search indexes
+(<L id="10.04" />), and offers a dedicated deployment on its enterprise plan.
+
+## Limits per tenant
+
+The first defence is making sure no tenant can take more than its share:
+
+- **<Term t="rate-limit">Rate limits</Term> per tenant** on every expensive operation (<L id="14.03" />), set by plan.
+- **Concurrency limits per tenant**: at most 5 exports running at once per customer, however many they request.
+- **Fair queuing**: instead of one first-in-first-out queue, round-robin between tenants' queues, so one tenant's 10,000
+  queued exports don't sit in front of everyone else's one.
+- **Quotas on size**: links per account, storage per account, so growth is a conversation, not an incident.
+
+## Cells: cap the blast radius
+
+Limits stop one tenant from using too much; they don't help if a tenant triggers a bug that crashes the servers they
+run on. **Cells** split the system into several complete, independent copies, each serving a subset of tenants. A
+poison request or a bad deploy (<L id="14.05" />) can only take down one cell: a fraction of customers instead of all of
+them. Cells also cap how big any one deployment gets, so each is tested at a known scale.
+
+## Shuffle sharding
+
+Cells divide tenants into fixed groups, so each tenant shares a fate with everyone in its cell. **Shuffle sharding**
+does better. Give each tenant a random **combination** of a few workers out of many. Two tenants rarely get exactly the
+same combination, so a tenant that poisons its workers takes out only its own combination; other tenants usually
+share at most one of those workers, and still have the rest of theirs.
+
+Amazon's numbers: with 8 workers split into 4 regular shards of 2, a bad tenant affects 25% of tenants. With shuffle
+shards of 2 out of the same 8 workers, there are 28 combinations, and the impact drops to about 1/28th. Route 53 uses
+2,048 virtual name servers and gives each domain a shuffle shard of 4, which allows about 730 billion combinations.
+
+<Analogy>
+  **An apartment block.** Shared plumbing is cheap, but one flat running every tap starves the others of water pressure (noisy neighbour), so each flat gets a flow limit. The building is split into separate wings with their own pipes (cells), so a burst pipe floods one wing, not all. And if each flat drew from a random pair of several water tanks, one contaminated tank would affect only the few flats that drew on it, and most of them still have their other tank.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Shuffle sharding"
+    year={2019}
+    href="https://builder.aws.com/content/3F06NpJ8YeoIGP8VHTw4n81pFn8/workload-isolation-using-shuffle-sharding"
+    source="Workload isolation using shuffle-sharding (Amazon Builders' Library)"
+    found="Random combinations of workers per customer shrink a bad customer's blast radius from a shard to a sliver."
+  >
+    Shuffle sharding creates virtual shards, for example of two workers each, and assigns each customer to one. With
+    eight workers there are 28 unique pairs, so a problem's scope of impact is about 1/28th, seven times better than
+    regular sharding into four shards, where it would be 25 percent. For Route 53, Amazon arranged capacity into 2,048
+    virtual name servers and gave each domain a shuffle shard of four, for about 730 billion possible combinations.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's export workers take jobs from one shared queue in order. An agency queues 10,000 exports. What do other customers experience, and what's the best fix?"
+  options={[
+    { text: "Nothing: the workers are fast", why: "Their exports sit behind 10,000 others in a first-in-first-out queue." },
+    { text: "Hours of delay; queue per tenant (or fair-share the queue) and cap each tenant's concurrent exports", correct: true, why: "Fair queuing gives every tenant a turn, and a concurrency cap stops one tenant from occupying every worker." },
+    { text: "Add workers until the queue drains", why: "It helps temporarily, but the next large customer recreates the problem." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**One shared FIFO queue for all tenants.** One tenant's backlog delays everyone. Fair-queue by tenant.</li>
+    <li>**Limits only on request rate.** Also cap concurrency, size and storage per tenant.</li>
+    <li>**One giant deployment.** Cells and shuffle sharding cap the blast radius of bad tenants and bad deploys.</li>
+    <li>**The same tenancy for everyone.** Give the largest or most sensitive customers dedicated resources.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Multi-tenancy trades cost for isolation: pooled, partitioned, or dedicated per tenant.</li>
+    <li>Rate limits, concurrency limits, fair queuing and quotas keep each tenant to its share.</li>
+    <li>Cells limit how many tenants a failure can reach.</li>
+    <li>Shuffle sharding gives each tenant a random set of resources, so one tenant's bad day touches almost nobody else.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you prevent one customer from degrading service for others in a multi-tenant system?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["What's shuffle sharding?", "When would you give a tenant dedicated infrastructure?"]}
+>
+  <p>Start with per-tenant limits on rate, concurrency, size and storage, set by plan and enforced at the gateway and in each service, and replace shared FIFO queues with per-tenant or fair-share queues so one tenant's backlog doesn't block others. Monitor usage per tenant to find noisy ones early.</p>
+  <p>To limit blast radius from bugs or poison requests, split the system into cells, each a full stack serving a subset of tenants, and consider shuffle sharding, where each tenant gets a random combination of workers so two tenants rarely share all their resources. Large or regulated customers can get dedicated shards or stacks, at a higher price.</p>
+</InterviewCard>

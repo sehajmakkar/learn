@@ -1,0 +1,141 @@
+export const meta = {
+  summary: "Deciding how reliable is reliable enough: indicators, objectives and agreements, the error budget an objective implies, and alerting on how fast that budget burns instead of on every blip.",
+  uses: ["14.01", "01.03", "11.05"],
+  usedIn: ["14.05", "14.08"],
+};
+
+<BeforeYouStart>
+  Read <L id="14.01" /> for the signals, and <L id="01.03" /> for what availability means.
+</BeforeYouStart>
+
+## The problem: "make it never fail"
+
+After the lunchtime incident, a manager asks for Snip to "never be down again". The engineers know that's
+impossible, and that chasing it would freeze every release. What the team needs is an agreed answer to **how reliable
+is enough**, and a way to tell when Snip is spending reliability too fast.
+
+## Indicators, objectives, agreements
+
+Google's SRE book gives the vocabulary:
+
+- An **SLI** (service level indicator) is a carefully defined measure of service: the fraction of redirects answered
+  successfully within 100 ms at the load balancer.
+- An **SLO** (service level objective) is a target for an SLI: 99.9% of redirects, over a rolling 30 days.
+- An **SLA** (service level agreement) is a contract with users that includes **consequences** if SLOs are missed:
+  credits for Snip's paid customers below 99.5%.
+
+SLOs are internal and stricter than SLAs, so there's room to react before a contract is broken.
+
+Good SLIs measure what users feel, close to the user (at the load balancer or from the client), as a ratio of good
+events to all events. For Snip: redirect success and latency; link creation success; dashboard load time.
+
+## 100% is the wrong target
+
+Users can't tell 99.99% from 100% through their own phone networks and Wi-Fi, but the cost of the last nines is
+enormous: more redundancy, slower releases, no risk-taking. The SRE book is blunt that insisting on 100% is both
+unrealistic and undesirable.
+
+## Error budgets
+
+An SLO implies an **error budget**: the amount of unreliability you're allowed. For a 30-day window:
+
+| SLO | Allowed bad time (if fully down) |
+| --- | --- |
+| 99% | 432 minutes, about 7.2 hours |
+| 99.9% | 43.2 minutes |
+| 99.99% | 4.3 minutes |
+
+The budget turns reliability into a shared decision. While budget remains, the team ships features, runs
+experiments, does risky migrations. When it's spent, the team slows down: freezes risky releases and works on
+reliability until the window recovers. Nobody argues about whether a release is "too risky" in the abstract; the
+budget decides.
+
+## Alert on burn rate, not blips
+
+Paging someone whenever the error rate ticks above 0.1% for a minute produces endless noise. Instead, alert on how fast
+the budget is being used: the **burn rate**, which is how fast, relative to the SLO, the service consumes its budget. A
+burn rate of 1 uses exactly the whole budget in 30 days.
+
+Google's SRE workbook recommends **multiwindow, multi-burn-rate** alerts as a starting point:
+
+| Budget consumed | Over | Burn rate | Action |
+| --- | --- | --- | --- |
+| 2% | 1 hour | 14.4 | Page |
+| 5% | 6 hours | 6 | Page |
+| 10% | 3 days | 1 | Ticket |
+
+Each alert also checks a short window (such as the last 5 minutes for the 1-hour alert), so it stops firing soon after
+the problem is fixed. A sharp outage pages within minutes; a slow leak that would quietly drain the month's budget
+becomes a ticket; a brief blip does neither.
+
+<Analogy>
+  **A household budget for treats.** Banning all treats makes everyone miserable; unlimited treats leave nothing for rent. Agreeing a monthly allowance means small treats need no debate, and when it's gone it's gone. And you don't panic over one coffee; you worry if you've spent half the month's allowance by the 3rd.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="SLIs, SLOs and error budgets"
+    year={2017}
+    href="https://sre.google/sre-book/service-level-objectives/"
+    source="Service Level Objectives (Site Reliability Engineering, chapter 4)"
+    found="Define indicators, set objectives below 100%, and manage the gap as an error budget."
+  >
+    The chapter defines an SLI as a carefully defined quantitative measure of the level of service, an SLO as a target
+    value or range for an SLI, and an SLA as a contract with users that includes consequences of meeting or missing
+    its SLOs. It calls insisting that SLOs be met 100% of the time unrealistic and undesirable, and recommends an error
+    budget, a rate at which SLOs can be missed, tracked daily or weekly.
+  </Seen>
+  <Seen
+    company="Google"
+    system="Alerting on SLOs"
+    year={2018}
+    href="https://sre.google/workbook/alerting-on-slos/"
+    source="Alerting on SLOs (The Site Reliability Workbook, chapter 5)"
+    found="Page on fast budget burn, ticket on slow burn, with a short window so alerts reset quickly."
+  >
+    The workbook defines burn rate as how fast, relative to the SLO, the service consumes its error budget: with a 99.9%
+    SLO over 30 days, a constant 0.1% error rate is a burn rate of 1. Its recommended starting points page when 2% of
+    the budget is consumed in an hour (burn rate 14.4) or 5% in six hours (6), and open a ticket for 10% in three days
+    (1), each paired with a shorter window.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's redirect SLO is 99.9% over 30 days. An incident makes 2% of redirects fail for 30 minutes. Roughly how much of the month's error budget did it use?"
+  options={[
+    { text: "About 2%", why: "That's the failure rate during the incident, not the share of the budget used." },
+    { text: "About 1.4%", correct: true, why: "Failing 2% of requests is 20 times the allowed 0.1%: a burn rate of 20. Half an hour at burn rate 20 uses as much budget as 10 hours at burn rate 1, and the budget lasts 720 hours at burn rate 1: 10 ÷ 720 is about 1.4%." },
+    { text: "About 70%", why: "Only if the incident had been a full outage for about 30 minutes. A 2% failure rate uses budget fifty times more slowly than a full outage." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Aiming for 100%.** It's unachievable and blocks all change. Pick the reliability users need.</li>
+    <li>**SLIs measured far from users.** Server CPU isn't user experience; measure success and latency at the edge.</li>
+    <li>**Paging on every threshold breach.** Alert on burn rate over multiple windows.</li>
+    <li>**An error budget with no consequences.** Agree in advance what happens when it's spent.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>SLIs measure user-visible service; SLOs set internal targets; SLAs are contracts with consequences.</li>
+    <li>100% is the wrong target; the gap below it is the error budget (99.9% over 30 days is 43.2 minutes).</li>
+    <li>Spend the budget on change while it lasts; slow down when it's gone.</li>
+    <li>Alert on burn rate with multiple windows: page fast burns, ticket slow ones.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What are SLIs, SLOs and error budgets, and how would you alert on them?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["How do you choose an SLO?", "What's a burn rate?"]}
+>
+  <p>An SLI is a measured ratio of good events to valid events that reflects user experience, such as requests served successfully under 200 ms. An SLO is the target for it over a window, say 99.9% over 30 days, set from what users need and what the system can achieve, below 100%. The remainder is the error budget, about 43 minutes of full outage a month at 99.9%, which the team can spend on releases and experiments; when it's exhausted, risky changes pause.</p>
+  <p>I'd alert on burn rate, the rate of budget consumption relative to a steady burn that would exactly use it up in the window, with multiple windows: page if 2% of the budget burns in an hour or 5% in six hours, ticket if 10% burns in three days, each with a short confirming window so alerts clear quickly after recovery.</p>
+</InterviewCard>
