@@ -32,7 +32,7 @@ you need ways to cope with them.
 Reads are the easier half, because copies of a value can be served from many places.
 
 - **Cache it closer.** Snip's Redis tier already absorbs most redirects. For the very hottest codes, each app server
-  also keeps a tiny **in-process cache** of a few thousand entries for a few seconds. 50,000 requests a second spread
+  also keeps a tiny **<Term t="in-process-cache">in-process cache</Term>** of a few thousand entries for a few seconds. 50,000 requests a second spread
   over 40 app servers become 40 requests a second to Redis.
 - **Spread one key over several cache nodes.** Store copies under `x7Kp#1` … `x7Kp#8`, which hash to different nodes,
   and have each reader pick one at random. Writes must update every copy, so do it only for keys you've detected as hot.

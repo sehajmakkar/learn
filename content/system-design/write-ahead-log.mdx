@@ -56,7 +56,7 @@ Once you have an ordered record of every change, it turns out to be useful well 
 - **Point-in-time recovery.** Take a full **base backup** now and then, and archive every WAL file since. To recover
   to "10:42 yesterday, just before someone ran the bad `DELETE`", restore the base backup and replay the archived log
   up to 10:41.
-- **Change data capture.** Read the log to stream every change to other systems: search <Term t="index">indexes</Term>, caches, analytics
+- **<Term t="change-data-capture">Change data capture</Term>.** Read the log to stream every change to other systems: search <Term t="index">indexes</Term>, caches, analytics
   (<L id="07.06" />).
 
 ## The log is only as good as your backups

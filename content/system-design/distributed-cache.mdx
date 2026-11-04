@@ -1,0 +1,219 @@
+export const meta = {
+  summary: "Designing the cache tier itself: sizing it, spreading keys over nodes, routing requests, replicas and failover, what happens when a node dies, and caches in more than one region.",
+  uses: ["05.03", "05.02", "05.04", "06.03", "06.05", "04.07"],
+  usedIn: ["15.02", "15.04"],
+};
+
+<BeforeYouStart>
+  This lesson puts the module together. It leans on <L id="05.03" /> (placing keys on nodes), <L id="05.02" /> (hot
+  keys), <L id="06.03" /> (eviction) and <L id="06.05" /> (<Term t="cache-stampede">stampedes</Term>), with replication from <L id="04.07" />.
+</BeforeYouStart>
+
+## The problem: Snip's cache is now a system of its own
+
+Snip's four Redis nodes from <L id="05.03" /> were enough for 100,000 cache reads a second. A year later the targets
+are:
+
+- **300,000 reads a second** at peak, almost all redirects, plus a few thousand writes (new links, edits, deletes).
+- **40 million links** in the working set.
+- **p99 under 2 ms** for a cache read, so the cache stays far faster than the database.
+- **Losing a node mustn't overload Postgres**, which is sized for about 1% of reads.
+
+Treat it like any design (<L id="01.07" />): estimate, choose how keys are placed and found, then decide what happens
+when things fail.
+
+## Sizing
+
+**Memory.** A cached link is a key, a URL and the cache's own bookkeeping per entry: say 500 bytes in all. 40 million ×
+500 bytes is **20 GB**. Leave room for growth and for memory fragmentation, and plan for about **32 GB** of primaries.
+
+**Throughput.** Snip's load tests show a node comfortably serving 50,000 reads a second at the latency target. 300,000
+÷ 50,000 is **6 nodes** at full load. To leave headroom, and so that losing one node moves only a small share of keys,
+Snip runs **12 primaries** of about 4 GB each, each with **one replica**.
+
+Running more, smaller nodes has a real benefit: when one fails, a twelfth of the keys are affected, not a quarter.
+
+## Finding the right node
+
+Every request must reach the node that owns its key. There are three ways to arrange that:
+
+| Approach | How a key finds its node | Trade-off |
+| --- | --- | --- |
+| **Client-side hashing** | Each app server's client library hashes the key onto a ring (<L id="05.03" />) | No extra hop; every client must agree on the node list |
+| **A proxy** | Apps talk to a local proxy (such as mcrouter or twemproxy), which routes | One place for routing and config; one more hop |
+| **A cluster-aware store** | The nodes know the layout and redirect clients that ask the wrong one | Self-managing; clients must support it |
+
+**Redis Cluster** is the third kind. It divides the key space into **16,384 hash slots**: a key's slot is
+`CRC16(key) mod 16384`, and each primary owns a range of slots. A client that asks the wrong node gets `-MOVED 3999
+10.0.0.7:6379` and updates its map. While a slot is being moved to another node, the client may get `ASK`, meaning
+"try that node for this one request". Slots are fixed logical partitions, exactly like Snip's 256 logical <Term t="sharding">shards</Term>
+(<L id="05.04" />): adding a node moves whole slots, not individual keys.
+
+**Hash tags** let you keep related keys together: only the part inside `{...}` is hashed, so `{x7Kp}:url` and
+`{x7Kp}:owner` land on the same node and can be read in one command. Use them sparingly, since one popular tag puts
+all its keys on one node.
+
+## Replicas and failover
+
+Each primary copies its writes to a replica **asynchronously**. If a primary dies, the replica is promoted. Because
+copying is asynchronous, the last few writes before a crash can be lost, and the Redis Cluster specification says so
+plainly: there are "small windows where acknowledged writes can be lost".
+
+For a cache, that's acceptable: the database is the source of truth, and a lost entry is just a miss. A lost
+**delete** is worse, since the promoted replica may still hold a value that was invalidated. That's another reason
+every entry has a TTL (<L id="06.04" />).
+
+Replicas can also serve reads, which adds read capacity, at the price of reading slightly behind the primary.
+
+## When a node fails
+
+Without a replica, or during the seconds before a replica takes over, a node's keys are unreachable. What should
+clients do?
+
+- **Treat it as a miss and go to the database.** Simple, but a twelfth of Snip's cached traffic, 25,000 reads a
+  second, suddenly hits a database sized for 3,000. It can cascade.
+- **Rehash onto the remaining nodes.** With a ring, the failed node's keys spread to its neighbours, which start cold.
+  A single <Term t="hot-key">hot key</Term> can account for a big share of a node's traffic, so the neighbour that inherits it can be
+  overloaded in turn.
+- **Send them to a small spare pool.** Facebook's answer, the **Gutter** pool: about 1% of servers, idle normally,
+  that take over failed servers' requests with short-lived entries. Misses there go to the database once, and then
+  become hits (below).
+
+Snip uses replicas for failover, and limits the misses any one app server can send to Postgres at once (<L id="03.11" />),
+so a slow failover degrades latency instead of taking the database down.
+
+## The client matters as much as the servers
+
+- **Timeouts.** A cache read that takes 50 ms is worse than none. Give cache calls a tight timeout (a few
+  milliseconds), and treat a timeout like a failed node, not as a reason to wait.
+- **Batch, but watch the tail.** Reading 20 keys in one multi-get is far cheaper than 20 round trips, but a request
+  that waits for 10 nodes is as slow as the slowest of them (<L id="03.12" />).
+- **Hot keys.** Spread them with a small <Term t="in-process-cache">in-process cache</Term> and suffixed copies (<L id="05.02" />).
+- **<Term t="request-coalescing">Coalescing</Term>.** Collapse concurrent misses for the same key (<L id="06.05" />).
+
+## More than one region
+
+If Snip serves from Virginia and Frankfurt, each region gets **its own cache**, filled from its own database replica,
+because a cache read across an ocean costs more than a local database read. The hard part is invalidation: an edit in
+Virginia must delete the entry in Frankfurt's cache too, and not before Frankfurt's database replica has the new row,
+or a miss there will refill the old value. Driving deletes from each region's own replication stream solves both: a
+region deletes a key when its database applies the change (<L id="06.04" />).
+
+<Arch
+  title="Snip's cache tier"
+  nodes={[
+    { id: "app", label: "Snip app", kind: "service", sub: "in-process L1", x: 0, y: 1 },
+    { id: "ring", label: "Cluster client", kind: "service", sub: "16,384 slots", x: 1, y: 1 },
+    { id: "p1", label: "Primaries ×12", kind: "cache", sub: "~4 GB each", x: 2.2, y: 0.5 },
+    { id: "r1", label: "Replicas ×12", kind: "cache", sub: "failover", x: 3.4, y: 0.5 },
+    { id: "pg", label: "Postgres", kind: "db", sub: "link shards", x: 2.2, y: 1.6 },
+    { id: "cdc", label: "Invalidator", kind: "worker", sub: "reads the WAL", x: 3.4, y: 1.6 },
+  ]}
+  edges={[
+    { from: "app", to: "ring" },
+    { from: "ring", to: "p1", label: "get" },
+    { from: "p1", to: "r1", label: "copies", dashed: true },
+    { from: "ring", to: "pg", label: "miss" },
+    { from: "pg", to: "cdc", label: "changes", dashed: true },
+    { from: "cdc", to: "p1", label: "delete" },
+  ]}
+  steps={[
+    { caption: "A redirect first checks the app's own in-process cache, for the few thousand hottest codes (05.02).", nodes: ["app"] },
+    { caption: "Otherwise the cluster client hashes the code to one of 16,384 slots and asks the primary that owns it: one round trip.", edges: ["app>ring", "ring>p1"] },
+    { caption: "Each primary copies to a replica, which takes over if it fails. Losing one of 12 primaries affects a twelfth of keys.", edges: ["p1>r1"] },
+    { caption: "Misses, coalesced per key, go to the link's Postgres shard. The miss rate is what Postgres is sized for.", edges: ["ring>pg"] },
+    { caption: "An invalidator reads committed changes from the database's log and deletes the affected keys, whoever made the change (06.04).", edges: ["pg>cdc", "cdc>p1"] },
+  ]}
+/>
+
+## Try it
+
+<DesignIt
+  id="sd-06-06-session-cache"
+  minutes={15}
+  levels={["mid", "senior"]}
+  patterns={["caching"]}
+  rubric={[
+    "Memory and throughput estimates, and the node count they lead to",
+    "How a request finds the node for its key, and what happens when nodes are added",
+    "What a node failure does to users and to the database behind the cache",
+    "Whether losing cached data is acceptable here, and how that changes replication",
+    "How a hot key (a celebrity, a flash sale) is handled",
+  ]}
+>
+  An online shop wants a cache for its product pages: 5 million products, each rendered as about 20 KB of JSON, read
+  200,000 times a second at peak and changed a few hundred times a second by merchants. During a flash sale, one
+  product can get a fifth of all reads. Design the cache tier: how big, how many nodes, how keys are placed, what
+  happens when a node dies, and how changes reach the cache.
+</DesignIt>
+
+<SeenInProduction>
+  <Seen
+    company="Facebook"
+    system="memcache: Gutter and cold clusters"
+    year={2013}
+    href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala"
+    source="Scaling Memcache at Facebook (NSDI 2013)"
+    found="Send a failed server's traffic to idle spares, not to its neighbours, and warm new caches from old ones."
+  >
+    Facebook dedicates about 1% of the memcached servers in a cluster to a pool called Gutter. When a client gets no
+    answer from a server, it retries in Gutter, filling it from the database on a miss, with entries that expire
+    quickly. The paper explains why it doesn't rehash onto the remaining servers: a single key can account for 20% of a
+    server's requests, and the server inheriting it could be overloaded. Gutter cut client-visible failures by 99%,
+    and when a server failed entirely, Gutter's hit rate usually exceeded 35% within four minutes. New or emptied
+    clusters warm up by reading from a warm cluster instead of the database, which brings them to full capacity in a
+    few hours instead of a few days.
+  </Seen>
+  <Seen
+    company="Redis"
+    system="Redis Cluster"
+    year="Docs"
+    href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/"
+    source="Redis cluster specification"
+    found="Fixed hash slots make resharding a matter of moving slots, and the spec is honest that async replication can lose writes."
+  >
+    The key space is split into 16,384 slots, with `HASH_SLOT = CRC16(key) mod 16384`; hash tags in braces make
+    related keys share a slot. A node that doesn't own a key's slot replies with a MOVED redirection, and ASK covers
+    slots in the middle of moving. Replication between nodes is asynchronous with "last failover wins", so the
+    specification warns that there are small windows where acknowledged writes can be lost.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="One of Snip's 12 cache primaries fails, and its replica takes 10 seconds to be promoted. Clients treat every error as a miss and go to Postgres. What's the risk, and the fix?"
+  options={[
+    { text: "No risk: 10 seconds is short", why: "For 10 seconds, a twelfth of cached reads, about 25,000 a second, go to a database sized for about 3,000." },
+    { text: "Postgres gets a burst of about 25,000 reads a second; cap and coalesce the misses, or send them to a spare pool", correct: true, why: "Coalescing per key collapses duplicate misses, a concurrency limit protects the database, and a Gutter-style pool absorbs the failed node's traffic without loading its neighbours." },
+    { text: "The other 11 primaries will take over the keys automatically", why: "Not until the slots are reassigned or the replica is promoted. In the meantime those keys have no owner." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Few, huge nodes.** Each failure takes out a big share of the keys. More, smaller nodes fail more gently.</li>
+    <li>**Failing over to the database.** A cache outage becomes a database outage. Cap misses, coalesce, or use spares.</li>
+    <li>**Loose timeouts on cache calls.** A slow cache is worse than none; time out in milliseconds.</li>
+    <li>**Reading another region's cache.** The round trip beats the point of caching. Cache per region and invalidate each.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Size the tier from the working set (memory) and the peak read rate (nodes), then add headroom.</li>
+    <li>Keys find nodes by client-side hashing, a proxy, or a cluster-aware store like Redis Cluster's 16,384 slots.</li>
+    <li>Replicas give fast failover; asynchronous copying can lose writes, which a cache can usually tolerate.</li>
+    <li>Plan the failure path: cap and coalesce misses, avoid overloading neighbours, and cache per region with per-region invalidation.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a distributed cache.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle a node failure without overloading the database?", "How do you handle a hot key?", "How does a client find the node for a key?"]}
+>
+  <p>I'd start from the numbers: working set size for memory, peak operations per second for node count, plus headroom, preferring more smaller nodes so a failure affects a small share of keys. Keys are placed with consistent hashing or fixed hash slots, so adding a node moves only a fraction; clients either hash themselves, go through a proxy, or follow redirects from a cluster-aware store. Each node is in-memory with an eviction policy such as approximate LRU, and every entry has a TTL.</p>
+  <p>For availability, each primary gets an asynchronously replicated replica that's promoted on failure; losing the last few writes is acceptable because the database is the source of truth. The failure path matters most: clients use tight timeouts, coalesce misses per key, cap concurrent misses to the database, and optionally fail over to a small spare pool. Hot keys get local caching and replication across several nodes. Across regions, each region has its own cache, invalidated from that region's replication stream.</p>
+</InterviewCard>

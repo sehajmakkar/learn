@@ -1,0 +1,167 @@
+export const meta = {
+  summary: "Every cached copy is a promise that it still matches the original. How much staleness each kind of data can bear, the ways to clear copies when data changes, and the race that leaves a cache wrong for ever.",
+  uses: ["06.02", "06.01", "04.07"],
+  usedIn: ["06.07", "07.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="06.02" /> for update-then-delete and <L id="06.01" /> for the layers that hold copies. The change stream
+  in this lesson is the replication log from <L id="04.07" />.
+</BeforeYouStart>
+
+## The problem: one edit, many copies
+
+Phil Karlton's line that "there are only two hard things in Computer Science: cache invalidation and naming things"
+([quoted by Martin Fowler](https://martinfowler.com/bliki/TwoHardThings.html)) is a joke engineers repeat because it's
+true. Here's why.
+
+An owner edits `x7Kp` to point at the summer sale. The database row changes in one place, but copies of the old
+destination may be sitting in Redis, in the <Term t="in-process-cache">in-process caches</Term> of 40 app servers, and, if Snip caches redirects at the
+edge (<L id="06.07" />), in CDN edges around the world. Each has to be cleared, or has to expire, before every user sees
+the new destination.
+
+Invalidation is hard for three reasons: there are **many copies**, the messages that clear them can be **delayed,
+lost or reordered**, and a read and a write racing each other can **put an old value back** after you cleared it.
+
+## First: how stale is acceptable?
+
+Perfect freshness everywhere is expensive. Decide per kind of data what a user can tolerate, and design for that:
+
+| Snip data | Acceptable staleness | How |
+| --- | --- | --- |
+| An edited destination | Up to a minute | Delete from Redis on edit; in-process TTL of 5 s; edge TTL of 60 s |
+| A link blocked as phishing | Seconds, everywhere | Delete from Redis, broadcast to app servers, <Term t="purge">purge</Term> the CDN |
+| Click totals on the dashboard | A few minutes | TTL only |
+| The owner's own list after an edit | None, for that owner | Read their own writes from the database (<L id="04.07" />) |
+
+Snip tells owners "edits take up to a minute to reach everyone", which turns a hard problem into an easy one.
+
+## Ways to clear a copy
+
+**1. TTL only.** Do nothing on change; every copy expires on its own. Staleness is bounded by the TTL, and it can't
+fail, because there's nothing to fail. Right for data where the bound is acceptable.
+
+**2. Delete on write.** The code that changes the row deletes the cache entry (<L id="06.02" />). Simple, but every
+code path that writes must remember to do it, including scripts, admin tools and other services. Miss one and the copy
+is stale until its TTL.
+
+**3. Delete from the change stream.** Instead of trusting every writer, a separate process reads the database's own
+log of committed changes (<Term t="change-data-capture">change data capture</Term>, <L id="07.06" />) and deletes the
+affected keys. Every committed change is seen, whoever made it, and the log can be replayed if deletes were lost.
+Facebook built its memcache invalidation this way (below).
+
+**4. Versioned keys.** Put a version in the key: `link:x7Kp:v4`. An edit bumps the version stored with the link, so
+readers ask for `v5`, which isn't cached yet, and the old entry is simply never read again until it's evicted.
+Nothing needs deleting, but readers need the current version from somewhere, so it suits data looked up through a
+parent that's already fresh, such as file names in HTML (<L id="02.05" />).
+
+**5. Broadcast to local caches.** In-process caches on 40 servers can't be deleted with one call. Publish "x7Kp
+changed" on a pub/sub channel that every server subscribes to, and keep their TTLs short in case a message is missed.
+
+## The race that undoes a delete
+
+Even with update-then-delete, one interleaving leaves the cache wrong. It needs a cache miss and an edit at the same
+moment, with the slow read finishing last:
+
+<Sequence
+  title="A slow read refills the cache with the old value"
+  walk
+  participants={[{ id: "r", label: "Redirect (read)" }, { id: "w", label: "Edit (write)" }, { id: "db", label: "Postgres" }, { id: "c", label: "Redis" }]}
+  messages={[
+    { from: "r", to: "c", label: "GET x7Kp → miss", explain: "The entry has just expired, so the redirect goes to the database." },
+    { from: "r", to: "db", label: "SELECT → spring", explain: "It reads the current destination, the spring sale. Then it's paused for a moment before writing the cache." },
+    { from: "w", to: "db", label: "UPDATE → summer", explain: "Meanwhile the owner's edit commits." },
+    { from: "w", to: "c", label: "DEL x7Kp", explain: "The edit deletes the cache entry. There isn't one yet, so nothing happens." },
+    { from: "r", to: "c", label: "SET spring", fail: true, explain: "The slow read now caches the value it read before the edit. The database says summer; the cache says spring until the TTL expires." },
+  ]}
+/>
+
+It's rare, because the read must be slower than a whole write and delete, but at millions of reads a second rare
+things happen daily. Three fixes, in increasing strength:
+
+- **A TTL** bounds the damage. Always have one.
+- **Versions on set.** Store the row's version with the cached value, and only let a fill write the cache if its
+  version is newer than what's there. That needs the cache to remember versions, including for deleted entries.
+- **<Term t="lease">Leases</Term>.** On a miss, the cache hands the reader a token. A delete for that key cancels the token, and the cache
+  rejects a `SET` with a cancelled token. The slow read above would be refused. Facebook added leases to memcache for
+  exactly this "stale set", and the same tokens help with <Term t="cache-stampede">stampedes</Term> (<L id="06.05" />).
+
+<Analogy>
+  **Changing a restaurant's menu.** The kitchen updates its master menu, then tells every waiter. But a waiter who copied the old specials onto a chalkboard just before the change, and only puts the board up afterwards, undoes the update. The fix is to date every chalkboard and refuse to display one older than the master menu.
+</Analogy>
+
+## Measure it
+
+You can't fix staleness you can't see. A simple check: sample a small share of cache reads and compare them with the
+database (after allowing for in-flight changes). Count mismatches as a rate, and alert on it. Meta built a service
+for this at scale, below, and found bugs no one had known about.
+
+<SeenInProduction>
+  <Seen
+    company="Facebook"
+    system="memcache invalidation"
+    year={2013}
+    href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala"
+    source="Scaling Memcache at Facebook (NSDI 2013)"
+    found="Read deletes from the database's commit log, not from every writer, so lost invalidations can be replayed."
+  >
+    Facebook amended the SQL statements that change data to include the memcache keys to invalidate once the
+    transaction commits. A daemon called mcsqueal on every database reads the committed statements, extracts the
+    deletes and broadcasts them to the memcache servers in every frontend cluster, batching them to keep packet rates
+    down. Because the deletes are stored in the database's reliable log, mcsqueal can replay invalidations that were
+    lost or misrouted. The same paper introduces leases to stop stale sets.
+  </Seen>
+  <Seen
+    company="Meta"
+    system="TAO and memcache consistency"
+    year={2022}
+    href="https://engineering.fb.com/2022/06/08/core-infra/cache-made-consistent/"
+    source="Cache made consistent (Engineering at Meta)"
+    found="Measure cache consistency directly, and the race between a fill and an invalidation becomes visible and fixable."
+  >
+    Meta describes the same race as above: a cache fill reads x=42, x changes to 43, the invalidation for 43 reaches
+    the cache first, and then the fill writes 42, leaving 42 in the cache indefinitely. To measure such problems it
+    built Polaris, which receives invalidation events like a cache server and then checks cache replicas for values
+    that should have changed. With it, Meta raised TAO's measured consistency from six nines (99.9999%) to ten nines:
+    99.99999999% of cache writes consistent within five minutes.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip deletes cache entries in the edit API. An admin script that bulk-changes 10,000 destinations updates Postgres directly. What happens, and what's the robust fix?"
+  options={[
+    { text: "Nothing goes wrong: Redis notices the database changed", why: "Redis has no idea what Postgres does. Only an explicit delete or the TTL removes the entry." },
+    { text: "Those links stay stale until their TTLs expire; invalidate from the database's change stream so every writer is covered", correct: true, why: "Delete-on-write only works for writers that remember to delete. Reading committed changes from the database catches all of them, scripts included." },
+    { text: "Lower every TTL to one second", why: "That bounds staleness, but throws away most of the cache's value for every link to cover a rare script." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Relying on every writer to invalidate.** One forgotten path (a script, another service) leaves stale data. Invalidate from the database's change stream when it matters.</li>
+    <li>**No TTL as a backstop.** Races and lost deletes happen. A TTL turns "wrong for ever" into "wrong for an hour at most".</li>
+    <li>**Forgetting derived entries.** The owner's link list and any cached query that includes the row are stale too.</li>
+    <li>**Promising freshness you don't need.** Agree an acceptable staleness per kind of data; most can tolerate seconds or minutes.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Decide how stale each kind of data may be before choosing how to invalidate it.</li>
+    <li>Options: TTL only, delete on write, delete from the change stream, versioned keys, and broadcast for local caches.</li>
+    <li>A slow fill can write an old value after the delete; TTLs bound it, versions or leases prevent it.</li>
+    <li>Measure staleness by sampling the cache against the database.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How do you keep a cache consistent with the database?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Describe a race that leaves stale data in the cache after a delete.", "How would you invalidate caches in another region?"]}
+>
+  <p>First I'd agree how stale each kind of data may be, because most data can tolerate seconds and that changes the design. The baseline is cache-aside with update-the-database-then-delete-the-key, and a TTL on every entry. To make sure every change triggers a delete, including writes from scripts or other services, I'd drive invalidation from the database's change stream rather than from application code, so deletes can be replayed if lost.</p>
+  <p>There's still a race: a read misses, reads the old row, the write and delete happen, and then the read sets the old value. TTLs bound it; versioned sets or leases, where a delete cancels the reader's token and the cache rejects its set, prevent it. For local caches I'd broadcast invalidations over pub/sub with short TTLs, and I'd sample cache reads against the database to measure staleness.</p>
+</InterviewCard>

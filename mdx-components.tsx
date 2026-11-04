@@ -1,3 +1,4 @@
+import { isValidElement, type ReactNode } from "react";
 import type { MDXComponents } from "mdx/types";
 import { Code, Terminal } from "@/components/lesson/code";
 import { Analogy, Aside, BeforeYouStart, Mistakes, Recap } from "@/components/lesson/callouts";
@@ -18,9 +19,20 @@ import { LoadBalancerLab } from "@/components/labs/load-balancer";
 import { TailLatencyLab } from "@/components/labs/tail-latency";
 import { BTreeLab } from "@/components/labs/btree";
 import { HashRingLab } from "@/components/labs/hash-ring";
+import { EvictionLab } from "@/components/labs/eviction";
+
+/** Fenced code blocks (```ts … ```) get the same highlighted, scrollable frame as <Code>. */
+function Pre({ children }: { children?: ReactNode }) {
+  const code = isValidElement<{ className?: string; children?: ReactNode }>(children) ? children : null;
+  const text = code?.props.children;
+  if (typeof text !== "string") return <pre>{children}</pre>;
+  const lang = /language-(\S+)/.exec(code?.props.className ?? "")?.[1] ?? "text";
+  return <Code lang={lang}>{text}</Code>;
+}
 
 // Everything a lesson can use without importing it.
 const components: MDXComponents = {
+  pre: Pre,
   Code,
   Terminal,
   Analogy,
@@ -51,6 +63,7 @@ const components: MDXComponents = {
   TailLatencyLab,
   BTreeLab,
   HashRingLab,
+  EvictionLab,
 };
 
 export function useMDXComponents(): MDXComponents {

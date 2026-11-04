@@ -1,0 +1,207 @@
+export const meta = {
+  summary: "Putting more than static files on a CDN: cache keys that don't fragment, separate lifetimes for the edge and the browser, tiered caching and request collapsing, purging by tag, and serving stale when the origin is down. Snip starts answering redirects at the edge.",
+  uses: ["02.05", "06.04", "06.05", "06.01"],
+  usedIn: ["15.02"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.05" />: this lesson picks up the question it left open, whether the edge should answer redirects. It
+  uses <Term t="cache-invalidation">invalidation</Term> from <L id="06.04" /> and <Term t="cache-stampede">stampedes</Term> from <L id="06.05" />.
+</BeforeYouStart>
+
+## The problem: Snip goes global
+
+Half of Snip's clicks now come from Asia and Australia. Every redirect from Sydney still crosses the Pacific to
+Virginia and back, and a big customer complains that their campaign links feel slow. In <L id="02.05" />, Snip kept
+redirects at the origin because clicks answered at the edge are never counted. Now the trade-off has changed, so Snip
+will **cache redirects at the edge** and solve counting another way.
+
+A redirect is a much harder thing to cache than a fingerprinted script. It can change (owners edit links), it must
+disappear quickly if it's blocked, and every click matters. Doing it well takes five ideas.
+
+## 1. The cache key decides your hit rate
+
+An edge stores each response under a **cache key**. By default that's roughly the full URL: scheme, host, path and
+query string (Cloudflare's default also includes a few headers, such as `Origin`). So these are three separate cache
+entries, even though Snip answers them identically:
+
+```
+https://snip.link/x7Kp
+https://snip.link/x7Kp?utm_source=newsletter
+https://snip.link/x7Kp?fbclid=IwAR3...
+```
+
+Social networks and email tools add tracking parameters, often unique per click. Left in the key, they spread one
+link over thousands of entries, and the hit rate collapses. Snip's redirect doesn't depend on the query string, so it
+configures the CDN to **leave the query out of the key**.
+
+The `Vary` response header works the other way: it adds request headers to the key. `Vary: Accept-Encoding` is
+normal. `Vary: User-Agent` or `Vary: Cookie` splits every entry by browser or by user, and quietly turns a cache into
+a pass-through.
+
+## 2. Separate lifetimes for the edge and the browser
+
+Snip can purge a CDN, but it can't reach into a browser (<L id="06.01" />). So it gives them different lifetimes:
+
+```
+HTTP/1.1 302 Found
+Location: https://shop.example/summer-sale
+Cache-Control: public, max-age=0, s-maxage=60, stale-while-revalidate=30, stale-if-error=86400
+Surrogate-Key: link-x7Kp owner-4821
+```
+
+- `max-age=0`: to a browser the copy is stale at once, so it checks again (at most reusing the old copy during the
+  `stale-while-revalidate` window below). An edit is never stuck in someone's browser.
+- `s-maxage=60`: shared caches (the CDN) may keep it for 60 seconds. Shared caches use `s-maxage` in place of
+  `max-age` when both are present.
+- `stale-while-revalidate=30`: for 30 seconds after that, the edge may serve the old copy while it refreshes in the
+  background, the soft-TTL idea from <L id="06.05" />.
+- `stale-if-error=86400`: if the origin returns a 500, 502, 503 or 504, the edge may serve the stale redirect for up to
+  a day.
+
+That last line means popular Snip links keep working **even if Snip's origin is down**.
+
+## 3. Tiers and collapsing protect the origin
+
+A CDN with 300 locations has 300 separate caches. A popular link can miss 300 times per minute (once per edge per
+TTL), and a brand-new link that goes viral misses in every city at once.
+
+- **Tiered caching**: edges are split into lower tiers and upper tiers. A lower-tier edge that misses asks an upper
+  tier, and only the upper tier asks the origin. 300 misses become a handful.
+- **Request collapsing**: when many requests for the same uncached object reach one edge at once, it sends **one**
+  request to the origin and queues the rest behind it, the CDN version of <Term t="request-coalescing">coalescing</Term> (<L id="06.05" />). The HTTP
+  caching standard, RFC 9111, mentions that caches may collapse requests this way.
+
+## 4. Purge by tag, keep the TTL short anyway
+
+Edits and blocks must reach the edge. **Purging** by URL works for one link, but Snip often needs to clear groups: all
+of an owner's links when their account is suspended for phishing. So each response carries **surrogate keys** (tags):
+`link-x7Kp` and `owner-4821` above. One purge of `owner-4821` clears every cached link of that owner, in every edge.
+
+Snip purges `link-x7Kp` when its owner edits it and when it's blocked. It still keeps `s-maxage` at a minute, so a
+failed or delayed purge leaves a link stale for a minute at most: the same "TTL as a backstop" rule as
+<L id="06.04" />.
+
+## 5. Count the clicks somewhere else
+
+Clicks answered at the edge never reach Snip's servers, so the click queue from <L id="02.06" /> doesn't see them.
+Snip switches its counting to the **CDN's request logs**, which the provider delivers in batches every few minutes.
+Workers read them into the same click pipeline. Dashboards are a few minutes behind, which Snip's staleness table
+already allows (<L id="06.04" />). (The alternative, a small program running at the edge that records each click, is
+more immediate and more work to run.)
+
+<Evolve
+  title="Snip: redirects answered at the edge"
+  change="Cache redirects at the CDN for 60 s, purge by tag, count clicks from edge logs"
+  before={{
+    nodes: [
+      { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+      { id: "cdn", label: "CDN edge", kind: "cdn", sub: "static files", x: 1, y: 0 },
+      { id: "app", label: "Snip app", kind: "service", sub: "Virginia", x: 2, y: 1 },
+      { id: "redis", label: "Redis", kind: "cache", x: 3, y: 0.5 },
+      { id: "queue", label: "Click queue", kind: "queue", x: 3, y: 1.5 },
+    ],
+    edges: [
+      { from: "user", to: "cdn", label: "files" },
+      { from: "user", to: "app", label: "redirects" },
+      { from: "app", to: "redis" },
+      { from: "app", to: "queue", label: "clicks", dashed: true },
+    ],
+  }}
+  after={{
+    nodes: [
+      { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+      { id: "cdn", label: "CDN edge", kind: "cdn", sub: "files + redirects", x: 1, y: 1 },
+      { id: "tier", label: "Upper tier", kind: "cdn", sub: "one per region", x: 2, y: 0 },
+      { id: "app", label: "Snip app", kind: "service", sub: "Virginia", x: 2, y: 1 },
+      { id: "redis", label: "Redis", kind: "cache", x: 3, y: 0.5 },
+      { id: "queue", label: "Click queue", kind: "queue", x: 3, y: 1.5 },
+      { id: "logs", label: "Edge logs", kind: "store", sub: "every few min", x: 2, y: 2 },
+    ],
+    edges: [
+      { from: "user", to: "cdn", label: "all" },
+      { from: "cdn", to: "tier", label: "miss" },
+      { from: "tier", to: "app", label: "miss", dashed: true },
+      { from: "app", to: "redis" },
+      { from: "app", to: "cdn", label: "purge by tag", dashed: true },
+      { from: "cdn", to: "logs", label: "clicks", dashed: true },
+      { from: "logs", to: "queue" },
+    ],
+  }}
+  caption="Most redirects are now answered a few milliseconds from the user; the origin sees misses from upper tiers and sends purges."
+/>
+
+<Analogy>
+  **A chain of newsagents.** Each shop keeps today's papers (the edge). When a shop runs out, it asks the regional depot, not the printing press (tiers). If forty customers ask for a paper the shop doesn't have, it places one order, not forty (collapsing). When a paper prints a correction, the press tells the depots to pull every copy with that edition's code (purge by tag). And the till receipts, not the press, tell you how many copies sold (logs).
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Cloudflare"
+    system="Tiered Cache"
+    year={2026}
+    href="https://developers.cloudflare.com/cache/how-to/tiered-cache/"
+    source="Tiered Cache (Cloudflare documentation)"
+    found="Make most edges ask a few upper-tier locations instead of the origin, so one miss serves a whole region."
+  >
+    Cloudflare divides its data centres into lower tiers and upper tiers. A lower tier that doesn't have the content
+    must ask an upper tier, and "only the upper-tier can ask the origin for content". The documentation says this
+    reduces requests to origins by dramatically increasing cache hit ratios. Its topologies range from a single
+    closest upper tier chosen automatically for each origin, to regional pools where a <Term t="consistent-hashing">consistent hash</Term> of the cache key
+    picks the upper-tier data centre.
+  </Seen>
+  <Seen
+    company="Fastly"
+    system="Surrogate keys and request collapsing"
+    year="Docs"
+    href="https://www.fastly.com/documentation/guides/full-site-delivery/purging/working-with-surrogate-keys/"
+    source="Working with surrogate keys (Fastly documentation)"
+    found="Tag responses so one purge clears a whole group, and collapse concurrent misses into one origin request."
+  >
+    A `Surrogate-Key` response header tags an object with one or more space-separated keys; Fastly records the mapping
+    from each key to its cached objects, strips the header, and a purge of one key removes every object tagged with
+    it. Fastly's
+    [request collapsing](https://www.fastly.com/documentation/guides/concepts/edge-state/cache/request-collapsing/)
+    combines multiple requests for the same object into a single request to the origin, so a popular object expiring
+    doesn't cause an immediate flood, though uncacheable or private responses must still be fetched one by one.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="After Snip starts caching redirects at the edge, the CDN's hit rate for redirects is only 30%, though a few thousand links get most clicks. What's the most likely cause?"
+  options={[
+    { text: "s-maxage=60 is too short", why: "A minute is plenty for a link clicked many times a second. Something is splitting the entries." },
+    { text: "Tracking parameters in the query string are part of the cache key, so each click looks like a new URL", correct: true, why: "utm and click-ID parameters are often unique per click. Leaving the query string out of the key (Snip's answer doesn't depend on it) lets every click of x7Kp share one entry." },
+    { text: "The CDN doesn't cache 302 responses", why: "It will when the response carries explicit freshness like s-maxage; it was caching, just under too many keys." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Query strings and `Vary` headers you don't need in the key.** They fragment the cache. Key only on what changes the answer.</li>
+    <li>**One lifetime for browsers and the CDN.** You can purge the CDN, not browsers. Use `s-maxage` for the edge and keep `max-age` short.</li>
+    <li>**Relying on purges alone.** Purges can be slow or fail. Keep edge TTLs short enough that staleness is bounded anyway.</li>
+    <li>**Forgetting what the origin no longer sees.** Counting, logging and rate limiting at the origin miss edge hits; move them to logs or the edge.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>The cache key decides the hit rate: drop query parameters and headers that don't change the answer.</li>
+    <li>Give the edge (`s-maxage`) and the browser (`max-age`) separate lifetimes; add `stale-while-revalidate` and `stale-if-error`.</li>
+    <li>Tiered caching and request collapsing turn many edge misses into a few origin requests.</li>
+    <li>Purge by tag for edits and blocks, keep TTLs short as a backstop, and count edge hits from logs.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Could you serve a URL shortener's redirects from a CDN? What would you have to change?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Scenario" }}
+  followUps={["How would you handle a link that's been blocked for phishing?", "How do you still count clicks?"]}
+>
+  <p>Yes. I'd return the redirect with headers that let shared caches keep it briefly but make browsers revalidate: max-age=0 and s-maxage of about a minute, plus stale-while-revalidate and stale-if-error so the edge can refresh in the background and keep serving if the origin is down. I'd exclude tracking query parameters from the cache key, since they'd otherwise give every click its own entry, and use tiered caching and request collapsing so a viral link doesn't send a miss from every edge.</p>
+  <p>Each response would carry surrogate keys for the link and its owner, so an edit or a phishing block triggers a purge by tag, with the short TTL bounding staleness if a purge is delayed. Because edge hits never reach the origin, I'd count clicks from the CDN's logs, or from code running at the edge, and accept that dashboards lag by a few minutes.</p>
+</InterviewCard>

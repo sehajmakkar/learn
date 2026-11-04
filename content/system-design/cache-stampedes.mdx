@@ -1,0 +1,188 @@
+export const meta = {
+  summary: "When a hot entry expires, or a whole cache starts empty, thousands of requests miss at once and all go to the database. Coalescing, leases, serving stale, early refresh and jitter keep one miss from becoming a thousand.",
+  uses: ["06.03", "05.02", "03.11", "03.12"],
+  usedIn: ["06.06", "06.07"],
+};
+
+<BeforeYouStart>
+  Read <L id="06.03" /> for TTLs and jitter, and <L id="05.02" /> for <Term t="hot-key">hot keys</Term>. Shedding load from
+  <L id="03.11" /> is the last line of defence, and <L id="03.12" /> explains why a slow database shows up in p99 first.
+</BeforeYouStart>
+
+## The problem: one expiry, a thousand queries
+
+The viral link `x7Kp` gets 50,000 redirects a second. Its Redis entry has a one-hour TTL. When the hour is up, the
+entry vanishes, and the next request misses and asks the database. That query takes about 20 ms. During those 20 ms,
+another **1,000 requests** arrive, find the entry still missing, and each sends its own query for the same row.
+
+The database slows down under the burst, so the refill takes longer, so more requests miss, which slows it further.
+That feedback loop is a **cache stampede** (also called a thundering herd or dogpile). It has three common triggers:
+
+| Trigger | What misses | Snip example |
+| --- | --- | --- |
+| **A hot key expires** | One key, many requests | `x7Kp`'s hour is up |
+| **Many keys expire together** | Many keys at once | Every link warmed by a deploy at 09:00 with the same TTL |
+| **A cold cache** | Everything | A Redis node restarts empty, or a new region opens |
+
+## Fix 1: let one request do the work (coalescing)
+
+The simplest fix: when a key is already being loaded, later requests **wait for that load** instead of starting
+their own. In one process this takes a few lines: keep a map of in-flight loads, keyed by cache key.
+
+```ts
+type Entry<V> = { value: V; delta: number; expiresAt: number };
+
+const cache = new Map<string, Entry<unknown>>(); // stands in for Redis in this sketch
+const inFlight = new Map<string, Promise<unknown>>();
+
+/** Run load() at most once at a time per key in this process; everyone else waits for the same answer. */
+function coalesce<V>(key: string, load: () => Promise<V>): Promise<V> {
+  const running = inFlight.get(key);
+  if (running) return running as Promise<V>;
+  const p = load().finally(() => inFlight.delete(key));
+  inFlight.set(key, p);
+  return p;
+}
+
+/** XFetch: refresh early, with a chance that rises as expiry nears and as the load gets slower. */
+function shouldRefreshEarly(e: Entry<unknown>, beta = 1, now = Date.now()) {
+  return now - e.delta * beta * Math.log(Math.random()) >= e.expiresAt;
+}
+
+export async function cached<V>(key: string, ttlMs: number, load: () => Promise<V>): Promise<V> {
+  const e = cache.get(key) as Entry<V> | undefined;
+  if (e && !shouldRefreshEarly(e)) return e.value;
+  return coalesce(key, async () => {
+    const start = Date.now();
+    const value = await load();
+    const delta = Date.now() - start; // how long a refill takes
+    cache.set(key, { value, delta, expiresAt: Date.now() + ttlMs });
+    return value;
+  });
+}
+```
+
+Tested with 1,000 concurrent misses on one key, the loader runs **once** and all 1,000 callers get the same value; if
+the load fails, every waiter gets the error and the next call tries again. Go ships this as
+[`singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight), and proxies offer it as a setting:
+nginx's `proxy_cache_lock` lets only one request at a time fill a cache entry, while the others wait (up to 5 seconds
+by default).
+
+Per-process coalescing caps the burst at **one query per app server**: 40 servers, 40 queries, instead of 1,000.
+That's usually enough. For a fleet-wide cap of one, the cache itself has to coordinate.
+
+## Fix 2: leases, coordinated by the cache
+
+With **leases**, a miss doesn't just return "not found". The first client to miss gets a **token** and the job of
+refilling; others that miss shortly after are told to wait briefly and retry, by which time the entry is usually
+there. Facebook's memcache hands out a token for a key at most once every 10 seconds, and the same token, cancelled by
+a delete, stops the stale sets of <L id="06.04" />. A simpler home-made version is a short lock in Redis:
+`SET lock:x7Kp 1 NX PX 2000`, where only the request that wins the lock queries the database.
+
+## Fix 3: serve the old value while refreshing
+
+For most data, a copy a few seconds past its TTL is better than a slow page or a dead database. So keep two lifetimes:
+
+- **Soft TTL**: after this, the entry is stale. The next request triggers a refresh in the background (coalesced), but
+  is answered immediately with the stale value.
+- **Hard TTL**: after this, the entry is too old to use at all.
+
+No request ever waits for the refill except after the hard TTL. HTTP caches have the same idea built in:
+`stale-while-revalidate` (<L id="06.07" />), and nginx's `proxy_cache_use_stale updating` with
+`proxy_cache_background_update`. Serving stale is also what keeps Snip up when the database itself is down:
+`stale-if-error`.
+
+## Fix 4: refresh before expiry
+
+Instead of waiting for the expiry, refresh a hot entry slightly **early**, at a random moment, so it never actually
+expires under load. The `shouldRefreshEarly` check above is the **XFetch** rule from a 2015 paper: each read refreshes
+early with a probability that grows as expiry approaches, scaled by `delta` (how long a refill takes) and `beta`
+(1 by default; larger refreshes earlier). With a 50 ms refill, a read 50 ms before expiry refreshes with probability
+about 37%; a read 500 ms before, about 0.005%. Hot keys, read thousands of times a second, are almost certain to be
+refreshed by one request just before they expire; cold keys rarely bother.
+
+## Fix 5: spread the expiries
+
+Synchronised expiry is a self-inflicted stampede. Add **jitter** to TTLs (an hour plus or minus 10%, at random, <L id="06.03" />)
+so entries filled together expire apart.
+
+## Cold caches
+
+When a whole cache is empty, none of the above is enough: every key misses at once. The options are to **warm it
+first** (copy the hottest keys from a warm replica or region before taking traffic), **bring it in gradually** (send
+it 1% of traffic, then 10%, and so on), and **limit misses** at the database with a concurrency cap so excess requests
+fail fast or wait rather than piling on (<L id="03.11" />).
+
+<Analogy>
+  **One person phones for the pizza.** When the office runs out of snacks, you don't want forty people each phoning the shop. The first person to notice calls, says "I've ordered", and everyone else waits. Better still, someone orders more when the box is nearly empty, not when it's gone.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Facebook"
+    system="memcache leases"
+    year={2013}
+    href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala"
+    source="Scaling Memcache at Facebook (NSDI 2013)"
+    found="One token per key every 10 seconds turns a thundering herd into one database query and a short wait."
+  >
+    Facebook's leases address two problems, stale sets and thundering herds. A memcached server gives a client a lease
+    token when it misses, and returns a token for a given key only once every 10 seconds; other clients that miss in
+    that window are told to wait briefly, by which time the leaseholder has usually filled the entry. In one week of
+    measurements on keys prone to thundering herds, the peak database query rate was 17,000 a second without leases
+    and 1,300 a second with them. For data that can be slightly stale, clients can also be handed the recently deleted
+    value instead of waiting.
+  </Seen>
+  <Seen
+    company="Goodreads, Sapienza and Bugsnag"
+    system="XFetch"
+    year={2015}
+    href="https://www.vldb.org/pvldb/vol8/p886-vattani.pdf"
+    source="Optimal Probabilistic Cache Stampede Prevention (VLDB 2015)"
+    found="Refreshing early at random, weighted by refill time, prevents stampedes without locks or coordination."
+  >
+    Andrea Vattani, Flavio Chierichetti and Keegan Lowenstein compare locks, external recomputation and probabilistic
+    early expiration, and give an algorithm for the last that they prove optimal. Their XFetch function recomputes a
+    value if the current time minus delta × beta × log(rand()) is at or past the expiry, with beta = 1 as the default.
+    Because it's a local decision on each read, it needs no locks and no communication between servers.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's 40 app servers each coalesce misses per key. The viral link expires. How many database queries for it, at most, happen during the refill?"
+  options={[
+    { text: "One", why: "Coalescing in each process doesn't coordinate across servers. One-per-fleet needs a lease or lock in the shared cache." },
+    { text: "About 40: one per app server", correct: true, why: "Each server lets one request per key through and makes the rest wait. With 40 servers, up to 40 identical queries reach the database, down from about 1,000." },
+    { text: "About 1,000", why: "That's without coalescing: every request that misses during the 20 ms refill sends its own query." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Same TTL for keys filled together.** They expire together. Add jitter.</li>
+    <li>**Coalescing without timeouts.** If the one load hangs, everyone waits. Give the load a timeout, and let waiters give up.</li>
+    <li>**Keeping a failed load cached.** Clear the in-flight entry on error, so the next request tries again (or serve stale).</li>
+    <li>**Restarting a cache under full load.** Warm it or bring it in gradually; protect the database with a concurrency limit.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A stampede is many requests missing the same entry at once, often triggered by a hot key expiring, synchronised TTLs or a cold cache.</li>
+    <li>Coalesce misses per process; use leases or a short lock for one refill across the fleet.</li>
+    <li>Serve stale while refreshing (soft and hard TTLs), refresh hot keys early at random (XFetch), and jitter TTLs.</li>
+    <li>Warm cold caches before full traffic, and cap the misses the database can receive.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "What is a cache stampede, and how do you prevent one?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["How would you coordinate one refill across many servers?", "What do you do when the whole cache restarts empty?"]}
+>
+  <p>It's when a popular cache entry expires, or many expire at once, and every request that misses goes to the database for the same data at the same time. The database slows down, the refill takes longer, and more requests miss, so it can cascade into an outage.</p>
+  <p>I'd layer the fixes. Coalesce misses so only one request per key per process loads it while the others wait for that result. For fleet-wide coordination, use leases or a short lock in the cache so only one client refills. Serve the stale value while refreshing in the background, using a soft TTL and a hard TTL, and refresh hot keys probabilistically before they expire. Add jitter to TTLs so entries don't expire together. For a cold cache, warm it from a replica or ramp traffic gradually, and put a concurrency limit in front of the database.</p>
+</InterviewCard>

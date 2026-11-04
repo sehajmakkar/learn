@@ -183,6 +183,13 @@ body {
   font-size: 0.9375rem;
   border-collapse: collapse;
 }
+/* On phones, a wide table scrolls inside its own box instead of widening the page. */
+@media (max-width: 639px) {
+  .prose-lesson > table {
+    display: block;
+    overflow-x: auto;
+  }
+}
 .prose-lesson > table th {
   text-align: left;
   font-family: var(--font-mono);

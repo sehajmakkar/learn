@@ -168,7 +168,7 @@ dashboard and stats queries, which vary too much to cache well.
   >
     Facebook's paper describes memcache as a "demand-filled look-aside cache" in front of MySQL, serving billions of
     requests per second. On a write, the web server updates the database and then deletes the cache entry rather than
-    updating it, because deletes are safe to repeat. For keys prone to stampedes, a mechanism they call leases cut the
+    updating it, because deletes are safe to repeat. For keys prone to <Term t="cache-stampede">stampedes</Term>, a mechanism they call leases cut the
     peak database query rate from 17,000 to 1,300 a second.
   </Seen>
 </SeenInProduction>

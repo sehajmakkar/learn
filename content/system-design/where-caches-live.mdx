@@ -1,0 +1,155 @@
+export const meta = {
+  summary: "A request passes through half a dozen places that can keep a copy: the browser, a CDN, a proxy, the app's own memory, a shared cache and the database. What each layer is good for, and what it costs.",
+  uses: ["02.04", "02.05", "01.04", "05.02"],
+  usedIn: ["06.02", "06.04", "06.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.04" /> for cache-aside and hit rate, and <L id="02.05" /> for CDNs. The latencies come from
+  <L id="01.04" />, and the in-process cache for viral links from <L id="05.02" />.
+</BeforeYouStart>
+
+## The problem: "add a cache" isn't one decision
+
+By the end of Module 05, Snip already has caches in three places: a CDN for its static files, a tiny in-process cache
+on each app server for viral codes, and a Redis cluster for every redirect. They weren't planned as a set; each was
+added when something hurt. Now the team wants to know: **where should a copy of a link live, and why there and not
+somewhere else?**
+
+Follow one redirect for `snip.link/x7Kp` from a phone in Sydney. Every hop it passes is a place that could answer it:
+
+<Arch
+  title="Every place a redirect could be answered"
+  nodes={[
+    { id: "browser", label: "Browser", kind: "user", sub: "HTTP cache", x: 0, y: 1 },
+    { id: "cdn", label: "CDN edge", kind: "cdn", sub: "near the user", x: 1, y: 1 },
+    { id: "proxy", label: "Reverse proxy", kind: "lb", sub: "response cache", x: 2, y: 1 },
+    { id: "app", label: "Snip app", kind: "service", sub: "in-process cache", x: 3, y: 1 },
+    { id: "redis", label: "Redis", kind: "cache", sub: "shared cache", x: 3, y: 0 },
+    { id: "pg", label: "Postgres", kind: "db", sub: "buffer cache", x: 3, y: 2 },
+  ]}
+  edges={[
+    { from: "browser", to: "cdn" },
+    { from: "cdn", to: "proxy" },
+    { from: "proxy", to: "app" },
+    { from: "app", to: "redis", label: "miss" },
+    { from: "app", to: "pg", label: "miss" },
+  ]}
+  steps={[
+    { caption: "The browser keeps responses it's allowed to (by their Cache-Control headers). A repeat click answered here costs nothing at all.", edges: [] , nodes: ["browser"] },
+    { caption: "A CDN edge in Sydney can answer for every user in the city: one copy, shared by thousands, a few milliseconds away.", edges: ["browser>cdn"] },
+    { caption: "A reverse proxy in front of the app (03.07) can cache whole responses too, shared by every user who reaches that datacenter.", edges: ["cdn>proxy"] },
+    { caption: "Inside the app, a small map in memory answers in about 100 ns, but only for the requests that land on that one server.", edges: ["proxy>app"] },
+    { caption: "Redis is shared by all the app servers: one network round trip (about 0.5 ms) and the same answer whichever server asks.", edges: ["app>redis"] },
+    { caption: "Even the database caches: Postgres keeps recently used pages in memory, and the operating system keeps more. A 'database read' is often a memory read.", edges: ["app>pg"] },
+  ]}
+  caption="Each layer only sees what the layers in front of it missed."
+/>
+
+## The layers, compared
+
+| Layer | Typical cost of a hit | Shared by | Who can clear it |
+| --- | --- | --- | --- |
+| **Browser** | Nothing: no request is sent | One user | Only expiry: you can't reach into someone's browser |
+| **CDN edge** | A few ms, nearby | Everyone near that edge | You, by <Term t="purge">purging</Term>, or expiry |
+| **Reverse proxy** | Under a ms, inside the datacenter | Everyone reaching that datacenter | You |
+| **In-process (app memory)** | About 100 ns | Requests on one app server | Each server separately |
+| **Shared cache (Redis, Memcached)** | About 0.5 ms round trip | Every app server | You, with one delete |
+| **Database buffer cache** | A query's CPU, no disk | Every query | The database, automatically |
+
+Two things change as you move outwards, towards the user. Hits get **cheaper** and save more work, because a hit at the
+edge skips everything behind it. But you get **less control**: a copy in a browser stays until it expires, whatever
+you do. That's why the outer layers suit data that's the same for everyone and rarely changes (fingerprinted files,
+<L id="02.05" />), and the inner layers suit data that changes or is personal.
+
+## Local or shared?
+
+The biggest design choice inside the datacenter is whether the app keeps its own copy in memory or asks a shared cache.
+
+| | In-process cache | Shared cache (Redis) |
+| --- | --- | --- |
+| **Speed** | Fastest: no network | One round trip |
+| **Hit rate** | Each server warms its own copy, so lower | One copy serves everyone, so higher |
+| **After a deploy** | Every new server starts empty | Stays warm |
+| **Consistency** | 40 servers, 40 copies that can disagree | One copy |
+| **Memory** | Takes memory from the app | Its own machines |
+
+The common answer is **both**, as two levels: a small in-process cache with a short <Term t="ttl">TTL</Term> (seconds) for the hottest keys,
+in front of a large shared cache with a longer one. The in-process level absorbs viral traffic (<L id="05.02" />); the
+shared level gives a high hit rate and survives deploys. The short TTL bounds how long the 40 local copies can
+disagree.
+
+<Analogy>
+  **Where you keep your keys.** Your pocket is fastest, but it's yours alone and holds little. The hook by the front door is shared by the household. The spare with a neighbour is slow to fetch but survives you losing everything else. Each place is right for some things, and you'd be unwise to rely on only one.
+</Analogy>
+
+## The danger: a cache you can't live without
+
+A cache that's down should make Snip slower, not stop it. But at 100,000 redirects a second with a 99% hit rate, the
+database sees 1,000 reads a second, and it was sized for that. If Redis disappears, it sees 100,000, a hundred times
+its normal load, and falls over. The cache has stopped being an optimisation and become **part of the capacity**.
+
+Ways to stay honest about it:
+
+- **Know the number.** Work out what the database would see with the cache empty, and decide whether you can survive it.
+- **Protect the database anyway.** Limit how many cache misses can reach it at once (<L id="03.11" />), and coalesce
+  them (<L id="06.05" />), so a cold cache means slow requests rather than a dead database.
+- **Warm before serving.** Bring new cache nodes or regions into use gradually, filled from a warm copy.
+- **Test it.** Turn the cache off in a test environment, or empty one node in production, and watch what happens.
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Service caches"
+    year={2019}
+    href="https://builder.aws.com/content/3K9TeXp6strMiJ4vhakpRD7BQWO/caching-challenges-and-strategies"
+    source="Caching challenges and strategies (Jas Chhabra, Amazon Builders' Library)"
+    found="Local caches start cold on every new server, and a service that has grown used to its cache can fall over without it."
+  >
+    The article compares in-memory caches inside each service with external caches such as Memcached or Redis. In-memory
+    caches suffer from cold starts: a new server begins empty and sends a burst of requests to the service behind it.
+    It describes a service that "has become addicted to its cache", where behaviour differs sharply depending on
+    whether an item is cached, and recommends planning for the cache being empty. It also covers caching error
+    responses with their own TTL, and keeping a <Term t="soft-ttl">soft TTL</Term> and a hard TTL, so stale data can be served when the service
+    behind the cache is down.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip deploys 40 new app servers every afternoon. Right after each deploy, the database's read load triples for a minute. Which cache is the likely cause?"
+  options={[
+    { text: "The CDN", why: "The CDN isn't replaced by an app deploy; its edges keep their copies." },
+    { text: "The in-process cache on each app server", correct: true, why: "Every new server starts with an empty in-process cache. If that layer carries a lot of hits, those requests fall through to Redis and the database until each server warms up." },
+    { text: "Postgres's buffer cache", why: "The database wasn't restarted, so its buffer cache is still warm." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Caching personal data in shared layers.** Anything per-user belongs in-process, in Redis under a per-user key, or nowhere: never in a CDN or proxy cache shared between users.</li>
+    <li>**Long TTLs on layers you can't clear.** A browser copy can't be recalled. Keep browser lifetimes short for anything that can change.</li>
+    <li>**Forgetting the layers you didn't add.** The database and OS already cache. Measure before adding a layer that duplicates them.</li>
+    <li>**Treating the cache as optional when it isn't.** If the database can't survive a cold cache, plan for that day.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Caches can sit in the browser, a CDN, a proxy, the app's memory, a shared store and the database.</li>
+    <li>Outer layers save more work per hit but are harder to clear; inner layers are easier to keep correct.</li>
+    <li>In-process caches are fastest but start cold and disagree; shared caches are one copy for everyone. Use both, as two levels.</li>
+    <li>Know what the database would face with the cache empty, and protect it.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Where can you cache in a web system, and how do you decide where to put a cache?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["What goes wrong with an in-process cache on 50 servers?", "What happens to your system if the cache goes down?"]}
+>
+  <p>From the user inwards: the browser's HTTP cache, a CDN at the edge, a reverse proxy, an in-process cache inside each application server, a shared cache such as Redis or Memcached, and the database's own buffer cache. Hits further out save more work but are harder to invalidate, because I can't clear a browser and purging a CDN takes time.</p>
+  <p>I decide by asking who shares the data and how fresh it must be. Public, rarely changing content goes to the CDN with long lifetimes. Shared data that changes goes in a shared cache with explicit invalidation. Very hot keys get a small in-process cache with a TTL of seconds in front. I'd also check that the database can survive the cache being empty, and limit or coalesce misses so a cold cache degrades instead of cascading.</p>
+</InterviewCard>

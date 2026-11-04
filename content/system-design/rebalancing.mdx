@@ -50,7 +50,7 @@ Each move follows the same routine, close to the expand and contract pattern of 
   ]}
 />
 
-The cutover is the only moment that touches live traffic. Writes for one logical shard pause for a second or two in
+The cutover is the only moment that touches live traffic. Writes for one <Term t="logical-shard">logical shard</Term> pause for a second or two in
 the router or <Term t="connection-pooler">connection pooler</Term>, while the last changes replicate, and then resume against the new machine. Reads can
 often keep going throughout.
 

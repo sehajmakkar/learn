@@ -1,0 +1,167 @@
+export const meta = {
+  summary: "Reading through a cache is the easy half. When the data changes, do you write the cache, the database, or both, and in which order? Cache-aside, read-through, write-through, write-around and write-behind, compared.",
+  uses: ["02.04", "06.01", "02.06"],
+  usedIn: ["06.04", "06.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="02.04" /> for cache-aside and <L id="06.01" /> for the layers. Write-behind reuses the click queue from
+  <L id="02.06" />.
+</BeforeYouStart>
+
+## The problem: links can change now
+
+Until now, a Snip link never changed once created, so a cached copy was never wrong. Then Snip launches a paid plan,
+and its most requested feature is **editing a link's destination**: a campaign link `x7Kp` that pointed at a spring
+sale should point at the summer sale from Monday. Snip now has to decide what happens to the cached copy when the
+database row changes.
+
+There are two halves to this. **Reads**: who fills the cache on a miss? **Writes**: when data changes, what happens to
+the cache and the database, and in what order?
+
+## Reads: cache-aside or read-through
+
+- **Cache-aside** (Snip since <L id="02.04" />): the app checks the cache, and on a miss reads the database and fills
+  the cache itself. The cache knows nothing about the database.
+- **Read-through**: the app only talks to the cache, and the cache (or a library wrapping it) loads from the database
+  on a miss. The logic is the same, but it lives in one place instead of in every caller.
+
+Both give the same results. Read-through is tidier when many services share the logic; cache-aside is simpler to
+start with and works with any cache.
+
+## Writes: four choices
+
+| Pattern | On a write | Reads right after | Risk |
+| --- | --- | --- | --- |
+| **Write-around + delete** | Write the database, delete the cache entry | One miss, then fresh | A small race window (<L id="06.04" />) |
+| **Write-through** | Write the database and the cache, as one step | Fresh and already cached | Slower writes; caches data that may never be read |
+| **Write-behind (write-back)** | Write the cache now; the database later, in batches | Fresh from the cache | Writes lost if the cache dies before flushing |
+| **Write-around, no delete** | Write the database only | Stale until the TTL expires | Staleness bounded only by the TTL |
+
+**Write-around with delete** is the default for most systems, and it's what Snip uses for edits:
+
+```ts
+// redis is an ioredis client; db is a pg-promise database.
+
+// Reading: cache-aside
+async function destination(code: string): Promise<string | null> {
+  const hit = await redis.get(`link:${code}`);
+  if (hit !== null) return hit;
+  const row = await db.oneOrNone("SELECT long_url FROM links WHERE code = $1", [code]);
+  if (row) await redis.set(`link:${code}`, row.long_url, "EX", 3600);
+  return row?.long_url ?? null;
+}
+
+// Editing: update the database first, then delete the cached copy
+async function editDestination(code: string, longUrl: string) {
+  await db.none("UPDATE links SET long_url = $2 WHERE code = $1", [code, longUrl]);
+  await redis.del(`link:${code}`);
+}
+```
+
+## Why delete, and why in that order
+
+**Delete, don't overwrite.** Suppose two edits to `x7Kp` happen at almost the same moment, and each writer sets the
+cache to its new value after updating the database. The database ends with whichever update committed last, but the
+cache ends with whichever `SET` arrived last, and those needn't match:
+
+<Sequence
+  title="Two edits that each overwrite the cache"
+  walk
+  participants={[{ id: "a", label: "Edit A (summer)" }, { id: "b", label: "Edit B (autumn)" }, { id: "db", label: "Postgres" }, { id: "c", label: "Redis" }]}
+  messages={[
+    { from: "a", to: "db", label: "UPDATE → summer", explain: "Edit A commits first." },
+    { from: "b", to: "db", label: "UPDATE → autumn", explain: "Edit B commits second, so the database's final value is autumn." },
+    { from: "b", to: "c", label: "SET autumn", explain: "B is quick and writes the cache first." },
+    { from: "a", to: "c", label: "SET summer", fail: true, explain: "A was paused for a moment (a slow network, a garbage collection) and writes the cache last. The cache now says summer, the database says autumn, and nothing will fix it until the TTL expires." },
+  ]}
+/>
+
+If both writers **delete** instead, the order doesn't matter: the entry is gone either way, and the next read fills it
+from the database, which has the right answer. Deletes are also safe to repeat, so a retried delete can't do harm.
+
+**Database first, then cache.** Delete the cache first and a read can slip in between, find nothing, read the old row
+from the database and put it back in the cache, before your update commits. Updating the database first shrinks that
+window to a much rarer case, which <L id="06.04" /> covers. And if the delete fails after the update succeeds, the TTL
+is the safety net, which is one reason every entry has one.
+
+<Analogy>
+  **The office noticeboard.** When a meeting moves, you could rewrite the notice (but two people rewriting it at once can leave the wrong time up), or you can update the calendar and simply take the notice down. The next person who wants to know checks the calendar and pins up a fresh notice. Taking it down is hard to get wrong.
+</Analogy>
+
+## Write-through: always warm, always paying
+
+With write-through, every write goes to the database and the cache together, so reads after a write are hits. It
+suits data that's read soon after it's written. The costs: every write pays for two stores, and you cache things that
+may never be read. In practice "write-through" is usually still **database first, then cache**, so the two-writer race
+above still applies unless the cache rejects older versions (<L id="06.04" />).
+
+Snip doesn't use it for links: most links are created and then clicked a handful of times, and an edit is rare.
+
+## Write-behind: fast, until the cache dies
+
+With write-behind, the app writes only to the cache and the cache, or a worker, copies changes to the database later,
+in batches. Writes are as fast as the cache, and many updates to the same key collapse into one database write.
+
+The danger is in the gap: anything written but not yet flushed exists only in the cache's memory. Snip considered it
+for click counts, with `INCR clicks:x7Kp` on every redirect and a worker writing the totals to Postgres every few
+seconds. It's fast, but a Redis node crashing would lose up to a flush interval of clicks for every code on that node.
+Snip keeps its click queue (<L id="02.06" />), which holds events durably until workers have counted them, because
+owners pay for accurate counts. Write-behind fits data where losing the last few seconds is acceptable: view
+counters, "last seen" times, <Term t="rate-limit">rate-limit</Term> counters.
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="DynamoDB Accelerator (DAX)"
+    year="Docs"
+    href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DAX.consistency.html"
+    source="DAX and DynamoDB consistency models (AWS documentation)"
+    found="A write-through cache, where the subtle part is which cached results a write does and doesn't refresh."
+  >
+    DAX describes itself as a write-through cache in front of DynamoDB. A write goes to DynamoDB first; only after
+    DynamoDB confirms it does DAX update its item cache and reply, and a write that fails isn't cached. But DAX keeps
+    two caches, and only the item cache is refreshed: query and scan results live in a separate query cache, and
+    "updates to the item cache, or to the underlying DynamoDB table, do not invalidate" them. Writes made directly to
+    DynamoDB, bypassing DAX, don't refresh its item cache either.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's edit code deletes the cache entry first, then updates the database. Users occasionally see an old destination for up to an hour after an edit. Why?"
+  options={[
+    { text: "Redis ignored the delete", why: "Redis applied the delete. The problem is what happened after it." },
+    { text: "A read arrived between the delete and the update, refilled the cache from the old row, and the entry stays until its one-hour TTL", correct: true, why: "With the cache empty and the database not yet updated, a miss reads the old value and caches it. Update the database first, then delete." },
+    { text: "The database update was rolled back", why: "Then the database would show the old value too, and the cache would be correct." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Overwriting the cache on write.** Two concurrent writers can leave the older value cached. Delete instead.</li>
+    <li>**Deleting before updating.** A read in between refills the cache with the old value.</li>
+    <li>**Write-behind for data you can't lose.** Unflushed writes live only in memory. Use it for counters and hints, not money or links.</li>
+    <li>**Forgetting other cached shapes of the same data.** A list or query result that includes the row is stale too.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Cache-aside and read-through differ only in who loads on a miss: the app or the cache.</li>
+    <li>For writes, the safe default is: update the database, then delete the cache entry, with a TTL as a backstop.</li>
+    <li>Write-through keeps the cache warm at the cost of slower writes; write-behind makes writes fast but can lose them.</li>
+    <li>Every cached form of the data (single rows, lists, query results) needs its own plan for changes.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Compare cache-aside, write-through and write-behind. Which would you choose?", level: "Mid", frequency: 3, importance: "Must-know", kind: "Concept" }}
+  followUps={["Why delete the cache entry rather than update it?", "What happens with write-behind if the cache node crashes?"]}
+>
+  <p>With cache-aside, the application reads the cache, and on a miss reads the database and fills the cache; on a write it updates the database and deletes the cache entry. Write-through writes the database and the cache together on every write, so the cache is always warm, at the cost of slower writes and caching data that may never be read. Write-behind writes the cache first and flushes to the database later in batches, which makes writes fast and merges repeated updates, but loses whatever wasn't flushed if the cache dies.</p>
+  <p>My default is cache-aside with delete-on-write and a TTL, because it's simple and fails safe. I'd use write-through when data is read right after it's written, and write-behind only for data where losing a few seconds is acceptable, like view counters.</p>
+</InterviewCard>

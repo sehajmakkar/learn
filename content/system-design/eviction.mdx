@@ -1,0 +1,225 @@
+export const meta = {
+  summary: "A cache is smaller than the data behind it, so something must go when it fills. FIFO, LRU, LFU and TTLs, tried on a simulated redirect workload, and how Redis and Caffeine really choose.",
+  uses: ["06.01", "02.04", "05.02"],
+  usedIn: ["06.05", "06.06"],
+};
+
+<BeforeYouStart>
+  Read <L id="06.01" /> and <L id="02.04" />: the whole point of a cache is its hit rate. The viral links from
+  <L id="05.02" /> show up here as a workload.
+</BeforeYouStart>
+
+## The problem: the cache is full
+
+Snip has 600 million links, and its Redis cluster has room for about 40 million of them. Every new entry that goes in
+means an old one comes out. Which one? Choose well and the cache answers 99% of redirects; choose badly and it keeps
+links nobody clicks while the popular ones miss.
+
+Two separate mechanisms remove entries:
+
+- **Expiry**: an entry's <Term t="ttl">TTL</Term> runs out. That's about freshness: how old a copy may be.
+- **Eviction**: the cache is full and must make room. That's about space, and the **eviction policy** decides which
+  entry goes.
+
+## The policies
+
+| Policy | Evicts | Good at | Bad at |
+| --- | --- | --- | --- |
+| **FIFO** | The oldest entry added | Simple, cheap: no work on a hit | Throws out popular keys just because they're old |
+| **LRU** (least recently used) | The entry not read for the longest | Recent popularity, changing workloads | One big scan flushes everything useful |
+| **LFU** (least frequently used) | The entry read the fewest times | Steady favourites; ignores one-off reads | Old favourites linger after they stop being popular |
+| **Random** | Any entry | Very cheap | Wastes space on cold keys |
+| **Optimal** (Belady's) | The entry needed furthest in the future | The best possible; a yardstick | Needs to know the future |
+
+The optimal policy can't be built, since no cache knows the next request. It's useful in a simulator, because it
+shows how much room for improvement is left.
+
+## Try it
+
+<Lab
+  id="sd-06-03-eviction"
+  title="Which policy keeps the right links?"
+  tasks={[
+    "With the steady workload and a cache of 1,000 links, rank the four policies. How far is the best real policy from optimal?",
+    "Make the cache 4,000 links. Does the choice of policy matter more or less when the cache is big?",
+    "Switch to 'Popularity shifts'. What happens to LFU after each shift, and why does LRU cope?",
+    "Switch to 'Crawler scan'. Watch the chart in the shaded period: which policy loses its popular links, and which keeps them?",
+  ]}
+>
+  <EvictionLab preset={{ pattern: "steady", skew: 0.9, size: 1000 }} />
+</Lab>
+
+The run sends 60,000 requests for 20,000 links whose popularity follows a power law, like real link clicks: a few
+links get most of the traffic. The hit rates are lower than Snip's real 99% because the run is short (every link's
+first request is a miss) and the cache holds only a few percent of the links. What matters is the comparison:
+
+- **Steady popularity** (cache of 1,000): FIFO hits 42.9%, LRU 47.1%, LFU 54.4%, optimal 65.6%. Counting how often a
+  link is used beats remembering when it was last used, because a popular link stays popular.
+- **Popularity shifts**: LFU falls to 32.8% while LRU holds at 46.4%. After each shift, yesterday's links still have
+  huge counts, so LFU keeps them and evicts today's links before they can build up counts. It never forgets.
+- **A crawler scan**, where half the requests in the middle third are for old links requested once: LRU's hit rate
+  falls to about 18% during the scan, LFU's to about 27%. Every one-off link is "recently used", so LRU throws out
+  popular links to make room for them; LFU sees they've been used once and evicts them first.
+- **A bigger cache** narrows the gaps: at 4,000 links, LRU and LFU are within a few points of each other. Policy
+  matters most when memory is tight.
+
+So neither LRU nor LFU wins everywhere. That's why real caches use something in between.
+
+## What real caches do
+
+**Redis** doesn't run exact LRU, which would mean updating a linked list on every read. When it needs room, it
+**samples** a few keys at random (5 in its example configuration; 10 gets closer to true LRU) and evicts the least
+recently used of those, keeping a pool of good candidates between rounds. It's close to true LRU at a fraction of the cost. Since Redis 4.0 it also offers LFU, with
+two twists that fix the problem in the lab: the counter is **logarithmic**, so it saturates around a million reads
+instead of growing forever, and it **decays** over time (by default every minute), so old favourites fade.
+
+Redis also asks you which keys may be evicted at all. `allkeys-lru` and `allkeys-lfu` consider every key;
+`volatile-lru`, `volatile-lfu` and `volatile-ttl` consider only keys with a TTL; and `noeviction` refuses new writes
+with an error when memory is full. For a pure cache, an `allkeys` policy is right. `noeviction` suits Redis used as a
+store, where silently losing data would be worse.
+
+**Caffeine**, a widely used Java cache, uses
+[W-TinyLFU](https://github.com/ben-manes/caffeine/wiki/Efficiency): new entries go into a small LRU "window", and when
+one is pushed out of the window it's only admitted to the main cache if a compact frequency sketch says it's been used
+more often than the entry it would replace. The window lets brand-new popular keys in, and the frequency check keeps
+one-off scans out: the best of both lab results.
+
+## TTLs are part of the policy
+
+A TTL bounds staleness, but it also shapes what the cache holds. An entry that expires frees its space whether or not
+the cache was full, so short TTLs keep the cache full of what's recently been asked for. When Twitter studied its
+production caches (below), it found TTLs were often what defined each cache's working set, more than eviction did.
+
+Two rules of thumb:
+
+- **Give every entry a TTL**, even if it's long. It's the safety net for every <Term t="cache-invalidation">invalidation</Term> you forget (<L id="06.04" />).
+- **Add jitter.** Entries filled at the same moment (a cache warm-up, a deploy) with the same TTL all expire at the
+  same moment too. Use 3,600 seconds plus or minus 10% at random, and expiries spread out (<L id="06.05" />).
+
+## A small LRU cache with TTLs
+
+A JavaScript `Map` remembers insertion order, which is enough for an LRU: move an entry to the end on every read, and
+evict from the front.
+
+```ts
+export class LruCache<V> {
+  // A Map remembers insertion order, so its first key is always the least recently used.
+  private entries = new Map<string, { value: V; expiresAt: number }>();
+
+  constructor(
+    private readonly capacity: number,
+    private readonly ttlMs: number,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  get(key: string): V | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= this.now()) {
+      this.entries.delete(key); // expired: treat as a miss
+      return undefined;
+    }
+    this.entries.delete(key); // move to the most recently used end
+    this.entries.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: string, value: V, ttlMs = this.ttlMs) {
+    this.entries.delete(key);
+    if (this.entries.size >= this.capacity) {
+      const oldest = this.entries.keys().next().value!;
+      this.entries.delete(oldest); // evict the least recently used
+    }
+    this.entries.set(key, { value, expiresAt: this.now() + ttlMs });
+  }
+
+  delete(key: string) {
+    this.entries.delete(key);
+  }
+}
+```
+
+Every operation is constant time. This is the kind of cache Snip's app servers use for viral codes: a few thousand
+entries with a TTL of five seconds. (Expired entries are only removed when read or pushed out; for a small cache
+that's fine.)
+
+<Analogy>
+  **A small bookshelf by your desk.** When it's full and you bring a new book, something goes back to the library. FIFO returns the book you've had longest; LRU returns the one you haven't opened for longest; LFU returns the one you've opened least. If you spent a week reading old reports once each, LRU would have sent all your favourites back. LFU wouldn't, but it would keep last year's textbook for ever.
+</Analogy>
+
+<SeenInProduction>
+  <Seen
+    company="Twitter"
+    system="Twemcache, 153 clusters"
+    year={2020}
+    href="https://www.usenix.org/conference/osdi20/presentation/yang"
+    source="A large scale analysis of hundreds of in-memory cache clusters at Twitter (OSDI 2020)"
+    found="Real cache workloads are often write-heavy and TTL-driven, and simple FIFO often does as well as LRU."
+  >
+    Researchers from Carnegie Mellon and Twitter analysed traces from 153 production cache clusters, over 80 TB of
+    data. More than 35% of clusters were write-heavy (over 30% of operations were writes). TTLs ranged from minutes to
+    days, with more than a quarter of workloads using a mean TTL under twenty minutes, and the paper calls TTL "an
+    important and sometimes defining parameter" of a cache's working set. In simulation, FIFO often performed about as
+    well as LRU at reasonable cache sizes; LRU's advantage showed mainly when the cache was severely limited.
+  </Seen>
+  <Seen
+    company="Redis"
+    system="Eviction policies"
+    year="Docs"
+    href="https://redis.io/docs/latest/develop/reference/eviction/"
+    source="Key eviction (Redis documentation)"
+    found="Approximate LRU by sampling, and an LFU whose counters saturate and decay."
+  >
+    Redis's LRU "samples a small number of keys at random and then evicts the ones with the longest time since last
+    access", and since 3.0 keeps a pool of good candidates. LFU arrived in Redis 4.0; by default its counter saturates
+    at around a million requests and decays every minute. The documentation suggests `allkeys-lru` as a good default
+    when you have no reason to prefer another policy.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A nightly job reads every one of Snip's 600 million links once to check for broken destinations, through the same Redis that serves redirects. The morning hit rate is terrible. Which change helps most?"
+  options={[
+    { text: "Switch from LRU to FIFO", why: "FIFO is just as easily flushed by a scan: every scanned link is the newest entry." },
+    { text: "Have the job read the database directly, or use an LFU-style policy that doesn't admit one-off reads", correct: true, why: "The job's reads are each used once, so caching them only pushes out popular links. Bypassing the cache is simplest; a frequency-aware policy is the general fix." },
+    { text: "Give the job's entries a longer TTL", why: "That keeps the useless entries around longer, making things worse." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Letting batch jobs read through the serving cache.** One scan can flush every popular key. Bypass the cache for scans.</li>
+    <li>**`noeviction` on a cache.** When memory fills, writes start failing. Use an `allkeys` policy for a pure cache.</li>
+    <li>**Same TTL for everything filled at once.** They all expire together. Add jitter.</li>
+    <li>**Tuning the policy before the size.** A bigger cache often helps more than a cleverer policy; measure hit rate against size first.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Expiry is about freshness; eviction is about space. A full cache needs a policy to choose what goes.</li>
+    <li>LRU adapts to change but is flushed by scans; LFU resists scans but clings to old favourites.</li>
+    <li>Real caches blend them: Redis samples and decays its counters; Caffeine admits new keys only if they beat the one they'd replace.</li>
+    <li>Give every entry a TTL with jitter, and keep one-off scans out of the serving cache.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Implement an LRU cache with O(1) get and put.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Coding" }}
+  followUps={["How would you add a TTL?", "How would you make it safe to use from many threads?"]}
+>
+  <p>The classic structure is a hash map from key to a node in a doubly linked list. The list is ordered by recency: on every get or put, I move the node to the head; when the cache is over capacity, I remove the tail node and delete its key from the map. Both the lookup and the list operations are constant time.</p>
+  <p>In JavaScript, a Map already keeps insertion order, so deleting and re-inserting a key on each access moves it to the end, and the first key is the least recently used. For a TTL, I'd store an expiry time with each value and treat expired entries as misses. For concurrency, a single lock is simplest; at high throughput I'd shard the cache into several independently locked segments.</p>
+</InterviewCard>
+
+<InterviewCard
+  q={{ q: "When would LFU beat LRU, and when would it lose?", level: "Senior", frequency: 2, importance: "Good to know", kind: "Concept" }}
+  followUps={["How do real systems fix LFU's weaknesses?"]}
+>
+  <p>LFU wins when popularity is stable and there's noise from one-off reads, like a scan or a crawler: those items have a count of one and are evicted first, while LRU would throw out popular items to make room for them. LFU loses when popularity shifts, because old items keep their high counts and new popular items get evicted before they can build up counts.</p>
+  <p>Real systems combine the two. Redis uses a logarithmic counter that saturates and decays over time. Caffeine's W-TinyLFU puts new items in a small LRU window and only admits them to the main cache if a frequency sketch says they're used more often than the item they'd evict.</p>
+</InterviewCard>
