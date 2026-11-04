@@ -1,0 +1,256 @@
+export const meta = {
+  summary: "Unique, roughly time-ordered 64-bit IDs at hundreds of thousands a second with no central counter: comparing ticket servers, UUIDs and Snowflake, handing out worker numbers with leases (tested), and what to do when a clock runs backwards.",
+  uses: ["05.05", "05.06", "08.07", "08.08", "04.02"],
+  usedIn: ["17.02"],
+};
+
+<BeforeYouStart>
+  <L id="05.05" /> introduced the schemes and a Snowflake generator; <L id="05.06" /> covered clocks. This lesson is
+  the full design, including the parts that usually go wrong: worker numbers and time.
+</BeforeYouStart>
+
+## The prompt
+
+"Design a unique ID generator" looks like a one-liner (use a UUID) until the interviewer adds constraints: 64 bits,
+sortable by time, very fast, and no single machine that everything depends on.
+
+<DesignIt
+  id="sd-15-05-id-generator"
+  minutes={15}
+  levels={["mid", "senior"]}
+  patterns={["coordination-free", "leases", "clocks"]}
+  rubric={[
+    "Options compared: database sequence, ticket servers, UUIDv4, UUIDv7, Snowflake",
+    "A bit layout with the arithmetic: years of timestamps, IDs per millisecond, number of workers",
+    "How each generator gets a unique worker number, and what stops two having the same one",
+    "What happens when the clock moves backwards",
+    "Library in each process or a separate service, with the trade-off",
+    "Why time-ordered IDs matter for database indexes",
+  ]}
+>
+  Every service at Snip needs IDs for new rows: clicks, events, messages. Design a way to generate them: unique
+  across all services and both regions, 64-bit integers, roughly ordered by creation time, at up to 500,000 a second
+  overall, with no single point of failure and under a millisecond to get one.
+</DesignIt>
+
+## 1. Requirements
+
+- **Unique**, everywhere, forever.
+- **64 bits**, so they fit a `bigint` column and are cheap to index.
+- **Roughly time-ordered** ("k-sorted"): IDs made later are usually larger, so new rows land at the end of a B-tree
+  index (<L id="04.02" />) and IDs sort by time without a separate column.
+- **Fast and available**: 500,000 a second, under a millisecond, no single point of failure.
+- **Not required:** being unguessable (these aren't Snip's short codes) or strictly sequential.
+
+## 2. Options
+
+<DeepDive title="Which scheme?">
+  <Option grade="bad" name="One database's auto-increment sequence">
+    Unique and ordered, but every insert in every service depends on one machine, and it's a bottleneck for both
+    regions.
+  </Option>
+  <Option grade="good" name="Ticket servers or blocks of IDs; or UUIDs">
+    Flickr's two ticket servers hand out odd and even numbers; a service can take a block of 1,000 at a time to cut
+    round trips. Still a dependency, and blocks break time order. UUIDv4 needs no coordination but is 128 bits and
+    random, which scatters index inserts; **UUIDv7** fixes the order, and is the right answer if 128 bits is
+    acceptable (<L id="05.05" />).
+  </Option>
+  <Option grade="great" name="Snowflake: timestamp, worker number, sequence">
+    Each generator makes IDs alone from its clock, its worker number and a counter. 64 bits, time-ordered, no
+    network call per ID.
+  </Option>
+</DeepDive>
+
+```text
+ 1 bit  | 41 bits                       | 10 bits        | 12 bits
+ unused | milliseconds since 2025-01-01 | worker number  | sequence within the millisecond
+
+ 41 bits of milliseconds ≈ 69 years · 1,024 workers · 4,096 IDs per worker per millisecond
+```
+
+One worker can make about 4 million IDs a second, so 500,000 a second needs a handful. The real limits are the
+1,024 worker numbers and the clock.
+
+## 3. High-level design
+
+<Arch
+  title="ID generation at Snip"
+  nodes={[
+    { id: "svc", label: "Service process", kind: "service", sub: "generator library", x: 0, y: 1 },
+    { id: "svc2", label: "Service process", kind: "service", sub: "generator library", x: 0, y: 2 },
+    { id: "lease", label: "Worker-number leases", kind: "db", sub: "Postgres or etcd", x: 1, y: 1 },
+    { id: "ntp", label: "Time sync", kind: "external", sub: "NTP", x: 1, y: 0 },
+  ]}
+  edges={[
+    { from: "svc", to: "lease", label: "claim, renew every 10 s" },
+    { from: "svc2", to: "lease" },
+    { from: "ntp", to: "svc", dashed: true },
+  ]}
+  steps={[
+    { caption: "At start-up, each process claims a free worker number from 0 to 1,023, with a 30-second lease.", edges: ["svc>lease", "svc2>lease"] },
+    { caption: "It then makes IDs entirely in memory: current millisecond, its worker number, and a sequence that resets each millisecond. No network call per ID.", nodes: ["svc"] },
+    { caption: "It renews the lease every 10 seconds. If a renewal fails and the lease runs out, it stops making IDs, because another process may now hold that number.", edges: ["svc>lease"] },
+    { caption: "Clocks are kept close by NTP; the generator also checks every timestamp against the last one it used.", edges: ["ntp>svc"] },
+  ]}
+  caption="The generator is a library inside each process; the only shared piece is the table of worker numbers, used every few seconds, not per ID."
+/>
+
+## 4. Deep dives
+
+<DeepDive title="Giving each generator a unique worker number">
+  <Option grade="bad" name="Set it by hand in config">
+    Works until someone copies a config, or autoscaling starts two copies of the same one. Duplicate worker numbers
+    mean duplicate IDs, silently.
+  </Option>
+  <Option grade="good" name="Derive it from the machine's IP address or name">
+    No coordination, but 10 bits from a hash of an address collide: with 40 machines, the chance that two share a
+    number is about 50%, and with 100 it's about 99%. Containers reuse addresses, too.
+  </Option>
+  <Option grade="great" name="Lease it from a coordination store">
+    A process claims a free number with an expiry and renews it; if renewal fails, it stops before the lease
+    expires. A process that stalled or lost its network can't keep using a number someone else now holds
+    (<L id="08.07" />).
+  </Option>
+</DeepDive>
+
+```sql
+CREATE TABLE worker_ids (id int PRIMARY KEY, holder text, expires_at timestamptz NOT NULL DEFAULT '-infinity');
+INSERT INTO worker_ids (id) SELECT g FROM generate_series(0, 1023) g;
+```
+
+```ts
+export async function claimWorkerId(db: pg.Pool, holder: string, leaseSeconds = 30): Promise<number | null> {
+  const { rows } = await db.query(
+    `UPDATE worker_ids SET holder = $1, expires_at = now() + make_interval(secs => $2)
+     WHERE id = (SELECT id FROM worker_ids WHERE expires_at < now()
+                 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+     RETURNING id`,
+    [holder, leaseSeconds],
+  );
+  return rows[0]?.id ?? null;
+}
+
+export async function renewWorkerId(db: pg.Pool, id: number, holder: string, leaseSeconds = 30) {
+  const { rowCount } = await db.query(
+    `UPDATE worker_ids SET expires_at = now() + make_interval(secs => $3)
+     WHERE id = $1 AND holder = $2 AND expires_at > now()`,
+    [id, holder, leaseSeconds],
+  );
+  return rowCount === 1; // false: the lease is gone, so stop generating IDs at once
+}
+```
+
+Tested on Postgres 16 with 2-second leases: 20 processes claiming at the same moment got 20 different numbers.
+Renewal by the holder succeeded and by any other name failed. After the lease ran out, the old holder's renewal
+failed, and a new process claimed the freed number. The lease time comes from the database's clock, so the
+processes' own clocks don't decide who holds what.
+
+<DeepDive title="When the clock goes backwards">
+  <Option grade="bad" name="Ignore it">
+    NTP steps the clock back 50 ms; the generator reuses those 50 milliseconds with the same worker number and
+    sequences that start at 0 again: duplicate IDs.
+  </Option>
+  <Option grade="good" name="Refuse to generate until the clock catches up">
+    Snowflake's own rule. Remember the last timestamp used; if the clock reads earlier, wait or return an error.
+    Correct, but a large jump stalls the process.
+  </Option>
+  <Option grade="great" name="Refuse, and bound the damage">
+    Wait out small steps (a few milliseconds); for large ones, stop, alert and let the process give up its lease and
+    claim a new number. Configure time sync to slew (adjust gradually) rather than step, and keep the lease longer
+    than the largest step you'd tolerate, so a restarted process can't reuse its old number in the repeated time.
+  </Option>
+</DeepDive>
+
+**Library or service?** A library has no network hop and no new service to run; it needs the lease table and
+disciplined clocks on every machine. A central ID service (a few instances, each with its own worker number) suits
+clients in many languages, at the cost of a call per ID or per block of IDs. Snip uses the library.
+
+## 5. Wrap-up
+
+What breaks first: **worker numbers**, if thousands of short-lived processes each hold one (10 bits is 1,024);
+widen the worker field and narrow the sequence. Then **ordering across machines**: IDs are only roughly ordered,
+since two machines' clocks differ by a few milliseconds, so never use them to decide which of two events happened
+first (<L id="08.05" />).
+
+<Levels
+  junior={[
+    "Proposes UUIDs or a database sequence and names a drawback",
+  ]}
+  mid={[
+    "Designs the Snowflake layout and does the arithmetic",
+    "Explains why time order helps indexes",
+  ]}
+  senior={[
+    "Assigns worker numbers with leases and stops when a lease is lost",
+    "Handles a backwards clock",
+    "Knows IDs are only roughly ordered across machines",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Twitter"
+    system="Snowflake"
+    year={2010}
+    href="https://github.com/twitter-archive/snowflake/tree/snowflake-2010"
+    source="Snowflake (2010 release README)"
+    found="Uncoordinated, roughly time-ordered 64-bit IDs: timestamp, machine number and sequence, and a refusal to run when the clock goes backwards."
+  >
+    Moving tweets from MySQL to Cassandra, which has no way to generate sequential IDs, Twitter needed at least 10,000
+    IDs a second per process, generated without machines coordinating, roughly sorted by time and under 64 bits. The
+    design was a 41-bit millisecond timestamp with a custom epoch, a 10-bit machine number and a 12-bit sequence. The
+    README warns that Snowflake depends on NTP and refuses to generate IDs if the clock runs backwards.
+  </Seen>
+  <Seen
+    company="Flickr"
+    system="Ticket servers"
+    year={2010}
+    href="https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/"
+    source="Ticket Servers: Distributed Unique Primary Keys on the Cheap"
+    found="Two small MySQL servers, one handing out odd IDs and one even, gave sharded data unique 64-bit keys."
+  >
+    Flickr's sharded MySQL couldn't rely on auto-increment, which isn't unique across databases, and it rejected GUIDs
+    because they're big and index badly. Its ticket servers each hold one row per sequence and use `REPLACE INTO` with
+    `LAST_INSERT_ID()` to atomically get the next number. Two servers, configured to step by 2 from offsets 1 and 2,
+    split the space into odd and even, so either can fail.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Autoscaling starts a second copy of a service whose config says worker = 17, so two processes generate IDs as worker 17. What happens?"
+  options={[
+    { text: "Nothing: their timestamps differ", why: "Not reliably. In the same millisecond, both start their sequence at 0." },
+    { text: "Duplicate IDs whenever both make an ID in the same millisecond with the same sequence; lease worker numbers instead", correct: true, why: "Uniqueness rests entirely on the worker number being unique. Leases with expiry make sure only one live process holds each." },
+    { text: "The database rejects the duplicate, so it's harmless", why: "Only where the ID is a primary key in one table. Events, logs and other stores may accept both." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Worker numbers in config files.** Lease them, and stop when the lease is lost.</li>
+    <li>**Trusting the clock.** Check each timestamp against the last one used.</li>
+    <li>**Treating IDs as a global order.** They're roughly ordered; machines' clocks differ.</li>
+    <li>**Random 128-bit keys on a hot table without thinking.** Prefer time-ordered IDs for index locality.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Snowflake IDs pack a millisecond timestamp, a worker number and a sequence into 64 bits: about 69 years, 1,024 workers, 4,096 IDs per millisecond each.</li>
+    <li>Generation is local; the only shared piece is the lease on each worker number.</li>
+    <li>A lost lease, or a backwards clock, means stop generating.</li>
+    <li>If 128 bits is fine, UUIDv7 gives time order with no coordination at all.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a distributed unique ID generator.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you assign machine IDs?", "What if the clock goes backwards?", "Why not just use UUIDs?"]}
+>
+  <p>I'd confirm the constraints: 64 bits, roughly time-ordered, high throughput, no single point of failure. That rules out a single database sequence, and UUIDv4 is 128 bits and random, though UUIDv7 would do if 128 bits were acceptable. So a Snowflake layout: 41 bits of milliseconds from a custom epoch, about 69 years; 10 bits of worker number, 1,024 workers; and 12 bits of sequence, 4,096 IDs per millisecond per worker. Generation is a library in each process, with no network call per ID.</p>
+  <p>Worker numbers are leased from a coordination store with an expiry and renewed regularly; if renewal fails, the process stops before the lease runs out, so two live processes never share a number. The generator remembers the last timestamp and refuses to issue IDs if the clock goes backwards, waiting out small steps and alerting on large ones. IDs are only roughly ordered across machines, so they're not used to order events precisely.</p>
+</InterviewCard>

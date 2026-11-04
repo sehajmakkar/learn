@@ -1,0 +1,278 @@
+export const meta = {
+  summary: "A rate limiting service for a whole API: rules that change without a deploy, shared counters in a sharded Redis tier with one atomic call per check, several rules on one request without double-spending, and what happens when the limiter itself is slow or down.",
+  uses: ["14.03", "14.04", "03.07", "06.06", "05.02", "08.01"],
+  usedIn: [],
+};
+
+<BeforeYouStart>
+  The algorithms are in <L id="14.03" /> and the placement choices in <L id="14.04" />. This lesson is the interview
+  version: one service that does it for every route, with numbers.
+</BeforeYouStart>
+
+## The prompt
+
+"Design a <Term t="rate-limit">rate limiter</Term>" usually means a **distributed** one: many <Term t="api">API</Term> servers, one set of limits. The algorithm is a
+small part of the answer; the rest is where state lives, how rules change, and what the limiter does when it breaks.
+
+<DesignIt
+  id="sd-15-03-rate-limiter"
+  minutes={20}
+  levels={["mid", "senior"]}
+  patterns={["shared counters", "atomic operations", "fail open"]}
+  rubric={[
+    "Rules keyed by something meaningful (API key, IP, route), with limits per plan",
+    "An algorithm chosen with its trade-off stated (token bucket or sliding window counter)",
+    "Shared state across servers, updated atomically",
+    "An estimate of memory and operations for the counter store",
+    "Clear responses: 429, Retry-After and remaining-quota headers",
+    "A decision for when the limiter is unreachable, and why",
+    "A way to change rules safely, without a deploy",
+  ]}
+>
+  Snip's public API runs on 40 gateway servers and peaks at 200,000 requests a second from 2 million API keys. Each
+  plan has limits ("basic: 10 requests a second, bursts of 20; 100 link creations a minute"), and unauthenticated
+  traffic is limited by IP. The limiter may add at most a couple of milliseconds to a request.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional**
+
+- Limit by API key, IP address and route, with limits that depend on the customer's plan.
+- Reject excess requests with **429 Too Many Requests**, a `Retry-After` header, and headers saying how much quota
+  is left.
+- Change limits and add rules without deploying the API.
+
+**Non-functional**
+
+- Adds under 2 ms at p99.
+- Limits hold across all 40 servers, give or take a few percent.
+- The limiter failing must not take the API down.
+
+## 2. Estimates
+
+- **State:** 2 million keys × about 3 rules each = 6 million buckets. At about 100 bytes each with Redis overhead,
+  that's **600 MB**: it fits in memory, comfortably.
+- **Operations:** 200,000 requests × 2 rules on average = 400,000 checks a second. If one Redis primary handles about
+  50,000 scripted checks a second within the latency target (measure your own), that's **8 primaries**, plus
+  replicas.
+
+So the counter store is a small Redis cluster. The cost to design around is the **round trip** on every request.
+
+## 3. Entities and API
+
+```text
+Rule    { name, match: (api_key | ip | route), per_plan: { rate, burst }, mode: enforce | shadow }
+Bucket  { rule:key → tokens, updated_at }        in Redis, sharded by key
+
+check(request) → { allowed, remaining, retry_after }      called by the gateway, in process
+
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 0
+```
+
+## 4. High-level design
+
+<Arch
+  title="Rate limiting at Snip's gateway"
+  nodes={[
+    { id: "client", label: "API client", kind: "client", x: 0, y: 1 },
+    { id: "edge", label: "CDN / edge", kind: "cdn", sub: "per-IP floods", x: 1, y: 1 },
+    { id: "gw", label: "Gateway", kind: "lb", sub: "limiter library", x: 2, y: 1 },
+    { id: "redis", label: "Counter store", kind: "cache", sub: "Redis, 8 primaries", x: 3, y: 0 },
+    { id: "api", label: "Snip API", kind: "service", x: 3, y: 1 },
+    { id: "rules", label: "Rules service", kind: "service", sub: "versioned config", x: 2, y: 2 },
+  ]}
+  edges={[
+    { from: "client", to: "edge" },
+    { from: "edge", to: "gw" },
+    { from: "gw", to: "redis", label: "1 script call" },
+    { from: "gw", to: "api", label: "if allowed" },
+    { from: "rules", to: "gw", label: "push", dashed: true },
+  ]}
+  steps={[
+    { caption: "The edge drops floods from single IP addresses before they cost anything (14.04).", edges: ["client>edge", "edge>gw"] },
+    { caption: "The gateway has every rule in memory, pushed by the rules service whenever a rule changes. It works out which rules match this request.", edges: ["rules>gw"] },
+    { caption: "It checks all matching buckets in one atomic script call to the Redis primary that owns the key.", edges: ["gw>redis"] },
+    { caption: "If every rule allows the request, it goes through, with headers saying how much quota is left. Otherwise the gateway answers 429 itself.", edges: ["gw>api"] },
+  ]}
+  caption="The limiter is a library inside the gateway, not a separate hop: rules live in memory, counts in a sharded Redis tier."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="Where do the counts live?">
+  <Option grade="bad" name="In each gateway's memory">
+    No round trip, but with 40 servers a key gets up to 40 times its limit, and the true limit changes whenever the
+    fleet resizes.
+  </Option>
+  <Option grade="good" name="In Redis, read then write">
+    Shared, but two gateways can both read 9 of 10, both allow, and both write 10: under concurrency the limit leaks.
+  </Option>
+  <Option grade="great" name="In Redis, one atomic script per check">
+    The script reads the bucket, refills it for the elapsed time, takes a token and writes it back as one step, so
+    concurrent checks can't interleave. Keys are spread across primaries by hash (<L id="06.06" />), and the script
+    uses the Redis server's clock, not 40 different gateway clocks.
+  </Option>
+</DeepDive>
+
+<DeepDive title="One request, several rules">
+  <Option grade="bad" name="Check each rule in turn, spending as you go">
+    A request allowed by the key's limit but rejected by the route limit has already spent a token from the key's
+    bucket. Rejected requests eat the customer's quota.
+  </Option>
+  <Option grade="good" name="Use only the strictest rule">
+    Simpler, but different rules protect different things; dropping one leaves a gap.
+  </Option>
+  <Option grade="great" name="Check every rule, then spend from all of them only if all allow">
+    Done inside one script, so it's atomic too. The response reports the lowest remaining quota and the longest
+    wait.
+  </Option>
+</DeepDive>
+
+The decision logic, run here in process with an in-memory map in place of Redis:
+
+```ts
+type Req = { apiKey: string; ip: string; route: string };
+type Rule = { name: string; match: (r: Req) => string | null; perSecond: number; burst: number };
+type Bucket = { tokens: number; at: number };
+
+export class Limiter {
+  private buckets = new Map<string, Bucket>();
+  constructor(private rules: Rule[]) {}
+
+  check(req: Req, now: number) {
+    let retryAfter = 0;
+    const touched: Bucket[] = [];
+    for (const rule of this.rules) {
+      const key = rule.match(req);
+      if (key === null) continue; // the rule doesn't apply to this request
+      const b = this.buckets.get(`${rule.name}:${key}`) ?? { tokens: rule.burst, at: now };
+      b.tokens = Math.min(rule.burst, b.tokens + ((now - b.at) / 1000) * rule.perSecond);
+      b.at = now;
+      this.buckets.set(`${rule.name}:${key}`, b);
+      if (b.tokens < 1) retryAfter = Math.max(retryAfter, Math.ceil((1 - b.tokens) / rule.perSecond));
+      touched.push(b);
+    }
+    if (retryAfter > 0) return { allowed: false, retryAfter };
+    for (const b of touched) b.tokens -= 1; // spend only when every rule allows it
+    return { allowed: true, remaining: Math.min(...touched.map((b) => Math.floor(b.tokens))) };
+  }
+}
+```
+
+Tested with a key rule of 5 a second (bursts of 10) and a creation rule of 1 a second per IP (bursts of 3): 12
+requests at once gave 10 allowed and 2 rejected with `retryAfter: 1`; one second later the next request was allowed
+with 4 remaining. Twenty link creations at once from one IP gave 3 allowed and 17 rejected, and afterwards the
+key's own bucket still had 6 tokens: the 17 rejected requests hadn't spent any.
+
+<DeepDive title="When the limiter is slow or down">
+  <Option grade="bad" name="Wait for Redis, and reject if it fails">
+    A slow Redis now slows every API call, and an outage of the limiter becomes an outage of the API (<L id="08.01" />).
+  </Option>
+  <Option grade="good" name="A short timeout, then fail open">
+    Give the call a few milliseconds; if it fails, allow the request. Customers notice nothing, and the API's own
+    concurrency limits still protect it.
+  </Option>
+  <Option grade="great" name="Fail open to local limits, and keep hot keys local">
+    On failure, fall back to a local bucket per server at the limit divided by the number of servers: rough, but not
+    unlimited. The very busiest keys get a local pre-check too, so one huge customer doesn't make a hot key in Redis
+    (<L id="05.02" />).
+  </Option>
+</DeepDive>
+
+**Changing rules safely.** A new rule starts in **shadow mode**: the limiter evaluates it and logs what it would
+have rejected, without rejecting anything. Once the logs show it catches abuse and not good customers, it's switched
+to enforce. Rules are versioned, so a bad change is rolled back in seconds (<L id="14.05" />).
+
+## 6. Wrap-up
+
+What breaks first is usually the **hot key**: one large customer's bucket, checked 20,000 times a second, all on
+one Redis primary. After that, cost: if the counters dominate the bill, approximate local counting synced every
+second (<L id="14.04" />) removes most of the round trips for limits that tolerate a brief overshoot.
+
+<Levels
+  junior={[
+    "Picks an algorithm and explains it",
+    "Returns 429 with a Retry-After header",
+  ]}
+  mid={[
+    "Keeps counts in a shared store and makes the check atomic",
+    "Estimates memory and operations for the store",
+    "Chooses fail open, with a reason",
+  ]}
+  senior={[
+    "Handles several rules without spending on rejected requests",
+    "Ships rules through config with shadow mode and rollback",
+    "Spots the hot-key problem and the cost of a round trip per request",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Stripe"
+    system="API rate limiters"
+    year={2017}
+    href="https://stripe.com/blog/rate-limiters"
+    source="Scaling your API with rate limiters (Paul Tarjan)"
+    found="Token buckets in Redis, plus concurrency limits and load shedders; the request limiter rejects millions of requests a month."
+  >
+    Stripe runs four kinds of limiter in production: a request rate limiter (N requests per second per user), a
+    concurrent requests limiter, a fleet usage load shedder and a worker utilisation load shedder. It uses the token
+    bucket algorithm, implemented in Redis. The request rate limiter rejects millions of requests a month, while the
+    concurrent requests limiter triggered about 12,000 times in the month described.
+  </Seen>
+  <Seen
+    company="Cloudflare"
+    system="Sliding window rate limiting"
+    year={2017}
+    href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"
+    source="How we built rate limiting capable of scaling to millions of domains (Cloudflare Blog)"
+    found="Two counters per key approximate a sliding window; on 400 million real requests, 0.003% were wrongly allowed or limited."
+  >
+    Cloudflare estimates the request rate by weighting the previous window's count by how much of it overlaps the
+    current sliding window and adding the current count. It uses only two numbers per counter, and in an analysis of
+    400 million requests from 270,000 distinct sources, 0.003% of requests were wrongly allowed or rate limited.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip's gateway checks the per-key rule and then the per-route rule, taking a token from each as it goes. A customer complains that a burst of rejected link creations used up their quota for reads. Why?"
+  options={[
+    { text: "Token buckets can't handle two rules", why: "They can; the problem is the order of checking and spending." },
+    { text: "The key's token was spent before the route rule rejected the request; check all rules first and spend only if all allow", correct: true, why: "Rejected requests shouldn't consume quota. Doing the check and the spend in one atomic script fixes both the order and the race." },
+    { text: "The customer's limit is too low", why: "Raising it hides the bug; rejected requests would still eat quota." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Per-server counters for a global limit.** The real limit becomes the limit times the number of servers.</li>
+    <li>**Read-modify-write without atomicity.** Concurrent checks leak through; use one script.</li>
+    <li>**Failing closed by default.** A limiter outage shouldn't become an API outage.</li>
+    <li>**Enforcing new rules immediately.** Run them in shadow mode first.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>A distributed limiter is a library in the gateway, rules pushed from config, and counts in a sharded Redis tier.</li>
+    <li>Each check is one atomic script: refill, test every matching rule, spend only if all allow.</li>
+    <li>Respond with 429, Retry-After and quota headers.</li>
+    <li>Fail open with a short timeout, fall back to local limits, and keep hot keys local.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a distributed rate limiter for an API.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["Token bucket or sliding window?", "What happens if Redis goes down?", "How do you change limits without a deploy?"]}
+>
+  <p>Limits are rules matched on API key, IP or route, with values per plan. I'd use a token bucket, which allows bursts while capping the average, or a sliding window counter if bursts must be tight. The limiter runs as a library in the gateway with rules in memory, pushed from a config service, and state in a Redis cluster sharded by key: 6 million buckets is under a gigabyte, and 400,000 checks a second is a handful of primaries.</p>
+  <p>Each check is one atomic script that refills and tests every matching bucket and spends only if all allow, using Redis's clock. Rejections get 429 with Retry-After and remaining-quota headers. Calls have a timeout of a few milliseconds and fail open to coarse local limits, and the busiest keys get a local pre-check. New rules run in shadow mode before enforcing.</p>
+</InterviewCard>

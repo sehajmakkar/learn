@@ -1,0 +1,323 @@
+export const meta = {
+  summary: "A Dynamo-style distributed key-value store: a hash ring with virtual nodes, N replicas with tunable R and W, sloppy quorums and hinted handoff to stay writable through failures (tested), conflict handling, an LSM engine on each node, gossip and anti-entropy.",
+  uses: ["05.03", "08.04", "08.03", "08.05", "08.10", "09.03"],
+  usedIn: ["17.03"],
+};
+
+<BeforeYouStart>
+  This design assembles Module 08: consistent hashing (<L id="05.03" />), quorums (<L id="08.04" />), clocks and
+  version vectors (<L id="08.05" />) and gossip (<L id="08.10" />), on top of the LSM engine from <L id="09.03" />.
+</BeforeYouStart>
+
+## The prompt
+
+"Design a key-value store" tests whether you can put the distributed-systems building blocks together into one
+system, and explain what each costs. The classic reference is Amazon's Dynamo.
+
+<DesignIt
+  id="sd-15-04-key-value-store"
+  minutes={25}
+  levels={["senior"]}
+  patterns={["consistent hashing", "quorums", "replication", "conflict resolution"]}
+  rubric={[
+    "A partitioning scheme that moves little data when nodes join or leave",
+    "N replicas per key, with R and W and what R + W > N buys",
+    "A plan for writes when replicas are down (sloppy quorum, hinted handoff)",
+    "How conflicting versions are detected and resolved",
+    "A storage engine per node suited to the workload",
+    "Failure detection and repair: gossip, read repair, anti-entropy",
+    "An estimate of node count from data size and replication",
+  ]}
+>
+  Build a store with two operations, `get(key)` and `put(key, value)`, for values up to 1 MB. It holds 100 TB of data,
+  serves 1 million operations a second with p99 under 10 ms, and must always accept writes, even when some machines
+  or a network link fail. Different applications want different trade-offs between consistency and availability.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional:** `get` and `put` by key; deletes; per-application settings for consistency.
+
+**Non-functional:**
+
+- Always writable: a shopping cart that rejects "add to cart" loses sales.
+- p99 under 10 ms; 1 million operations a second.
+- Grows by adding machines, with no downtime and little data moved.
+- No single point of failure, and no single coordinator.
+
+**Out of scope:** range queries, secondary indexes, transactions across keys.
+
+## 2. Estimates
+
+- **Storage:** 100 TB × 3 replicas = 300 TB. At about 4 TB usable per node, kept under 70% full for compaction
+  and repair, that's about **100 nodes**.
+- **Load:** 1 million operations a second over 100 nodes is 10,000 per node; with three replicas involved in each,
+  about 30,000 replica operations per node. Each node is an ordinary server with <Term t="ssd">SSDs</Term>.
+
+## 3. API
+
+```text
+get(key)                    → { values: [value, …], context }    one value normally, several on conflict
+put(key, value, context?)   → ok                                 context: the version the writer read
+```
+
+The `context` carries version information (a version vector, <L id="08.05" />), so the store can tell an update
+that saw the previous value from one that didn't.
+
+## 4. High-level design
+
+<Arch
+  title="A Dynamo-style store"
+  nodes={[
+    { id: "client", label: "Client", kind: "client", x: 0, y: 1 },
+    { id: "coord", label: "Coordinator", kind: "service", sub: "any node", x: 1, y: 1 },
+    { id: "a", label: "Replica 1", kind: "db", sub: "LSM engine", x: 2, y: 0 },
+    { id: "b", label: "Replica 2", kind: "db", sub: "LSM engine", x: 2, y: 1 },
+    { id: "c", label: "Replica 3", kind: "db", sub: "LSM engine", x: 2, y: 2 },
+    { id: "d", label: "Stand-in", kind: "db", sub: "holds hints", x: 3, y: 1 },
+  ]}
+  edges={[
+    { from: "client", to: "coord" },
+    { from: "coord", to: "a" },
+    { from: "coord", to: "b" },
+    { from: "coord", to: "c" },
+    { from: "coord", to: "d", label: "if one is down", dashed: true },
+    { from: "a", to: "b", label: "gossip", dashed: true, both: true },
+  ]}
+  steps={[
+    { caption: "The client sends a put to any node, which acts as the coordinator. Every node knows the ring, learned by gossip.", edges: ["client>coord"] },
+    { caption: "The coordinator hashes the key and walks the ring clockwise to its preference list: the first N = 3 distinct physical nodes.", nodes: ["a", "b", "c"] },
+    { caption: "It sends the write to all three and answers the client once W = 2 have acknowledged. Each replica appends to its write-ahead log and memtable.", edges: ["coord>a", "coord>b", "coord>c"] },
+    { caption: "If a replica is down, the next healthy node on the ring takes the write with a hint naming the real owner, and hands it back when the owner returns.", edges: ["coord>d"] },
+    { caption: "Nodes gossip membership and health, and compare Merkle trees in the background to repair replicas that drifted.", edges: ["a>b"] },
+  ]}
+  caption="There's no leader: any node coordinates any request, and every key's replicas are found the same way, by walking the ring."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="Spreading keys across 100 nodes">
+  <Option grade="bad" name="hash(key) mod number of nodes">
+    Adding one node changes the result for almost every key: a 100 TB reshuffle.
+  </Option>
+  <Option grade="good" name="Consistent hashing">
+    Nodes sit on a ring; a key belongs to the next node clockwise. Adding a node moves only the keys between it and
+    its neighbour (<L id="05.03" />). But with one position per node, load is uneven, and a new node takes all its
+    keys from one neighbour.
+  </Option>
+  <Option grade="great" name="Consistent hashing with virtual nodes">
+    Each physical node takes many positions on the ring, so load evens out, and a joining node takes small pieces
+    from every other node. Bigger machines get more positions.
+  </Option>
+</DeepDive>
+
+<DeepDive title="Staying writable when replicas fail">
+  <Option grade="bad" name="One primary per key">
+    Simple and consistent, but when the primary is unreachable that key can't be written until a new one is
+    chosen.
+  </Option>
+  <Option grade="good" name="Strict quorums: W of the N owners">
+    With N = 3 and W = 2, one owner can be down. With R = 2 as well, R + W > N, so every read overlaps the latest
+    write (<L id="08.04" />). But with two owners down, writes fail.
+  </Option>
+  <Option grade="great" name="Sloppy quorums with hinted handoff">
+    Count acknowledgements from the first W **healthy** nodes on the ring, owners or not. A stand-in stores the write
+    with a hint and returns it to the owner when it recovers. Writes keep working through failures; the price is
+    that a read can briefly miss a write held by a stand-in.
+  </Option>
+</DeepDive>
+
+The core of it, with five nodes, 64 virtual nodes each, N = 3 and W = R = 2:
+
+```ts
+type Versioned = { value: string; version: number };
+const hash32 = (s: string) => createHash("md5").update(s).digest().readUInt32BE(0);
+
+export class KvCluster {
+  private ring: [number, string][] = []; // (position, physical node), sorted
+  data = new Map<string, Map<string, Versioned>>();
+  hints = new Map<string, { owner: string; key: string; v: Versioned }[]>();
+  down = new Set<string>();
+
+  constructor(nodes: string[], readonly n = 3, readonly w = 2, readonly r = 2, vnodes = 64) {
+    for (const node of nodes) {
+      this.data.set(node, new Map());
+      for (let i = 0; i < vnodes; i++) this.ring.push([hash32(`${node}#${i}`), node]);
+    }
+    this.ring.sort((a, b) => a[0] - b[0]);
+  }
+
+  /** Walk clockwise from the key, collecting distinct physical nodes. */
+  walk(key: string): string[] {
+    const h = hash32(key);
+    let i = this.ring.findIndex(([p]) => p >= h);
+    if (i < 0) i = 0;
+    const out: string[] = [];
+    for (let k = 0; out.length < this.data.size && k < this.ring.length; k++) {
+      const node = this.ring[(i + k) % this.ring.length][1];
+      if (!out.includes(node)) out.push(node);
+    }
+    return out;
+  }
+
+  put(key: string, value: string, version: number) {
+    const all = this.walk(key);
+    const spares = all.slice(this.n).filter((s) => !this.down.has(s));
+    let acks = 0;
+    for (const owner of all.slice(0, this.n)) {
+      const v = { value, version };
+      if (!this.down.has(owner)) {
+        this.store(owner, key, v);
+        acks++;
+      } else if (spares.length) {
+        const holder = spares.shift()!; // sloppy quorum: a healthy stand-in keeps it, with a hint
+        this.store(holder, key, v);
+        this.hints.set(holder, [...(this.hints.get(holder) ?? []), { owner, key, v }]);
+        acks++;
+      }
+    }
+    if (acks < this.w) throw new Error(`only ${acks} of ${this.w} writes acknowledged`);
+  }
+
+  get(key: string) {
+    const replies = this.walk(key).filter((node) => !this.down.has(node)).slice(0, this.n)
+      .map((node) => this.data.get(node)!.get(key));
+    if (replies.length < this.r) throw new Error("not enough replicas");
+    return replies.filter(Boolean).sort((a, b) => b!.version - a!.version)[0];
+  }
+
+  /** When a node comes back, every stand-in hands its hints over. */
+  recover(node: string) {
+    this.down.delete(node);
+    for (const [holder, list] of this.hints) {
+      this.hints.set(holder, list.filter((h) => (h.owner === node ? (this.store(node, h.key, h.v), false) : true)));
+    }
+  }
+
+  private store(node: string, key: string, v: Versioned) {
+    const cur = this.data.get(node)!.get(key);
+    if (!cur || cur.version < v.version) this.data.get(node)!.set(key, v);
+  }
+}
+```
+
+Tested: `user:42`'s preference list was three distinct nodes, B, E and A. With B down, the write of version 2
+succeeded, D held it with a hint, and a read returned version 2 while B itself still had version 1. When B
+recovered, the hint was handed over and B had version 2. With all three owners down, the write was still accepted by
+the two remaining nodes: availability, at the cost that the owners know nothing about it until they're back. Adding
+a sixth node moved 1,416 of 10,000 keys' primary owner (one sixth would be about 1,667), every one of them to the
+new node.
+
+<DeepDive title="Two writes to the same key at once">
+  <Option grade="bad" name="Last write wins by each server's clock">
+    Clocks drift (<L id="05.06" />): a write stamped by a fast clock silently beats a later one. Data is lost without
+    anyone noticing.
+  </Option>
+  <Option grade="good" name="Last write wins, chosen deliberately">
+    For data where losing a concurrent update is acceptable (a profile photo, a session), it's simple and needs no
+    help from the application. Say so explicitly.
+  </Option>
+  <Option grade="great" name="Version vectors, with merging">
+    Each value carries a version vector; the store can tell "B saw A" from "A and B happened concurrently"
+    (<L id="08.05" />). Concurrent versions are both kept and returned to the client, which merges them (a cart's
+    union) and writes the result back. Data types that merge automatically (CRDTs) remove the client step.
+  </Option>
+</DeepDive>
+
+**Each node's storage engine.** Writes dominate and must be fast, so each node runs an LSM engine: append to the
+write-ahead log, insert into the memtable, flush sorted files, compact in the background (<L id="09.03" />). A
+Bloom filter per file keeps reads for missing keys cheap (<L id="05.08" />). Deletes are tombstones, kept long
+enough to reach every replica, or a replica that missed the delete would bring the value back.
+
+**Failure detection and repair.** Nodes learn membership and health by gossip (<L id="08.10" />). Replicas drift
+when hints are lost; **read repair** fixes stale replicas noticed during reads, and **anti-entropy** compares Merkle
+trees between replicas in the background and sends only the ranges that differ.
+
+## 6. Wrap-up
+
+The knobs are the point. N, R and W per table let a cart choose (3, 2, 2) and a cache choose (3, 1, 1). What breaks
+next is usually operational: repair traffic after a long outage, compaction falling behind, and hot keys, which no
+ring spreads (<L id="05.02" />).
+
+<Levels
+  junior={[
+    "Partitions with consistent hashing and replicates each key",
+  ]}
+  mid={[
+    "Explains R + W > N and picks values",
+    "Adds virtual nodes and explains why",
+    "Chooses an LSM engine for a write-heavy store",
+  ]}
+  senior={[
+    "Uses sloppy quorums and hinted handoff, and states what they cost",
+    "Handles conflicts with version vectors, or chooses last-write-wins knowingly",
+    "Covers gossip, read repair, anti-entropy and tombstones",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Amazon"
+    system="Dynamo"
+    year={2007}
+    href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
+    source="Dynamo: Amazon's Highly Available Key-value Store (SOSP 2007)"
+    found="Tunable N, R and W, with (3, 2, 2) as the common choice, plus sloppy quorums and hinted handoff for availability."
+  >
+    Dynamo lets each instance tune N, R and W, noting that R + W > N gives a quorum-like system, and the paper gives
+    (3, 2, 2) as the common configuration used by several instances. To stay writable during failures it uses a sloppy
+    quorum with hinted handoff, and it tracks causality between versions of an object with vector clocks, returning
+    conflicting versions to the application to reconcile.
+  </Seen>
+  <Seen
+    company="Apache Cassandra"
+    system="Tunable consistency"
+    year="Docs"
+    href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html"
+    source="Dynamo (Apache Cassandra documentation)"
+    found="Dynamo's R + W > N, exposed as per-request consistency levels."
+  >
+    Cassandra describes its consistency levels as a version of Dynamo's R + W > N mechanism: ONE needs a single
+    replica, QUORUM a majority of replicas, and ALL every replica. Replicas converge through hinted handoff, read
+    repair, and anti-entropy repair, in which replicas compute Merkle trees over their data.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A store runs N = 3, W = 1, R = 1 to be as fast as possible. A client writes a key and immediately reads it back from a different coordinator. What can happen?"
+  options={[
+    { text: "It always sees its write", why: "With W = 1 the write may be on one replica; R = 1 may read a different one. R + W = 2 isn't more than N = 3." },
+    { text: "It can read the old value, because the read and write sets needn't overlap", correct: true, why: "That's the trade for speed. Raising R or W so that R + W > N makes them overlap, at the cost of latency." },
+    { text: "The read fails", why: "One replica answering is enough for R = 1; it may just be stale." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Modulo hashing.** Use a ring with virtual nodes so growth moves little data.</li>
+    <li>**Last-write-wins by wall clock, unstated.** Either choose it for data where losing updates is fine, or use version vectors.</li>
+    <li>**Forgetting deletes.** Tombstones must outlive the longest repair window, or deleted data comes back.</li>
+    <li>**No repair story.** Hints get lost; read repair and anti-entropy close the gaps.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Keys go on a hash ring with virtual nodes; the first N distinct nodes clockwise hold a key's replicas.</li>
+    <li>R and W are tunable; R + W > N makes reads overlap the latest write.</li>
+    <li>Sloppy quorums and hinted handoff keep writes available through failures, at some consistency cost.</li>
+    <li>Version vectors detect conflicts; LSM engines, gossip, read repair and anti-entropy keep each node fast and the replicas converging.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a distributed key-value store.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle a node that's down during a write?", "How are conflicting writes resolved?", "What does R + W > N give you?"]}
+>
+  <p>Keys are placed on a consistent hash ring with virtual nodes, and each key is replicated to the first N distinct physical nodes clockwise. Any node can coordinate a request; it sends writes to all N and returns after W acknowledge, and reads from R, so with N = 3 and R = W = 2 every read overlaps the latest write. Each node stores data in an LSM engine with a write-ahead log, which suits a write-heavy store.</p>
+  <p>To stay writable during failures, I'd use sloppy quorums: if an owner is down, the next healthy node takes the write with a hint and hands it back on recovery. Concurrent writes are detected with version vectors and both versions returned to the client to merge, or resolved by last-write-wins where losing an update is acceptable. Membership spreads by gossip, and read repair plus Merkle-tree anti-entropy fix replicas that drifted. At 100 TB with three replicas, that's about 100 nodes.</p>
+</InterviewCard>

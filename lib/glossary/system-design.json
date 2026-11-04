@@ -287,5 +287,19 @@
   "shuffle-sharding": {"term": "Shuffle sharding", "def": "Giving each tenant a random combination of a few resources out of many, so one tenant's problems rarely affect all of another's.", "lesson": "14.09", "match": ["\\bshuffle[- ]shard(ing|s)?\\b"]},
   "rbac": {"term": "RBAC", "def": "Role-based access control: permissions granted through roles such as admin, editor or viewer.", "lesson": "14.10", "match": ["\\bRBAC\\b"], "caseSensitive": true},
   "crypto-shredding": {"term": "Crypto-shredding", "def": "Encrypting each user's data with its own key and deleting the key to make every copy unreadable.", "lesson": "14.11", "match": ["\\bcrypto-shredding\\b", "\\bcryptographic erasure\\b"]},
-  "data-minimisation": {"term": "Data minimisation", "def": "Collecting and keeping only the personal data a purpose actually needs.", "lesson": "14.11", "match": ["\\bdata minimi[sz]ation\\b"]}
+  "data-minimisation": {"term": "Data minimisation", "def": "Collecting and keeping only the personal data a purpose actually needs.", "lesson": "14.11", "match": ["\\bdata minimi[sz]ation\\b"]},
+  "url-frontier": {"term": "URL frontier", "def": "A crawler's list of URLs still to fetch; it decides which page is fetched next, and when.", "lesson": "15.06", "match": ["\\bURL frontier\\b", "\\bfrontier\\b"]},
+  "politeness": {"term": "Politeness (crawling)", "def": "A crawler limiting itself per website: one request at a time, with a pause between requests.", "lesson": "15.06", "match": ["\\bpoliteness\\b"]},
+  "robots-txt": {"term": "robots.txt", "def": "A file at a website's root telling crawlers which paths they may fetch, standardised in RFC 9309.", "lesson": "15.06", "match": ["\\brobots\\.txt\\b"]},
+  "crawler-trap": {"term": "Crawler trap", "def": "A site structure that generates endless URLs, such as a calendar with a 'next month' link forever.", "lesson": "15.06", "match": ["\\bcrawler traps?\\b"]},
+  "conditional-request": {"term": "Conditional request", "def": "An HTTP request with If-None-Match or If-Modified-Since, answered 304 with no body if nothing changed.", "lesson": "15.06", "match": ["\\bconditional requests?\\b", "\\bconditional GETs?\\b"]},
+  "preference-list": {"term": "Preference list", "def": "The N distinct nodes found by walking the hash ring clockwise from a key; they hold its replicas.", "lesson": "15.04", "match": ["\\bpreference lists?\\b"]},
+  "worker-number": {"term": "Worker number", "def": "The part of a Snowflake ID naming the generator that made it; it must be unique among live generators.", "lesson": "15.05", "match": ["\\bworker numbers?\\b"]},
+  "shadow-mode": {"term": "Shadow mode", "def": "Running a new rule or system on real traffic and logging what it would do, without letting it act.", "lesson": "15.03", "match": ["\\bshadow mode\\b"]},
+  "sequence-number": {"term": "Sequence number", "def": "A number that goes up by one for each item in a stream, such as messages in a conversation, so order is clear and gaps or repeats show.", "lesson": "15.09", "match": ["\\bsequence numbers?\\b"]},
+  "hydration": {"term": "Hydration (data)", "def": "Turning a list of IDs into full objects by fetching them in one batch, usually from a cache.", "lesson": "15.08", "match": ["\\bhydrat(e|ed|es|ing|ion)\\b"]},
+  "prefix-table": {"term": "Prefix table", "def": "A precomputed map from each prefix to its top suggestions, so autocomplete is one lookup.", "lesson": "15.10", "match": ["\\bprefix tables?\\b"]},
+  "missed-run-policy": {"term": "Missed-run policy", "def": "What a scheduler does about runs missed while it was down: run once now, run every one, or skip.", "lesson": "15.11", "match": ["\\bmissed-run polic(y|ies)\\b", "\\bmissed runs?\\b"]},
+  "device-token": {"term": "Device token", "def": "The address a push service gives an app on one device; the app's servers send notifications to it.", "lesson": "15.07", "match": ["\\bdevice tokens?\\b"]},
+  "quiet-hours": {"term": "Quiet hours", "def": "A window, in the user's own time zone, when non-urgent notifications are held back.", "lesson": "15.07", "match": ["\\bquiet hours\\b"]}
 }

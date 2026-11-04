@@ -1,0 +1,302 @@
+export const meta = {
+  summary: "A crawler that fetches a billion pages a month without hammering anyone: a URL frontier with a queue per host (with a lab), robots.txt, URL normalisation (tested) and a seen-URL filter, splitting hosts across machines, and the traps that keep crawlers busy forever.",
+  uses: ["05.08", "03.01", "09.04", "13.04", "14.04", "07.02"],
+  usedIn: [],
+};
+
+<BeforeYouStart>
+  A crawler reuses Bloom filters (<L id="05.08" />), DNS (<L id="03.01" />), object storage (<L id="09.04" />) and
+  content fingerprints (<L id="13.04" />). Politeness is <Term t="rate-limit">rate limiting</Term> turned around: limiting yourself, per host
+  (<L id="14.04" />).
+</BeforeYouStart>
+
+## The prompt
+
+A crawler's core loop fits in five lines: take a URL, fetch it, store it, extract links, add the new ones. Every
+interesting part of the design is about what that loop does to other people's servers, and to itself, at a billion
+pages.
+
+<DesignIt
+  id="sd-15-06-web-crawler"
+  minutes={22}
+  levels={["mid", "senior"]}
+  patterns={["queues", "politeness", "deduplication", "partitioning"]}
+  rubric={[
+    "Estimates of fetch rate, bandwidth and storage",
+    "A frontier that enforces politeness per host without leaving threads idle",
+    "robots.txt fetched, cached and obeyed",
+    "URL normalisation and a seen-URL set, sized",
+    "Duplicate content detected by fingerprint",
+    "Work split across machines so each host is handled by one place",
+    "Defences against crawler traps, and a plan for recrawling",
+  ]}
+>
+  Design a crawler for a search engine. Starting from a list of seed URLs, it should fetch 1 billion HTML pages a
+  month, store them for an indexer, and keep finding new pages through links. It must be polite to every website,
+  never fetch the same page twice in one pass, and recrawl pages that change often.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional:** fetch pages from seeds outward; store each page and its metadata; extract and follow links;
+recrawl pages based on how often they change.
+
+**Non-functional:**
+
+- **Polite:** one request at a time per host, with a pause between requests, and obey robots.txt.
+- **Scalable:** 1 billion pages a month, more by adding machines.
+- **Robust:** slow servers, malformed HTML and infinite link structures can't stall it.
+- **Restartable:** a crashed node resumes without losing its frontier.
+
+## 2. Estimates
+
+| | Value | What it decides |
+| --- | --- | --- |
+| Fetch rate | 1 billion ÷ 2.6 million seconds ≈ **400 pages a second** | Asynchronous I/O, thousands of connections |
+| Bandwidth | 400 × 100 KB ≈ 40 MB/s, about **320 Mbit/s** | A handful of machines on a good network |
+| Storage | 100 TB a month before compression | Object storage, compressed |
+| Seen URLs | 10 billion over time | A Bloom filter at 1% is about **12 GB**; exact fingerprints, 80 GB, sharded |
+| Hosts in flight | With a 2 s pause per host, 400 pages a second needs **800+ hosts** active at once | The frontier must juggle many hosts |
+
+The last row is the one that shapes the design.
+
+## 3. High-level design
+
+<Arch
+  title="One crawler node"
+  nodes={[
+    { id: "front", label: "URL frontier", kind: "queue", sub: "priority + per-host queues", x: 0, y: 1 },
+    { id: "fetch", label: "Fetchers", kind: "worker", sub: "async, DNS + robots caches", x: 1, y: 1 },
+    { id: "web", label: "Websites", kind: "external", x: 1, y: 0 },
+    { id: "store", label: "Page store", kind: "store", sub: "object storage", x: 2, y: 0 },
+    { id: "parse", label: "Parser", kind: "worker", sub: "links + fingerprint", x: 2, y: 1 },
+    { id: "seen", label: "Seen filter", kind: "cache", sub: "URLs + content", x: 2, y: 2 },
+    { id: "index", label: "Indexer", kind: "service", x: 3, y: 0 },
+  ]}
+  edges={[
+    { from: "front", to: "fetch", label: "next polite URL" },
+    { from: "fetch", to: "web", both: true },
+    { from: "fetch", to: "parse" },
+    { from: "parse", to: "store" },
+    { from: "store", to: "index", dashed: true },
+    { from: "parse", to: "seen", label: "new?" },
+    { from: "seen", to: "front", label: "new URLs" },
+  ]}
+  steps={[
+    { caption: "A fetcher asks the frontier for the next URL whose host may be contacted now.", edges: ["front>fetch"] },
+    { caption: "It checks the host's cached robots.txt and its DNS cache, then fetches the page with a timeout and a size limit.", edges: ["fetch>web"] },
+    { caption: "The parser fingerprints the content (skipping exact duplicates), stores the page, and extracts links.", edges: ["fetch>parse", "parse>store"] },
+    { caption: "Each link is normalised and checked against the seen-URL filter; new ones go back into the frontier.", edges: ["parse>seen", "seen>front"] },
+    { caption: "The indexer reads stored pages on its own schedule, so a slow indexer never stops the crawl.", edges: ["store>index"] },
+  ]}
+  caption="Many such nodes run in parallel, each owning a share of the hosts."
+/>
+
+## 4. Deep dives
+
+<DeepDive title="The frontier: fast and polite">
+  <Option grade="bad" name="One first-in, first-out queue">
+    Pages link mostly to their own site, so the queue fills with runs of URLs from one host, and eight threads hit
+    that host at once.
+  </Option>
+  <Option grade="good" name="One queue, and a thread waits for its URL's host">
+    Polite, but a thread holding a URL for a busy host sits idle while thousands of other hosts could be fetched.
+  </Option>
+  <Option grade="great" name="A queue per host, and a heap of when each host may be contacted next">
+    Front queues order URLs by priority; back queues each hold one host's URLs. A free thread takes the host whose
+    "next allowed" time is earliest, fetches, and puts the host back with a new time. Threads stay busy on whichever
+    hosts are ready.
+  </Option>
+</DeepDive>
+
+## Try it
+
+<Lab
+  id="sd-15-06-crawler"
+  title="Three frontiers, same URLs"
+  tasks={[
+    "With 'One big site' and a 2 s delay, compare the first two rows. How many pages does politeness cost a single FIFO queue, and why?",
+    "Look at the third row. Where does the extra throughput come from, if the big site still gets the same number of requests?",
+    "Switch to 'Mostly one site'. Why are threads idle even with a queue per host?",
+    "Raise the delay to 5 s with 'Many small sites'. What limits the third row now?",
+  ]}
+>
+  <CrawlerLab />
+</Lab>
+
+With one big site (40% of URLs) and a 2-second pause, a single queue with no politeness fetched 594 pages in a
+minute, but 510 requests broke the rule, with up to 8 at once on one host. Making each thread wait for its host made
+it polite and cut it to **54 pages**, with threads idle 91% of the time. A queue per host fetched **360**, all
+polite: the big site got about the same number of requests either way (22 and 21); the difference is that the other threads kept working on
+the small sites. With 70% of URLs from one site, even per-host queues left threads idle 70% of the time: politeness
+caps each host, so throughput comes from crawling **many hosts at once**.
+
+**robots.txt.** Before fetching from a host, the crawler fetches `/robots.txt` and obeys it. RFC 9309 sets the
+rules: cache it for at most 24 hours; if it returns a 4xx, the crawler may fetch anything; if the server errors
+(5xx) or can't be reached, assume everything is disallowed; parse at least the first 500 KiB.
+
+<DeepDive title="Not fetching the same thing twice">
+  <Option grade="bad" name="Compare URLs as strings">
+    `HTTP://Shop.example:80/a#top` and `http://shop.example/a` are the same page; tracking parameters make millions
+    of URLs for each page.
+  </Option>
+  <Option grade="good" name="Normalise, then keep an exact set of seen URLs">
+    Correct, but 10 billion URLs is 80 GB of 8-byte fingerprints, which must be sharded or kept on disk.
+  </Option>
+  <Option grade="great" name="Normalise, check a Bloom filter, and fingerprint the content">
+    A Bloom filter (<L id="05.08" />) answers "definitely new" for most URLs in memory; a 1% false positive skips
+    a page that will be found again later. A hash of each page's content catches the same page under different URLs
+    (mirrors, session IDs), like content addressing in <L id="13.04" />.
+  </Option>
+</DeepDive>
+
+```ts
+const TRACKING = /^(utm_[a-z]+|fbclid|gclid)$/i;
+
+export function normalise(href: string, base?: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(href, base); // resolves relative links against the page
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null; // mailto:, javascript:, ...
+  u.hash = ""; // fragments never reach the server
+  u.hostname = u.hostname.toLowerCase().replace(/\.$/, "");
+  const params = [...u.searchParams].filter(([k]) => !TRACKING.test(k)).sort(([a], [b]) => a.localeCompare(b));
+  u.search = new URLSearchParams(params).toString();
+  if (u.pathname === "") u.pathname = "/";
+  return u.toString(); // URL already lowercases the scheme and drops default ports
+}
+```
+
+Tested: `https://Shop.Example:443/a/b/page.html?utm_source=x&b=2&a=1#reviews` became
+`https://shop.example/a/b/page.html?a=1&b=2`; `../c?id=7` on that page resolved to `https://shop.example/a/c?id=7`;
+`HTTP://shop.example:80` became `http://shop.example/`; `mailto:` and `javascript:` links were dropped; a `gclid`
+parameter was removed; and a trailing dot on the host was removed.
+
+<DeepDive title="Splitting the crawl across machines">
+  <Option grade="bad" name="Any node takes any URL">
+    Politeness then needs a shared, global "last contacted" per host: a hot coordination point for every fetch.
+  </Option>
+  <Option grade="good" name="A central frontier service">
+    One place to enforce politeness, but it becomes the bottleneck and a single point of failure.
+  </Option>
+  <Option grade="great" name="Partition by host: hash(host) picks the node">
+    Each node owns a share of hosts and runs its own frontier, robots cache and DNS cache. Links to hosts it doesn't
+    own are sent in batches to the owning node. Politeness stays local, and nodes are added by moving host ranges
+    (<L id="05.03" />).
+  </Option>
+</DeepDive>
+
+**Traps.** Calendars with a "next month" link forever, session IDs in URLs, and generated pages make infinite URL
+spaces. Cap URL length and path depth, cap pages per host per crawl, and lower the priority of hosts whose pages are
+mostly near-duplicates.
+
+**Freshness.** Recrawl by observed change rate: a news front page hourly, an old article monthly. Conditional requests
+(`If-Modified-Since`, `If-None-Match`) let unchanged pages answer 304 with no body.
+
+## 5. Wrap-up
+
+What breaks first is rarely the fetchers: it's **DNS** (each node needs its own caching resolver), the **seen-URL
+set** as it grows, and **complaints**, which is why politeness, a clear user agent and a contact page for site owners
+are part of the design.
+
+<Levels
+  junior={[
+    "Draws the fetch, parse, store, enqueue loop with a queue",
+    "Mentions robots.txt",
+  ]}
+  mid={[
+    "Designs per-host queues for politeness",
+    "Normalises URLs and sizes the seen-URL set",
+    "Stores pages in object storage, decoupled from indexing",
+  ]}
+  senior={[
+    "Partitions by host so politeness stays local",
+    "Handles traps, duplicates by content, DNS and recrawl policy",
+    "Knows throughput comes from parallelism across hosts, not per host",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Google"
+    system="The original crawler"
+    year={1998}
+    href="https://research.google/pubs/the-anatomy-of-a-large-scale-hypertextual-web-search-engine/"
+    source="The Anatomy of a Large-Scale Hypertextual Web Search Engine (Brin and Page, 1998)"
+    found="A few crawler processes with hundreds of connections each, and DNS as a major bottleneck."
+  >
+    A single URLserver sent lists of URLs to a few crawlers, each keeping about 300 connections open at once with
+    asynchronous I/O. At peak, four crawlers fetched over 100 pages a second, about 600 KB a second of data. DNS
+    lookup was a major performance stress, so each crawler kept its own DNS cache. The paper notes that a crawler
+    contacting more than half a million servers generates a fair amount of email and phone calls.
+  </Seen>
+  <Seen
+    company="Compaq"
+    system="Mercator"
+    year={2001}
+    href="https://www.cs.cornell.edu/courses/cs685/2002fa/mercator.pdf"
+    source="High-Performance Web Crawling (Najork and Heydon, Compaq SRC Research Report 173)"
+    found="Per-host back queues and a heap of next-contact times: polite and busy at once."
+  >
+    One thread per host at a time ("weak politeness") still drew complaints, because it allowed requests with no
+    pause. Mercator's frontier keeps per-host FIFO back queues and a heap ordered by when each host may next be
+    contacted, uses about three times as many back queues as threads, and waits ten times as long as the last download
+    took before contacting a host again. A December 2000 crawl processed 891 million URLs in 17 days; 35 million were
+    excluded by robots.txt.
+  </Seen>
+  <Seen
+    company="IETF"
+    system="RFC 9309, Robots Exclusion Protocol"
+    year={2022}
+    href="https://www.rfc-editor.org/rfc/rfc9309.html"
+    source="Robots Exclusion Protocol (RFC 9309)"
+    found="robots.txt became a standard in 2022, including how to cache it and what errors mean."
+  >
+    Crawlers should not use a cached robots.txt for more than 24 hours unless it's unreachable. If the file is
+    unavailable (a 4xx status), crawlers may access any resource; if it's unreachable because of server or network
+    errors (such as a 5xx), they must assume complete disallow. Crawlers should follow at least five redirects for it,
+    and the parsing limit must be at least 500 KiB.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A crawler node has 200 threads and one shared FIFO queue. To be polite, each thread waits until its URL's host may be contacted. Throughput is a fraction of what the network allows. What's the fix?"
+  options={[
+    { text: "Add more threads", why: "More threads mostly means more threads waiting on the same busy hosts." },
+    { text: "Per-host queues and a heap of next-contact times, so threads only take URLs whose host is ready", correct: true, why: "Waiting moves from threads to hosts: a busy host's URLs wait in its queue while threads fetch from other hosts." },
+    { text: "Drop the pause between requests", why: "That's impolite and gets the crawler blocked." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**One FIFO queue.** Runs of same-host URLs either overload a site or idle the threads.</li>
+    <li>**Treating a robots.txt error as permission.** A 5xx means assume everything is disallowed.</li>
+    <li>**No URL normalisation.** The same page gets crawled under hundreds of URLs.</li>
+    <li>**No trap defences.** Cap depth, URL length and pages per host.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Politeness caps each host, so throughput comes from fetching many hosts at once.</li>
+    <li>The frontier keeps a queue per host and a heap of when each may be contacted next.</li>
+    <li>Normalise URLs, filter seen ones with a Bloom filter, and fingerprint content to skip duplicates.</li>
+    <li>Partition hosts across nodes so each node enforces politeness alone; cache DNS and robots.txt per node.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a web crawler.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you stay polite to websites?", "How do you avoid crawling the same page twice?", "How do you distribute the crawl?"]}
+>
+  <p>At a billion pages a month that's about 400 pages a second, roughly 320 Mbit/s and 100 TB a month before compression, stored in object storage for the indexer. The core loop is: take a URL from the frontier, check robots.txt and DNS from caches, fetch with timeouts and size limits, store the page, extract and normalise links, and add unseen ones back to the frontier.</p>
+  <p>Politeness is the key constraint: one request per host at a time with a pause, so the frontier keeps a queue per host and a heap ordered by when each host may next be contacted, and threads always take a ready host. Seen URLs go through a Bloom filter and content is fingerprinted to skip duplicates. Hosts are partitioned across nodes by hash, so politeness, robots and DNS caches stay local, and URL caps on depth, length and pages per host defend against traps.</p>
+</InterviewCard>

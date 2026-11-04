@@ -36,7 +36,7 @@ creates 1,200 jobs, which spread across workers and can't overwhelm anything at 
 **Decide per recipient.** The most important step is often deciding **not** to send:
 
 - **Preferences**: has this person muted this creator, or turned off "new link" notifications?
-- **Quiet hours**: it's 03:00 where they are; hold it until morning, or move it to the digest.
+- **<Term t="quiet-hours">Quiet hours</Term>**: it's 03:00 where they are; hold it until morning, or move it to the digest.
 - **<Term t="rate-limit">Rate limits</Term>**: they follow 400 creators; ten posts in an hour should become one "10 new links from creators you
   follow", not ten buzzes.
 - **<Term t="deduplication">Deduplication</Term>**: a key per (user, event), so a retried batch never notifies anyone twice (<L id="07.03" />).
@@ -46,7 +46,7 @@ creates 1,200 jobs, which spread across workers and can't overwhelm anything at 
 - **In-app**: if the user's app is connected (<L id="12.01" />), push the update over their connection. Cheap and
   instant, and it can replace a phone notification entirely.
 - **Mobile push**: the app's servers send to Apple's and Google's push services, which deliver to the device. They
-  have their own rules and limits, so a channel worker paces sends, retries with backoff, and removes device tokens the
+  have their own rules and limits, so a channel worker paces sends, retries with backoff, and removes <Term t="device-token">device tokens</Term> the
   service reports as invalid.
 - **Email**: batch into digests; individual emails for each event are rarely welcome.
 

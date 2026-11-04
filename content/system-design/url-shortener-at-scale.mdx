@@ -1,0 +1,312 @@
+export const meta = {
+  summary: "Snip at a hundred times the traffic: 100,000 redirects a second from every continent, 30 TB of links and 8.6 billion clicks a day. Where each part of the course lands: logical shards, a cache tier and the CDN for redirects, a streaming click pipeline, hot links, and a second region.",
+  uses: ["15.01", "05.01", "05.02", "06.06", "06.07", "11.01", "14.08", "14.06"],
+  usedIn: [],
+};
+
+<BeforeYouStart>
+  Do <L id="15.01" /> first. This lesson pulls together sharding (<L id="05.01" />), the cache tier
+  (<L id="06.06" />), redirects at the edge (<L id="06.07" />), click counting (<L id="11.01" />) and a second region
+  (<L id="14.08" />). Each deep dive links back to where the idea was taught.
+</BeforeYouStart>
+
+## The prompt
+
+The follow-up interviewers ask once the one-machine answer is on the board: "Now make it a hundred times bigger,
+and global." The point isn't a new design, it's knowing **which part breaks first** and changing only that.
+
+<DesignIt
+  id="sd-15-02-url-shortener-at-scale"
+  minutes={25}
+  levels={["mid", "senior"]}
+  patterns={["sharding", "caching", "CDN", "stream processing", "multi-region"]}
+  rubric={[
+    "Estimates that show what no longer fits: redirect rate, storage, click volume",
+    "A shard key that keeps the redirect on one shard, and an answer for the owner's dashboard",
+    "Layers of caching for redirects (CDN, cache tier, in-process), with how edits and blocks reach them",
+    "A plan for one link getting a huge burst of traffic",
+    "Clicks counted through a stream, not the redirect path, with raw events kept",
+    "A second region, and what's lost if the first one fails",
+    "Abuse at scale: phishing links and bots",
+  ]}
+>
+  Snip now creates 1 billion links a month, with 100 redirects per link, and half of all clicks come from Asia and
+  Australia. Owners want per-link charts of clicks by minute, country and referrer, at most a few minutes behind.
+  Redirects stay under 50 ms at the server for 99% of requests and available 99.99% of the time.
+</DesignIt>
+
+## 1. Requirements
+
+The functional list is the same as <L id="15.01" />, plus per-link analytics by minute, country and referrer. The
+non-functional list changes:
+
+- Redirects under 50 ms at the server for 99% of requests, **from every continent**, available 99.99%.
+- Links never lost; creating a link can take a few hundred milliseconds.
+- Analytics at most a few minutes behind; exact totals per day, approximate unique visitors are fine.
+- An edited or blocked link stops redirecting within about a minute everywhere.
+
+## 2. Estimates
+
+| | Value | What it decides |
+| --- | --- | --- |
+| Writes | 1 billion a month ≈ 400 a second, about 1,200 at peak | Fine for a few databases; the problem is storage |
+| Redirects | 100 × writes ≈ 40,000 a second, about **120,000 at peak** | Caches must answer almost all of them |
+| Storage | 1 billion × 500 bytes = 0.5 TB a month, **30 TB** over five years | No longer one database: shard |
+| Clicks | 100,000 a second ≈ **8.6 billion a day** | A stream with pre-aggregation, not a row per click |
+| Codes | 60 billion links over five years | 7 characters collide 1.7% of the time; use **8** (<L id="05.05" />) |
+
+## 3. Entities and API
+
+The <Term t="api">API</Term> doesn't change: the clients from <L id="15.01" /> keep working. The data gains a second home for the
+dashboard and the click pipeline:
+
+```text
+links           { code, long_url, owner_id, created_at, expires_at? }   sharded by hash(code)
+links_by_owner  { owner_id, created_at, code }                          sharded by owner_id
+clicks (stream) { code, at, country, referrer, ua }                     partitioned by code
+clicks_minute   { code, minute, clicks, by_country, by_referrer, visitors_hll }
+```
+
+## 4. High-level design
+
+<Arch
+  title="Snip at 100,000 redirects a second"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+    { id: "cdn", label: "CDN", kind: "cdn", sub: "s-maxage 60 s", x: 1, y: 1 },
+    { id: "lb", label: "Load balancer", kind: "lb", x: 2, y: 1 },
+    { id: "app", label: "Snip app", kind: "service", sub: "many, + L1 cache", x: 3, y: 1 },
+    { id: "cache", label: "Redis tier", kind: "cache", sub: "12 primaries", x: 4, y: 0 },
+    { id: "shards", label: "Link shards", kind: "db", sub: "256 logical", x: 4, y: 1 },
+    { id: "logs", label: "Edge logs", kind: "store", sub: "every few min", x: 1, y: 2 },
+    { id: "topic", label: "Clicks topic", kind: "queue", sub: "by code", x: 3, y: 2 },
+    { id: "agg", label: "Aggregator", kind: "worker", sub: "per-minute rollups", x: 4, y: 2 },
+    { id: "olap", label: "Analytics DB", kind: "db", sub: "+ raw archive", x: 5, y: 2 },
+  ]}
+  edges={[
+    { from: "user", to: "cdn" },
+    { from: "cdn", to: "lb", label: "miss" },
+    { from: "lb", to: "app" },
+    { from: "app", to: "cache", label: "1st" },
+    { from: "app", to: "shards", label: "on miss" },
+    { from: "app", to: "topic", label: "clicks", dashed: true },
+    { from: "cdn", to: "logs", dashed: true },
+    { from: "logs", to: "topic", dashed: true },
+    { from: "topic", to: "agg" },
+    { from: "agg", to: "olap" },
+  ]}
+  steps={[
+    { caption: "A redirect reaches the nearest CDN edge. Popular links are cached there for 60 seconds, so most redirects end here, near the user.", edges: ["user>cdn"] },
+    { caption: "On an edge miss, the request goes to the nearest Snip region. The app checks its small in-process cache, then the Redis tier.", edges: ["cdn>lb", "lb>app", "app>cache"] },
+    { caption: "On a cache miss, the app hashes the code to one of 256 logical shards, finds its database in a small routing table, and reads the row by primary key.", edges: ["app>shards"] },
+    { caption: "Clicks the origin answers are pre-aggregated per second in each app and published to a clicks topic partitioned by code.", edges: ["app>topic"] },
+    { caption: "Clicks answered at the edge arrive later, from the CDN's request logs, and join the same topic.", edges: ["cdn>logs", "logs>topic"] },
+    { caption: "Aggregators turn the stream into per-minute rollups, with HyperLogLog sketches for unique visitors, and archive the raw events to object storage.", edges: ["topic>agg", "agg>olap"] },
+  ]}
+  caption="The redirect path is a stack of caches in front of sharded Postgres; the click path is a separate stream that can lag without touching redirects."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="Storing 30 TB of links">
+  <Option grade="bad" name="One bigger database">
+    Vertical scaling buys time (<L id="02.02" />), but a 30 TB primary means restores that take many hours and one
+    machine whose failure is everyone's outage.
+  </Option>
+  <Option grade="good" name="Shard by hash of code, one shard per database">
+    Every redirect touches exactly one shard. But growing from 8 databases to 16 means rehashing and moving most
+    links (<L id="05.03" />).
+  </Option>
+  <Option grade="great" name="256 logical shards by hash of code, mapped to fewer databases">
+    The code is hashed to one of 256 logical shards forever; a small table maps logical shards to physical databases.
+    Growing means moving whole logical shards with replication and a short cutover (<L id="05.04" />), and nothing
+    rehashes. The dashboard's "my links" reads a `links_by_owner` copy sharded by owner (<L id="05.01" />).
+  </Option>
+</DeepDive>
+
+```ts
+import { createHash } from "node:crypto";
+
+export const LOGICAL_SHARDS = 256;
+
+/** Which logical shard owns a code. Never change this: it would move every link. */
+export function logicalShard(code: string) {
+  return createHash("md5").update(code).digest().readUInt32BE(0) % LOGICAL_SHARDS;
+}
+
+/** Logical shards map to physical databases through a small table you can change. */
+export const physicalFor = (code: string, map: string[]) => map[logicalShard(code)];
+```
+
+Tested with a million random codes: every logical shard received between 3,690 and 4,066 of them (the mean is about
+3,906). With 8 databases holding 32 logical shards each, moving one logical shard to a ninth database changed where
+its codes were read from, and nothing else: each code's logical shard stayed the same.
+
+<DeepDive title="Answering 120,000 redirects a second">
+  <Option grade="bad" name="Every redirect to the database">
+    120,000 reads a second spread over shards is possible, but every one pays a cross-ocean round trip for half the
+    users, and every cache miss storm lands on Postgres.
+  </Option>
+  <Option grade="good" name="A Redis tier in each region">
+    Cache-aside (<L id="06.02" />) with 12 primaries and replicas (<L id="06.06" />) answers most reads in about a
+    millisecond. But users in Sydney still cross the Pacific to reach it.
+  </Option>
+  <Option grade="great" name="The CDN first, then an in-process cache, then Redis">
+    Redirects for popular links are cached at the edge for 60 seconds with `s-maxage`, and kept out of browsers with a
+    short `max-age`, so Snip can still purge them. Edits and blocks purge by a surrogate key per link
+    (<L id="06.07" />); the 60-second lifetime caps staleness if a purge is missed.
+  </Option>
+</DeepDive>
+
+<DeepDive title="One link, forty million followers">
+  <Option grade="bad" name="Nothing special">
+    A celebrity posts a link; 50,000 redirects a second hit one code, one Redis slot and, on a miss, one shard
+    (<L id="05.02" />).
+  </Option>
+  <Option grade="good" name="Rely on the CDN">
+    The edge absorbs most of it. But each edge location and each cache expiry still sends a burst of misses.
+  </Option>
+  <Option grade="great" name="Edge caching, request collapsing and a local copy of hot keys">
+    The CDN collapses concurrent misses for the same key into one origin request; app servers keep the very hottest
+    codes in process; and the Redis client coalesces identical in-flight reads (<L id="06.05" />). Clicks for the
+    code are pre-aggregated before they reach the topic, so one hot link doesn't make one hot partition.
+  </Option>
+</DeepDive>
+
+<DeepDive title="Counting 8.6 billion clicks a day">
+  <Option grade="bad" name="Increment a counter per click in the links table">
+    100,000 writes a second, concentrated on popular rows: the click path would become the busiest part of the
+    database.
+  </Option>
+  <Option grade="good" name="Publish every click to a topic, count in consumers">
+    Off the redirect path, replayable and partitioned by code (<L id="07.04" />). But each click is a message, and a
+    viral link's partition falls behind.
+  </Option>
+  <Option grade="great" name="Pre-aggregate, stream, roll up, and keep the raw events">
+    Apps sum clicks per code per second before publishing; consumers write per-minute rollups idempotently
+    (<L id="07.03" />), with HyperLogLog sketches for unique visitors (<L id="11.03" />); raw events go to object
+    storage for 13 months, so a counting bug can be fixed by replaying them (<L id="11.06" />).
+  </Option>
+</DeepDive>
+
+**A second region.** Redirects are served active-active from Virginia and Frankfurt, each with its own cache and
+read replicas. Link creation stays in Virginia, with Frankfurt as a warm standby (<L id="14.08" />): if Virginia
+fails, about a second of new links may be lost, and redirects keep working throughout.
+
+**Abuse.** At this size Snip is a target for phishing. Destinations are checked against blocklists at creation and
+re-checked in the background, new accounts get low rate limits, and a block purges the link from every cache
+(<L id="14.10" />).
+
+## 6. Wrap-up
+
+<Arch
+  title="Snip at scale: the final picture"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+    { id: "cdn", label: "CDN", kind: "cdn", x: 1, y: 1 },
+    { id: "us", label: "Virginia", kind: "service", sub: "reads + writes", x: 2, y: 0 },
+    { id: "eu", label: "Frankfurt", kind: "service", sub: "reads, warm standby", x: 2, y: 2 },
+    { id: "usdb", label: "Shards", kind: "db", sub: "primaries", x: 3, y: 0 },
+    { id: "eudb", label: "Shards", kind: "db", sub: "replicas", x: 3, y: 2 },
+    { id: "stream", label: "Click pipeline", kind: "queue", x: 3, y: 1 },
+  ]}
+  edges={[
+    { from: "user", to: "cdn" },
+    { from: "cdn", to: "us" },
+    { from: "cdn", to: "eu" },
+    { from: "us", to: "usdb" },
+    { from: "eu", to: "eudb" },
+    { from: "usdb", to: "eudb", label: "async", dashed: true },
+    { from: "us", to: "stream", dashed: true },
+    { from: "eu", to: "stream", dashed: true },
+  ]}
+  groups={[{ label: "Region 1", nodes: ["us", "usdb"] }, { label: "Region 2", nodes: ["eu", "eudb"] }]}
+/>
+
+What breaks next: the analytics database as owners ask for longer ranges and more dimensions (<L id="11.06" />),
+and the cost of the edge logs. And the first thing to say if asked: everything above is an answer to an estimate.
+At 15.01's scale, none of it would be justified.
+
+<Levels
+  junior={[
+    "Adds caching and read replicas",
+    "Knows that the database must be split at this size",
+  ]}
+  mid={[
+    "Shards by code and handles the owner's dashboard with a second copy",
+    "Layers caches and explains how edits and blocks reach them",
+    "Moves click counting to a stream with batching",
+  ]}
+  senior={[
+    "Uses logical shards so growth never rehashes",
+    "Handles a hot link with edge caching, collapsing and pre-aggregation",
+    "Chooses what's active-active and what's a standby, and states the data loss",
+    "Raises abuse and the cost of the pipeline unprompted",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Notion"
+    system="Sharding Postgres"
+    year={2021}
+    href="https://www.notion.com/blog/sharding-postgres-at-notion"
+    source="Herding elephants: lessons learned from sharding Postgres at Notion"
+    found="Many logical shards on fewer machines, with a count chosen to divide evenly as the fleet grows."
+  >
+    Notion sharded its single Postgres by workspace ID into 480 logical shards, 15 per machine on 32 machines,
+    choosing 480 because it divides evenly into many machine counts. The move used double writes, a three-day
+    backfill and dark reads comparing both databases, then a few minutes of scheduled downtime.
+  </Seen>
+  <Seen
+    company="Discord"
+    system="Message storage"
+    year={2023}
+    href="https://discord.com/blog/how-discord-stores-trillions-of-messages"
+    source="How Discord stores trillions of messages"
+    found="One busy key could slow the whole cluster; routing a key's requests to one service and coalescing them was part of the fix."
+  >
+    Heavy reads on one busy channel created hot partitions whose latency spread across Discord's database cluster.
+    Discord added data services that coalesce identical requests, querying once for many readers, and routed requests
+    by channel ID with consistent hashing so all requests for a channel reach the same instance.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip shards links into 16 databases by hash(code) % 16. It needs 24. What happens, and what should it have done?"
+  options={[
+    { text: "Only a third of links move, since 8 databases are new", why: "With modulo, changing 16 to 24 changes the result for most codes, so most links move." },
+    { text: "Most links change database; it should hash into many fixed logical shards mapped to databases by a table", correct: true, why: "With 256 logical shards, growing means reassigning some logical shards to new machines; every code's logical shard stays the same." },
+    { text: "Nothing: Postgres rebalances shards automatically", why: "Plain Postgres has no idea it's one of 16 shards; the application does the routing." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Redesigning everything.** Change what the estimates say breaks: storage, read volume, clicks.</li>
+    <li>**Sharding by owner.** It makes the hottest query, the redirect, need to find the owner first.</li>
+    <li>**Caching without a purge path.** Blocked phishing links must stop working everywhere quickly.</li>
+    <li>**A click pipeline without raw events.** Keep them, so mistakes in counting can be fixed.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>At 100×, storage (30 TB), redirects (120,000 a second at peak) and clicks (8.6 billion a day) no longer fit one machine.</li>
+    <li>Links live in 256 logical shards by hash of code; the dashboard reads a copy sharded by owner.</li>
+    <li>Redirects are answered by the CDN, an in-process cache and Redis, with purges for edits and blocks.</li>
+    <li>Clicks flow through a stream with pre-aggregation and rollups, while raw events are archived for replay.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "How would you scale a URL shortener to 100,000 redirects a second worldwide?", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle a single viral link?", "How do you count clicks at that rate?", "What happens if a region fails?"]}
+>
+  <p>Start with what breaks: 30 TB of links needs sharding, 120,000 redirects a second at peak need caching close to users, and 8.6 billion clicks a day need a stream. I'd shard by hash of code into 256 logical shards mapped to physical Postgres databases, so redirects hit one shard and growth moves whole logical shards; owners' link lists come from a copy sharded by owner.</p>
+  <p>Redirects go through the CDN with a 60-second shared-cache lifetime and purge by tag, then an in-process cache, then Redis, then the shard. A viral link is handled by edge caching, request collapsing and pre-aggregated clicks. Clicks are summed per second in the app, published to a topic partitioned by code, rolled up per minute with HyperLogLog for uniques, and archived raw. Reads run in two regions; writes go to one, with a warm standby that loses about a second of new links if the primary region fails.</p>
+</InterviewCard>

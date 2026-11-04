@@ -1,0 +1,245 @@
+export const meta = {
+  summary: "Suggestions on every keystroke for millions of users: a pipeline from search logs to a precomputed prefix table (tested, with weekly decay), serving it from memory and the CDN, a trending layer for what's spiking now, and the filtering that keeps suggestions safe.",
+  uses: ["10.06", "11.04", "11.02", "06.07", "11.06", "14.11"],
+  usedIn: [],
+};
+
+<BeforeYouStart>
+  <L id="10.06" /> built a trie with the top completions stored at each node, and the client-side tricks. This
+  lesson is the system at scale: where the counts come from, how the table is rebuilt, and how it stays fresh
+  (<L id="11.04" />).
+</BeforeYouStart>
+
+## The prompt
+
+"Design search autocomplete" (Google's search box, a shop's search bar) is mostly a **data pipeline** question. The
+serving path is a lookup; the real design is how suggestions are counted, ranked, filtered and shipped to the
+servers that answer.
+
+<DesignIt
+  id="sd-15-10-search-autocomplete"
+  minutes={20}
+  levels={["mid", "senior"]}
+  patterns={["precomputation", "caching", "stream processing"]}
+  rubric={[
+    "A latency budget per keystroke, and the request rate including keystrokes",
+    "Suggestions precomputed per prefix, not computed at query time",
+    "A pipeline from search logs to the prefix table, rebuilt on a schedule",
+    "Old popularity fading, and a way to surface what's trending now",
+    "Serving from memory, with caching in the browser and at the CDN",
+    "Filtering: offensive suggestions, and queries too rare to show",
+    "Client behaviour: debounce, cancel stale requests",
+  ]}
+>
+  Snip Bio's search box suggests searches as people type: after `su`, show the five most popular searches starting
+  with "su". There are 10 million daily users, each searching about 5 times a day. Suggestions must appear within
+  about 100 ms of a keystroke, and a search that spikes (a creator going viral) should start appearing within minutes.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional:** return the top 5 suggestions for a prefix, ranked by popularity; reflect trending searches within
+minutes; never suggest offensive or private queries.
+
+**Non-functional:** under 100 ms end to end, so a few milliseconds at the server; very high availability (a broken
+autocomplete is noticed immediately, though search still works without it).
+
+## 2. Estimates
+
+- **Requests:** 10 million × 5 searches × about 6 requests per search after debouncing ≈ 300 million a day, about
+  3,500 a second and **15,000 at peak**. Several times the search traffic itself.
+- **Table size:** suppose 10 million distinct queries clear the popularity threshold. Prefixes up to 10 characters,
+  heavily shared, come to perhaps 50 million; × 5 suggestions × about 30 bytes ≈ **7.5 GB**. That fits in memory on
+  each serving node.
+- **Logs:** 50 million searches a day is a few GB a day: an ordinary batch job.
+
+## 3. Entities and API
+
+```text
+SearchLog    { query, user_id_hash, at, country }               raw, kept 30 days (14.11)
+QueryScore   { query, score }                                    rebuilt weekly with decay
+PrefixTable  { prefix → [(query, score)] × 5 }                   versioned snapshot
+
+GET /suggest?q=su&locale=en-GB        →  200 ["summer sale", "summer shoes", ...]   Cache-Control: max-age=300
+```
+
+## 4. High-level design
+
+<Arch
+  title="Autocomplete: the pipeline and the serving path"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 0 },
+    { id: "cdn", label: "CDN", kind: "cdn", sub: "short prefixes", x: 1, y: 0 },
+    { id: "suggest", label: "Suggest servers", kind: "service", sub: "table in memory", x: 2, y: 0 },
+    { id: "trend", label: "Trending layer", kind: "cache", sub: "last hour, top-k", x: 3, y: 0 },
+    { id: "logs", label: "Search logs", kind: "queue", x: 0, y: 2 },
+    { id: "batch", label: "Weekly build", kind: "worker", sub: "count, decay, filter", x: 1, y: 2 },
+    { id: "snap", label: "Table snapshots", kind: "store", sub: "versioned", x: 2, y: 2 },
+    { id: "stream", label: "Stream job", kind: "worker", sub: "count-min sketch", x: 3, y: 2 },
+  ]}
+  edges={[
+    { from: "user", to: "cdn" },
+    { from: "cdn", to: "suggest", label: "miss" },
+    { from: "suggest", to: "trend", label: "merge" },
+    { from: "logs", to: "batch" },
+    { from: "batch", to: "snap" },
+    { from: "snap", to: "suggest", label: "load", dashed: true },
+    { from: "logs", to: "stream" },
+    { from: "stream", to: "trend" },
+  ]}
+  steps={[
+    { caption: "The browser debounces keystrokes and asks for /suggest?q=su. Short, popular prefixes are answered by the CDN, cached for a few minutes.", edges: ["user>cdn"] },
+    { caption: "Misses reach a suggest server, which holds the whole prefix table in memory: one hash lookup.", edges: ["cdn>suggest"] },
+    { caption: "It merges in anything from the trending layer for that prefix, so a search that spiked this hour can appear.", edges: ["suggest>trend"] },
+    { caption: "Every search is logged. A weekly batch job counts queries, blends them with last week's decayed scores, filters them, and builds a new prefix table.", edges: ["logs>batch", "batch>snap"] },
+    { caption: "Suggest servers load the new snapshot alongside the old one and switch over at once; a bad snapshot is rolled back by loading the previous version.", edges: ["snap>suggest"] },
+    { caption: "A streaming job keeps approximate counts for the last hour with a count-min sketch and publishes the heavy hitters per prefix (11.04).", edges: ["logs>stream", "stream>trend"] },
+  ]}
+  caption="The slow path decides what's popular; the fast path is a lookup. The trending layer bridges the gap between weekly builds."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="Answering a prefix in a few milliseconds">
+  <Option grade="bad" name="Query the search logs at request time">
+    `WHERE query LIKE 'su%' GROUP BY query ORDER BY count(*) DESC` scans millions of rows per keystroke.
+  </Option>
+  <Option grade="good" name="A trie with the top completions at each node">
+    The lookup walks the prefix and returns the stored list (<L id="10.06" />). Fast, but updating weights in place
+    is awkward, and the structure lives in one process's memory.
+  </Option>
+  <Option grade="great" name="A precomputed prefix table, built offline and served from memory">
+    The build job writes prefix → top 5 directly, so serving is a hash lookup; every server holds a full copy (7.5 GB)
+    and any can answer. If the table outgrows memory, shard it by hash of prefix, not by first letter, since "s"
+    holds far more than "x".
+  </Option>
+</DeepDive>
+
+```ts
+export function buildPrefixTable(counts: Map<string, number>, k = 5, maxPrefix = 10) {
+  const table = new Map<string, [string, number][]>();
+  for (const [query, n] of counts) {
+    for (let len = 1; len <= Math.min(query.length, maxPrefix); len++) {
+      const prefix = query.slice(0, len);
+      const top = table.get(prefix) ?? [];
+      top.push([query, n]);
+      top.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+      if (top.length > k) top.pop();
+      table.set(prefix, top);
+    }
+  }
+  return table; // written to a snapshot: prefix -> top k
+}
+
+/** Blend this week into the running score so old spikes fade: halve the past every week. */
+export function decay(previous: Map<string, number>, thisWeek: Map<string, number>, keep = 0.5) {
+  const out = new Map<string, number>();
+  for (const [q, n] of previous) out.set(q, n * keep);
+  for (const [q, n] of thisWeek) out.set(q, (out.get(q) ?? 0) + n);
+  return out;
+}
+```
+
+<DeepDive title="Keeping suggestions fresh">
+  <Option grade="bad" name="All-time counts">
+    Last February's spike for "super bowl" stays at the top of `su` all year.
+  </Option>
+  <Option grade="good" name="Weekly rebuilds with decay">
+    Each week's counts are added to half of the previous score, so a spike fades within weeks.
+  </Option>
+  <Option grade="great" name="Decayed weekly table, plus a trending layer">
+    The weekly table gives stable ranking; a streaming top-k over the last hour (<L id="11.04" />), in event-time
+    windows (<L id="11.02" />), adds what's spiking now. The suggest server merges the two per prefix.
+  </Option>
+</DeepDive>
+
+Tested with six queries over three weeks, k = 3. In week 1, `su` suggested "super bowl" (2,000), "summer sale" and
+"summer shoes". In week 2, "super bowl" fell to 30 searches; its decayed score of 1,030 dropped it below "summer sale"
+(1,400). By week 3, "sun cream", rising from 120 to 500 searches a week, had overtaken it as well: `su` showed
+"summer sale", "sun cream", "summer shoes". The six queries produced 42 prefix entries.
+
+**Filtering.** Before a query enters the table: drop anything on a blocklist (offensive, defamatory, or names a
+creator has asked to remove), and drop queries searched by fewer than, say, 50 distinct users, so nothing someone
+typed privately (a phone number, a name) is ever suggested to others. These are rules in the build, run before
+anything is served.
+
+**The client.** Debounce about 100 ms, cancel requests for stale prefixes, cache by prefix in the browser, and filter
+already-fetched suggestions locally as the user keeps typing (<L id="10.06" />). With a few minutes of caching at the
+CDN, most one- and two-letter prefixes never reach the servers.
+
+## 6. Wrap-up
+
+What breaks first: **build time and memory** as distinct queries grow, handled by the popularity threshold and by
+limiting prefixes to 10 characters; then **regional differences**, handled by building one table per locale.
+
+<Levels
+  junior={[
+    "Uses a trie or a prefix index",
+    "Debounces on the client",
+  ]}
+  mid={[
+    "Precomputes top-k per prefix from logs, offline",
+    "Caches short prefixes at the CDN",
+    "Decays old popularity",
+  ]}
+  senior={[
+    "Ships versioned snapshots with atomic switch and rollback",
+    "Adds a streaming trending layer and merges it",
+    "Filters offensive and privacy-revealing queries with thresholds",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Elastic"
+    system="Completion suggester"
+    year="Docs"
+    href="https://www.elastic.co/docs/reference/elasticsearch/rest-apis/search-suggesters"
+    source="Suggester examples: completion suggester (Elasticsearch documentation)"
+    found="Autocomplete from in-memory structures built for prefix lookups: optimised for speed, costly to build."
+  >
+    The completion suggester provides autocomplete and search-as-you-type. It uses data structures that allow fast
+    lookups but are costly to build and are stored in memory, so it's optimised for speed; the completion index is
+    entirely held in the heap. New suggestions become visible after a refresh, and the documentation recommends
+    indexing completions into a single-shard index.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip Bio's suggestions come from all-time search counts. Months after a one-day spike, a joke query is still the first suggestion for its prefix. What's the best fix?"
+  options={[
+    { text: "Delete the query from the logs", why: "That fixes one query, by hand; the next spike does the same." },
+    { text: "Score queries with decay, so each week's past weight is halved, and add a short-window trending layer for new spikes", correct: true, why: "Decay lets old spikes fade on their own; the trending layer keeps new ones visible quickly." },
+    { text: "Rebuild the table every hour from all-time counts", why: "More frequent rebuilds of the same all-time counts give the same answer." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Computing suggestions at request time.** Precompute top-k per prefix.</li>
+    <li>**Sharding by first letter.** Prefixes are wildly uneven; hash them.</li>
+    <li>**No popularity threshold.** Rare queries can reveal what someone typed privately.</li>
+    <li>**Replacing the table in place.** Load a new version beside the old one, switch, and keep rollback.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Autocomplete is a pipeline: logs → decayed scores → filtered → prefix table → servers.</li>
+    <li>Serving is a hash lookup in memory, behind browser and CDN caches.</li>
+    <li>Weekly decay keeps rankings current; a streaming top-k surfaces what's trending now.</li>
+    <li>Filter by blocklist and minimum distinct users before anything is suggested.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design search autocomplete for a large website.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you keep suggestions fresh?", "How do you shard the data?", "How do you stop offensive suggestions?"]}
+>
+  <p>Every keystroke is a request, around 15,000 a second at peak after debouncing, and the server has a few milliseconds, so suggestions are precomputed. A batch job reads search logs, scores each query with decay so old popularity fades, filters it, and builds a table of prefix to top five, which is about 7.5 GB for 10 million queries and fits in memory on each suggest server. Servers load versioned snapshots and switch atomically, with rollback.</p>
+  <p>Short prefixes are cached at the CDN and in the browser, and the client debounces and cancels stale requests. For freshness, a streaming job keeps last-hour counts with a count-min sketch and publishes trending queries per prefix, merged at serve time. Queries on a blocklist or searched by too few distinct users are never added, and if the table outgrows memory it's sharded by hash of prefix.</p>
+</InterviewCard>

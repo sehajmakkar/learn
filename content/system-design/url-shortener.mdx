@@ -1,0 +1,269 @@
+export const meta = {
+  summary: "The classic first question, answered with the framework: requirements, estimates that say one database is enough, an API, random short codes with tested collision handling, a fast redirect path, clicks counted off the request path, and a standby so one machine failing isn't an outage.",
+  uses: ["01.07", "01.05", "01.06", "02.01", "05.05", "03.10", "05.08", "06.03"],
+  usedIn: ["15.02"],
+};
+
+<BeforeYouStart>
+  This is Snip from the start of the course, answered as an interview question. Read the framework in <L id="01.07" />
+  and the estimate in <L id="01.05" /> first; the short-code scheme comes from <L id="05.05" />.
+</BeforeYouStart>
+
+## The prompt
+
+"Design a URL shortener." It's the most common opening question because it's small enough to finish in an
+interview and still has real decisions in it: how codes are made, how redirects stay fast, where clicks are counted,
+and what happens when the machine fails. This version stays at Snip's launch scale; <L id="15.02" /> takes it to a
+hundred times that.
+
+<DesignIt
+  id="sd-15-01-url-shortener"
+  minutes={20}
+  levels={["junior", "mid"]}
+  patterns={["read-heavy", "ID generation", "caching"]}
+  rubric={[
+    "Requirements with numbers: redirect latency and availability, and that a link is never lost",
+    "An estimate that decides the architecture (about 1,000 redirects a second at peak and 300 GB: one database is enough)",
+    "An API for creating a link and for the redirect, with the status code chosen and justified",
+    "A schema with the short code as the primary key",
+    "A code scheme that is short, unique and not guessable, with collisions handled",
+    "Click counting that doesn't slow the redirect down",
+    "A plan for the machine failing: a standby, backups, or both",
+  ]}
+>
+  Users submit a long URL and get back a short one, like `snip.example/x7Kp9aQ`. Anyone who opens the short link is
+  sent to the long URL. Assume 10 million new links a month and 100 redirects for every link created. Owners can see
+  how many times each link was clicked.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional**
+
+- Create a short link for a long URL, optionally with a custom alias (`snip.example/spring-sale`) and an expiry date.
+- Redirect anyone who opens the short link.
+- Show the owner a click count per link.
+
+**Non-functional**
+
+- Redirects under 50 ms at the server for 99% of requests, available 99.99% of the time.
+- A link, once created, is never lost.
+- Codes can't be guessed or enumerated: some links point at private documents.
+- Click counts can lag by a few seconds.
+
+**Out of scope:** user accounts beyond an <Term t="api">API</Term> key, detailed analytics, editing a link's destination.
+
+## 2. Estimates
+
+From <L id="01.05" />: 10 million links a month is about **4 writes a second** on average and 10 at peak; with 100
+redirects per link, about **350 reads a second** and 1,000 at peak; and 600 million links of 500 bytes each over
+five years is **300 GB**.
+
+**What it decides:** one ordinary Postgres server handles this with room to spare. The design doesn't need sharding,
+a queue or a cache cluster. It does need a second copy of the data, because 99.99% is about 4 minutes of downtime a
+month (<L id="14.02" />), and one machine can't promise that on its own.
+
+## 3. Entities and API
+
+```text
+Link   { code (primary key), long_url, owner_id, created_at, expires_at? }
+Clicks { code, day, count }
+
+POST /links        { long_url, alias?, expires_at? }   Idempotency-Key: …   →  201 { code, short_url }
+GET  /{code}                                                                 →  302 Location: long_url
+GET  /links/{code}/stats                                                     →  200 { clicks, by_day }
+```
+
+The create call takes an idempotency key (<L id="03.10" />) so a retried request doesn't make a second link. The
+redirect answers **302**, not 301: a 301 is cached by browsers, so later clicks never reach Snip and are never
+counted, and the destination can never change (<L id="01.06" />).
+
+## 4. High-level design
+
+<Arch
+  title="Snip on one machine, plus a standby"
+  nodes={[
+    { id: "user", label: "Browser", kind: "user", x: 0, y: 1 },
+    { id: "app", label: "Snip app", kind: "service", sub: "+ in-process cache", x: 1, y: 1 },
+    { id: "db", label: "Postgres", kind: "db", sub: "links, clicks", x: 2, y: 1 },
+    { id: "standby", label: "Standby", kind: "db", sub: "streaming replica", x: 3, y: 1 },
+    { id: "backup", label: "Backups", kind: "store", sub: "WAL + nightly", x: 3, y: 2 },
+    { id: "feed", label: "Blocklist", kind: "external", sub: "Bloom filter", x: 1, y: 0 },
+  ]}
+  edges={[
+    { from: "user", to: "app" },
+    { from: "app", to: "feed", label: "check" },
+    { from: "app", to: "db" },
+    { from: "db", to: "standby", label: "replicate", dashed: true },
+    { from: "db", to: "backup", label: "archive", dashed: true },
+  ]}
+  groups={[{ label: "One server", nodes: ["app", "db"] }]}
+  steps={[
+    { caption: "Create: the app checks the long URL against the phishing blocklist, held in memory as a Bloom filter (05.08).", edges: ["user>app", "app>feed"] },
+    { caption: "It draws a random 7-character code and inserts the row. The code is the primary key, so a collision fails the insert and the app draws again.", edges: ["app>db"] },
+    { caption: "Redirect: the app looks the code up, first in its in-process cache, then by primary key in Postgres, and answers 302. It adds one to an in-memory counter for the code.", edges: ["user>app", "app>db"] },
+    { caption: "Every few seconds the app writes the counters to the clicks table in one statement, so a thousand redirects cost one write.", edges: ["app>db"] },
+    { caption: "Postgres streams every change to a standby on another machine and archives its write-ahead log to object storage, so a lost server costs neither the data nor more than a minute or two of redirects.", edges: ["db>standby", "db>backup"] },
+  ]}
+  caption="Every box traces to a requirement: the standby to availability, the archive to never losing a link, the in-process counters to keeping redirects fast."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="How are short codes made?">
+  <Option grade="bad" name="A counter, written in base62">
+    Short and never collides, but **guessable**: anyone can walk `x7Kp`, `x7Kq`, `x7Kr` and find every link,
+    including private ones, and the codes reveal how many links Snip has.
+  </Option>
+  <Option grade="good" name="A hash of the long URL, cut to 7 characters">
+    Not guessable, and the same URL gets the same code. But truncated hashes still collide and need a retry scheme, and
+    two users shortening the same URL now share one link, with one expiry and one click count.
+  </Option>
+  <Option grade="great" name="Random base62 codes, with the primary key catching collisions">
+    62⁷ is about 3.5 trillion codes. With 600 million links, a new random code collides about 0.02% of the time, and
+    the database already checks uniqueness for free: insert, and on a conflict, draw again (<L id="05.05" />). Custom
+    aliases go in the same column, so they're checked the same way.
+  </Option>
+</DeepDive>
+
+```ts
+import { randomInt } from "node:crypto";
+
+const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+export function randomCode(length = 7) {
+  let code = "";
+  for (let i = 0; i < length; i++) code += ALPHABET[randomInt(62)]; // randomInt avoids modulo bias
+  return code;
+}
+
+export async function createLink(db: pg.Pool, longUrl: string, ownerId: number, draw = randomCode) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const { rows } = await db.query(
+      `INSERT INTO links (code, long_url, owner_id) VALUES ($1, $2, $3)
+       ON CONFLICT (code) DO NOTHING RETURNING code`,
+      [draw(), longUrl, ownerId],
+    );
+    if (rows.length) return rows[0].code as string; // no row back: the code was taken, draw again
+  }
+  throw new Error("no free code after 5 attempts");
+}
+```
+
+Tested on Postgres 16: 10,000 links were created in about 0.7 seconds on one connection. With the first draw forced
+to an existing code, the insert returned no row and the second draw succeeded; with every draw forced to a taken
+code, the function gave up after five attempts instead of looping forever. The redirect's lookup by code used the
+primary key index.
+
+<DeepDive title="Keeping the redirect fast">
+  <Option grade="bad" name="Look up the long URL by scanning, or by an unindexed column">
+    Fine with a thousand links, and seconds per redirect with hundreds of millions.
+  </Option>
+  <Option grade="good" name="A primary key lookup on the code">
+    One index lookup, typically well under a millisecond on a warm database, and enough for 1,000 reads a second.
+  </Option>
+  <Option grade="great" name="The primary key, plus a small in-process cache for hot codes">
+    Clicks are skewed: a few links get most of them. An LRU cache of the 100,000 hottest codes (<L id="06.03" />)
+    answers most redirects from memory with no database round trip. Give entries a short TTL, such as a minute, so a
+    blocked or expired link stops working quickly.
+  </Option>
+</DeepDive>
+
+<DeepDive title="Counting clicks without slowing redirects">
+  <Option grade="bad" name="UPDATE links SET clicks = clicks + 1 on every redirect">
+    Turns every read into a write, and a popular link's row becomes a lock that every redirect for it waits on.
+  </Option>
+  <Option grade="good" name="Insert a row per click">
+    Appends don't fight over one row, and you keep each click's details. But at 350 a second that's 30 million rows a
+    day, which will soon dwarf the links table.
+  </Option>
+  <Option grade="great" name="Count in memory, write totals every few seconds">
+    Each app process keeps a map of code → count and flushes it with one upsert every few seconds. The requirements
+    allow counts to lag, and a crash loses a few seconds of counts, never a link. If detailed analytics arrive later,
+    the same flush can write events to a queue instead (<L id="02.06" />).
+  </Option>
+</DeepDive>
+
+**Expiry and aliases.** An expired link is checked on read (`expires_at < now()` answers 404) and deleted later by a
+nightly job, so expiry never needs a timer per link. Aliases need a reserved list (`api`, `login`, `admin`) and the
+same character rules as codes.
+
+## 6. Wrap-up: what breaks first
+
+- **The machine.** The standby is promoted when the primary fails, by a tool like Patroni or a managed database's
+  failover, in about a minute (<L id="04.07" />). That's most of a month's 99.99% budget, which is why the next step
+  is two app servers behind a load balancer (<L id="02.03" />).
+- **Growth.** At a hundred times the traffic, 30 TB and 100,000 redirects a second don't fit on one machine. That's
+  <L id="15.02" />.
+
+<Levels
+  junior={[
+    "A working API and a table keyed by code",
+    "Random or hashed codes, with collisions handled",
+    "Picks a redirect status code",
+  ]}
+  mid={[
+    "Uses the estimate to justify one database",
+    "Explains 301 against 302 in terms of caching and analytics",
+    "Keeps click counting off the redirect path; adds idempotent creates",
+  ]}
+  senior={[
+    "Turns 99.99% into a standby, failover time and backups with a recovery point",
+    "Covers abuse (blocklists), expiry and aliases",
+    "Says exactly what changes at 100× and why",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Stack Overflow"
+    system="The whole site"
+    year={2016}
+    href="https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/"
+    source="Stack Overflow: The Architecture – 2016 Edition"
+    found="A very large site ran on a small, carefully tuned set of servers; they scaled up and tuned before they scaled out."
+  >
+    On one day in February 2016, Stack Overflow's load balancers handled over 209 million HTTP requests. The sites ran
+    on 4 Microsoft SQL Servers, 11 IIS web servers, 2 Redis servers, 3 tag-engine servers, 3 Elasticsearch servers
+    and 4 HAProxy load balancers, with Redis instances below 2% CPU.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="An interviewer asks why Snip doesn't use an auto-increment ID in base62 as the code. It's shorter and never collides. What's the strongest answer?"
+  options={[
+    { text: "Base62 can't represent large numbers", why: "It can represent any number; it just needs more characters." },
+    { text: "Sequential codes are guessable: anyone can enumerate every link, including private ones, and see how many exist", correct: true, why: "The requirement that codes can't be guessed rules out a counter. Random codes cost a rare retry, which the primary key makes cheap." },
+    { text: "Auto-increment is slow in Postgres", why: "Sequences are fast; speed isn't the issue." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Reaching for a distributed design at 10 writes a second.** Do the estimate; one database is enough here.</li>
+    <li>**Answering with a 301 by default.** It hides clicks and freezes the destination; say why you chose either code.</li>
+    <li>**Counting clicks on the redirect path.** Batch the counts.</li>
+    <li>**No plan for the machine failing.** "Never lose a link" needs replication and backups.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Snip's numbers (1,000 redirects a second at peak, 300 GB) fit one database, plus a standby for availability.</li>
+    <li>Random 7-character base62 codes, with the primary key catching the rare collision.</li>
+    <li>Redirects are a primary-key lookup behind a small in-process cache, answered with a 302.</li>
+    <li>Clicks are counted in memory and written in batches; a crash costs seconds of counts, not links.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a URL shortener.", level: "Junior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you generate the short codes?", "301 or 302?", "How would you count clicks?"]}
+>
+  <p>I'd confirm the scope (create, redirect, click counts) and the scale; at 10 million links a month that's about 10 writes and 1,000 redirects a second at peak and 300 GB over five years, so one Postgres primary with a streaming standby and archived backups is enough. The API is a POST to create a link, with an idempotency key, and a GET on the code that answers 302 so clicks keep reaching us.</p>
+  <p>Codes are 7 random base62 characters, about 3.5 trillion possibilities, used as the primary key, so a rare collision fails the insert and we draw again; a counter would be guessable. Redirects are a primary-key lookup behind a small in-process LRU cache with a short TTL. Clicks are counted in memory and flushed in batches every few seconds, so redirects never wait on a write. The first thing to change at higher scale is adding app servers behind a load balancer, then caching and sharding.</p>
+</InterviewCard>

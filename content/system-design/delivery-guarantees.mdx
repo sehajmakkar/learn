@@ -57,7 +57,7 @@ and just before saying so. What systems can offer is that the **effect** happens
 twice. Two kinds of help exist:
 
 - **Inside the messaging system.** Since version 0.11, Kafka's producer can be idempotent: the broker gives each
-  producer an ID and drops resent messages by sequence number, so producer retries don't create duplicates in the log.
+  producer an ID and drops resent messages by <Term t="sequence-number">sequence number</Term>, so producer retries don't create duplicates in the log.
   Kafka transactions let a consumer read, write its output to other topics and save its offset as one atomic step.
   That's exactly-once **within Kafka**.
 - **At the edges, in your code.** As soon as the effect is outside the log (a row in Postgres, an email, a charge),

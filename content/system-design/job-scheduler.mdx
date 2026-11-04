@@ -1,0 +1,281 @@
+export const meta = {
+  summary: "Cron as a service for 10 million schedules: finding due jobs without scanning, several schedulers that never double-run a job (leases and fencing, tested), what to do about runs missed during an outage (tested), the top-of-the-hour spike, and executors with heartbeats, retries and alerts for jobs that silently stop.",
+  uses: ["07.05", "07.07", "08.07", "08.08", "07.03", "03.09"],
+  usedIn: ["17.07"],
+};
+
+<BeforeYouStart>
+  This design builds on the Postgres job queue (<L id="07.05" />), scheduled and recurring jobs (<L id="07.07" />),
+  and leases with fencing tokens (<L id="08.07" />, <L id="08.08" />).
+</BeforeYouStart>
+
+## The prompt
+
+"Design a distributed job scheduler" asks for cron that doesn't live on one machine. A crontab on one server is
+simple and a single point of failure; three servers running the same crontab run every job three times. The design
+is about running each job **once, on time**, across many machines that can fail.
+
+<DesignIt
+  id="sd-15-11-job-scheduler"
+  minutes={22}
+  levels={["mid", "senior"]}
+  patterns={["leases", "fencing", "SKIP LOCKED", "idempotency"]}
+  rubric={[
+    "Due jobs found by an index on next run time, not a scan",
+    "Several schedulers for availability, with a mechanism that stops two claiming the same run",
+    "A lease that expires if a scheduler or worker dies, and a fence so a late one can't finish a run it lost",
+    "Runs made idempotent, since at-least-once is the realistic guarantee",
+    "A policy for runs missed during an outage",
+    "A plan for thousands of jobs all due at the top of the hour",
+    "Retries, timeouts, history, and an alert when a job stops running",
+  ]}
+>
+  Snip's teams want to schedule work: "every hour, recompute this owner's report", "every day at 09:00 in the owner's
+  time zone, send the summary", "in 3 days, expire this link". Design a scheduler service for 10 million schedules,
+  where runs start within a few seconds of their time, no run happens twice at once, and a scheduler machine failing
+  doesn't stop or duplicate anything.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional:** create, pause and delete schedules (cron expressions, fixed intervals, one-time); run each at its
+time on a worker; retry failures; show history per schedule.
+
+**Non-functional:**
+
+- Runs start within a few seconds of their scheduled time.
+- A run never executes twice at the same time, and normally runs once.
+- No single point of failure.
+- 10 million schedules; tens of thousands of runs a second at peak.
+
+## 2. Estimates
+
+- **Average rate:** if a typical schedule runs hourly, 10 million schedules is about **2,800 runs a second**.
+- **The spike:** people write `0 * * * *`. If a third of hourly schedules are due at minute 0, that's 3.3 million runs
+  in one minute, about **55,000 a second**, then quiet. The spike, not the average, sizes the system.
+- **History:** 240 million runs a day at about 200 bytes is 48 GB a day; kept 30 days, **1.4 TB**, partitioned by day.
+
+## 3. Entities and API
+
+```text
+Schedule { id, owner, spec: "0 9 * * *" | every 1 hour, time_zone, next_run_at, job: { queue, payload },
+           misfire: run_once | skip, owner_lease, lease_until, fence }
+Run      { schedule_id, scheduled_for, attempt, status, worker, started_at, finished_at }   unique (schedule_id, scheduled_for)
+
+POST   /schedules            { spec, time_zone, job, misfire }    →  201 { id, next_run_at }
+PATCH  /schedules/{id}       { paused: true }
+GET    /schedules/{id}/runs?before=…
+```
+
+## 4. High-level design
+
+<Arch
+  title="A scheduler service"
+  nodes={[
+    { id: "api", label: "Schedule API", kind: "service", x: 0, y: 1 },
+    { id: "db", label: "Schedules", kind: "db", sub: "index on next_run_at", x: 1, y: 1 },
+    { id: "s1", label: "Scheduler 1", kind: "worker", sub: "claims due rows", x: 2, y: 0 },
+    { id: "s2", label: "Scheduler 2", kind: "worker", sub: "claims due rows", x: 2, y: 2 },
+    { id: "q", label: "Run queue", kind: "queue", x: 3, y: 1 },
+    { id: "w", label: "Executors", kind: "worker", sub: "heartbeat, retry", x: 4, y: 1 },
+  ]}
+  edges={[
+    { from: "api", to: "db" },
+    { from: "s1", to: "db", label: "SKIP LOCKED", both: true },
+    { from: "s2", to: "db", both: true },
+    { from: "s1", to: "q", label: "run (fenced)" },
+    { from: "s2", to: "q" },
+    { from: "q", to: "w" },
+    { from: "w", to: "db", label: "finish", dashed: true },
+  ]}
+  steps={[
+    { caption: "Creating a schedule computes its first next_run_at in its own time zone and stores it.", edges: ["api>db"] },
+    { caption: "Every second, each scheduler claims a batch of rows whose next_run_at has passed and that nobody holds, skipping rows another scheduler has locked (07.05). Each claim sets a lease and increments a fence number.", edges: ["s1>db", "s2>db"] },
+    { caption: "For each claimed row, the scheduler records a run for that exact slot (unique per schedule and time) and puts it on the run queue.", edges: ["s1>q", "s2>q"] },
+    { caption: "Executors run the job, sending heartbeats that extend the lease while it runs, and retry with backoff on failure (03.09).", edges: ["q>w"] },
+    { caption: "On completion, the row moves to its next slot, but only if the fence number still matches: a scheduler whose lease expired can't advance a schedule someone else now holds.", edges: ["w>db"] },
+  ]}
+  caption="Schedulers are interchangeable and stateless: the database row, its lease and its fence decide who is doing what."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="Finding what's due">
+  <Option grade="bad" name="Scan every schedule every second">
+    10 million rows a second to find a few thousand due ones.
+  </Option>
+  <Option grade="good" name="An index on next_run_at, polled with SKIP LOCKED">
+    `WHERE next_run_at <= now() ORDER BY next_run_at LIMIT 100` reads only due rows, and several schedulers poll at
+    once without blocking each other (<L id="07.05" />).
+  </Option>
+  <Option grade="great" name="The index, sharded, with the next minute held in memory">
+    Partition schedules by hash of ID across database shards, each polled by its own schedulers. For tight timing,
+    each scheduler also loads the coming minute's due rows into an in-memory timer and fires them on the second,
+    claiming each just before it runs.
+  </Option>
+</DeepDive>
+
+<DeepDive title="Never running a job twice at once">
+  <Option grade="bad" name="One scheduler, or several with no coordination">
+    One is a single point of failure; several each run everything, so every job runs N times.
+  </Option>
+  <Option grade="good" name="Elect a leader; only it schedules">
+    Correct with a proper lease (<L id="08.07" />), but one machine does all the work, and failover leaves a gap.
+  </Option>
+  <Option grade="great" name="Claim each row with a lease and a fence; record runs uniquely by slot">
+    Any scheduler can claim any due row. The lease frees the row if its holder dies; the fence number, incremented on
+    every claim, rejects a late finish from a holder that lost its lease (<L id="08.08" />); and the run's unique
+    (schedule, slot) key makes a duplicate enqueue a no-op. Jobs themselves are idempotent, because at-least-once is
+    still the honest guarantee (<L id="07.03" />).
+  </Option>
+</DeepDive>
+
+```ts
+export async function claimDue(db: pg.Pool, owner: string, limit = 10, leaseSeconds = 30) {
+  const { rows } = await db.query(
+    `UPDATE schedules SET owner = $1, lease_until = now() + make_interval(secs => $3), fence = fence + 1
+     WHERE id IN (SELECT id FROM schedules
+                  WHERE next_run_at <= now() AND (lease_until IS NULL OR lease_until < now())
+                  ORDER BY next_run_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+     RETURNING id, next_run_at, fence`,
+    [owner, limit, leaseSeconds],
+  );
+  return rows as { id: number; next_run_at: Date; fence: number }[];
+}
+
+export async function finish(db: pg.Pool, id: number, fence: number) {
+  // Move to the next slot after now, skipping any missed while the scheduler was down.
+  const { rowCount } = await db.query(
+    `UPDATE schedules
+     SET next_run_at = next_run_at + every * (floor(extract(epoch FROM now() - next_run_at) / extract(epoch FROM every)) + 1),
+         owner = NULL, lease_until = NULL
+     WHERE id = $1 AND fence = $2`,
+    [id, fence],
+  );
+  return rowCount === 1; // false: our lease expired and someone else has the job now
+}
+```
+
+Tested on Postgres 16 with 100 due schedules of "every minute" and four schedulers claiming in batches of 10 at the
+same time: all 100 were claimed, each by exactly one scheduler. With 2-second leases and nobody finishing, a fifth
+scheduler reclaimed all 100 once the leases expired. The original holder's finish for schedule 1 was then rejected,
+because its fence was stale; the new holder's finish succeeded, cleared the lease and set the next run about a minute
+ahead.
+
+<DeepDive title="Runs missed during an outage">
+  <Option grade="bad" name="Run every missed slot when you come back">
+    After a 10-minute outage, every per-minute job runs ten times at once: a self-inflicted spike, and usually
+    pointless (ten copies of the same report).
+  </Option>
+  <Option grade="good" name="Skip to the next slot">
+    No spike, but a daily billing job that missed 09:00 doesn't run until tomorrow.
+  </Option>
+  <Option grade="great" name="A policy per schedule, defaulting to 'run once now, then resume'">
+    Most jobs want "run once to catch up, then carry on"; a few want every slot (each day's invoices); some want to
+    skip. The schedule stores which, and the scheduler applies it.
+  </Option>
+</DeepDive>
+
+Tested: a per-minute schedule left 10 minutes 30 seconds overdue was claimed and run once, and `finish` set its next
+run about 30 seconds ahead, at the next whole slot, instead of queueing ten catch-up runs.
+
+**The top of the hour.** When a third of all hourly jobs are due at minute 0, spread them: for schedules that don't
+care about the exact minute ("hourly"), pick the minute from a hash of the schedule ID, so load is even across the
+hour. Keep the exact spec for the ones that do care, and size workers for that smaller spike.
+
+**Executors.** Long jobs send heartbeats that extend their lease; a job whose heartbeats stop is presumed dead and
+retried. Each job has a timeout, retries with exponential backoff and jitter, and a dead-letter queue after the last
+attempt. A schedule that hasn't succeeded within twice its interval raises an alert: the most dangerous failure of a
+scheduler is a job that silently stops running.
+
+## 6. Wrap-up
+
+What breaks first: **the database** behind the schedules, at tens of thousands of claims a second during a spike, so
+schedules are sharded and claims are batched; then **time zones**: "09:00 daily" in a zone with daylight saving time
+happens twice, or not at all, once a year, so next run times are computed with a time zone library, never by adding
+24 hours.
+
+<Levels
+  junior={[
+    "Stores schedules with a next run time and polls for due ones",
+    "Runs jobs on workers from a queue",
+  ]}
+  mid={[
+    "Uses SKIP LOCKED so several schedulers can poll",
+    "Adds leases so a dead scheduler's work is picked up",
+    "Retries with backoff and keeps run history",
+  ]}
+  senior={[
+    "Adds fencing and unique runs per slot, and makes jobs idempotent",
+    "Defines missed-run policies and spreads the top-of-hour spike",
+    "Alerts on schedules that stop succeeding and handles daylight saving time",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Dropbox"
+    system="Async Task Framework (ATF)"
+    year={2020}
+    href="https://dropbox.tech/infrastructure/asynchronous-task-scheduling-at-dropbox"
+    source="How we designed Dropbox ATF: an async task framework"
+    found="Store scheduled tasks durably, poll for the ones that are due, and guarantee at least once."
+  >
+    Tasks are kept in a task store; a store consumer periodically polls it for tasks that are ready and pushes them
+    onto queues for execution, with timeouts for tasks that aren't claimed or stop sending heartbeats, and exponential
+    backoff for retriable failures. The system guarantees a task runs at least once after being scheduled, and at the
+    time of writing served about 9,000 scheduled tasks a second for 28 engineering teams.
+  </Seen>
+  <Seen
+    company="Slack"
+    system="Job queue"
+    year={2017}
+    href="https://slack.engineering/scaling-slacks-job-queue/"
+    source="Scaling Slack's Job Queue (Slack Engineering, updated 2020)"
+    found="Background work at huge scale, and an outage when the queue itself filled up and couldn't accept new jobs."
+  >
+    On its busiest days Slack's job system processes over 1.4 billion jobs, at a peak of 33,000 a second. It
+    originally kept jobs in Redis; during an outage, a database slowdown made jobs run slower, Redis reached its
+    maximum memory, and it could no longer enqueue new jobs. Slack's fix was to add Kafka in front of Redis rather
+    than replace Redis.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Scheduler A claims a daily job, then pauses for 45 seconds during garbage collection. Its 30-second lease expires, scheduler B claims and runs the job, and then A wakes up and tries to finish. What should happen?"
+  options={[
+    { text: "A's finish succeeds; both runs are recorded", why: "Then A can move the schedule forward based on a run it no longer owns, and the job may have run twice with neither knowing." },
+    { text: "A's finish is rejected because its fence number is out of date, and B's run stands", correct: true, why: "Each claim increments the fence; only the current holder's number matches. The unique run per slot also stops A from enqueuing a duplicate." },
+    { text: "Leases should be longer than any pause", why: "No lease is longer than every possible pause; fencing is what makes leases safe." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**The same crontab on several machines.** Every job runs once per machine.</li>
+    <li>**Leases without fencing.** A paused holder wakes up and acts on work it lost.</li>
+    <li>**Catching up every missed slot.** Choose a policy per job; default to running once.</li>
+    <li>**No alert for silence.** A job that stops running fails without a single error.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Schedules live in a table indexed by next run time; schedulers claim due rows with SKIP LOCKED.</li>
+    <li>Leases free work from dead schedulers; fence numbers stop late finishes; unique runs per slot stop duplicates.</li>
+    <li>Choose missed-run policies per job, and spread "hourly" jobs across the hour.</li>
+    <li>Executors heartbeat, time out, retry with backoff, and alert when a schedule stops succeeding.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a distributed job scheduler like cron for many machines.", level: "Senior", frequency: 2, importance: "Good to know", kind: "Design" }}
+  followUps={["How do you make sure a job doesn't run twice?", "What if a scheduler dies mid-run?", "What happens to runs missed during an outage?"]}
+>
+  <p>Schedules are rows with a cron spec, time zone and next_run_at, indexed on next_run_at and sharded by ID. Several stateless schedulers poll each shard every second, claiming due rows with FOR UPDATE SKIP LOCKED, setting a lease and incrementing a fence number. Each claim records a run unique by schedule and slot and enqueues it; executors heartbeat to extend the lease, time out, and retry with backoff into a dead-letter queue.</p>
+  <p>If a scheduler dies, its lease expires and another claims the row; if it was only paused, its finish is rejected because the fence moved on. Jobs are still idempotent, since delivery is at least once. Missed runs follow a per-schedule policy, usually run once then resume. The top-of-hour spike is spread by hashing flexible hourly jobs across the hour, and an alert fires when a schedule hasn't succeeded within twice its interval.</p>
+</InterviewCard>

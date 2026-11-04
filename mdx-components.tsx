@@ -12,6 +12,7 @@ import { Arch, Evolve } from "@/components/lesson/arch";
 import { Sequence } from "@/components/lesson/sequence";
 import { Levels, Seen, SeenInProduction } from "@/components/lesson/design";
 import { DesignIt } from "@/components/lesson/design-it";
+import { DeepDive, Option } from "@/components/lesson/deep-dive";
 import { NumbersToKnow } from "@/components/lesson/numbers";
 import { Lab } from "@/components/lesson/lab";
 import { EstimateLab } from "@/components/labs/estimate";
@@ -28,6 +29,7 @@ import { HyperLogLogLab } from "@/components/labs/hyperloglog";
 import { GeohashLab } from "@/components/labs/geohash";
 import { ChunkingLab } from "@/components/labs/chunking";
 import { RateLimiterLab } from "@/components/labs/rate-limiter";
+import { CrawlerLab } from "@/components/labs/crawler";
 
 /** Fenced code blocks (```ts … ```) get the same highlighted, scrollable frame as <Code>. */
 function Pre({ children }: { children?: ReactNode }) {
@@ -63,6 +65,8 @@ const components: MDXComponents = {
   SeenInProduction,
   Seen,
   DesignIt,
+  DeepDive,
+  Option,
   Levels,
   NumbersToKnow,
   Lab,
@@ -80,6 +84,7 @@ const components: MDXComponents = {
   GeohashLab,
   ChunkingLab,
   RateLimiterLab,
+  CrawlerLab,
 };
 
 export function useMDXComponents(): MDXComponents {

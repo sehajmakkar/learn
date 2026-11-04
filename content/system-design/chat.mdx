@@ -1,0 +1,283 @@
+export const meta = {
+  summary: "One-to-one and group chat for 20 million daily users: persistent connections and a registry, a sequence number per conversation with retries that never duplicate (tested), syncing devices that were offline, storage partitioned by conversation, and read receipts as one number.",
+  uses: ["12.01", "12.02", "05.07", "04.11", "12.08", "07.04"],
+  usedIn: ["17.05"],
+};
+
+<BeforeYouStart>
+  Chat combines persistent connections (<L id="12.01" />), presence (<L id="12.02" />), keyset pagination
+  (<L id="05.07" />) and push notifications (<L id="12.08" />). The storage choice follows <L id="04.11" />.
+</BeforeYouStart>
+
+## The prompt
+
+"Design WhatsApp" or "design a chat app" looks like a WebSocket problem. The harder parts are elsewhere: putting
+messages in one order, never showing one twice when a phone retries on a bad connection, and catching up a device
+that was offline for a week.
+
+<DesignIt
+  id="sd-15-09-chat"
+  minutes={25}
+  levels={["mid", "senior"]}
+  patterns={["WebSockets", "ordering", "idempotency", "sync"]}
+  rubric={[
+    "Persistent connections on gateway servers, and a way to find which gateway holds a user",
+    "Messages stored before they're delivered",
+    "One order per conversation, not by device clocks",
+    "Retries that never create duplicate messages",
+    "Offline devices catch up from where they left off, and get a push notification",
+    "Storage partitioned by conversation, with the main query identified",
+    "Read receipts and presence without a write per message per reader",
+  ]}
+>
+  Snip Bio adds messaging between creators and their followers: one-to-one chats and groups of up to 500 people. There
+  are 20 million daily users who each send about 40 messages a day, on several devices each. Messages to online
+  users should arrive in under half a second; offline users get them when they return, plus a push notification.
+  History is kept and available on every device.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional:** send and receive messages in one-to-one and group chats; history on every device; sent, delivered
+and read indicators; online status and "last seen".
+
+**Non-functional:** under 500 ms delivery to online recipients; every message in the same order for every member;
+no duplicates and no lost messages; history kept indefinitely.
+
+**Out of scope:** voice and video calls, media processing (<L id="13.01" />), end-to-end encryption (with it, the
+server stores ciphertext it can't read; the design below barely changes).
+
+## 2. Estimates
+
+| | Value | What it decides |
+| --- | --- | --- |
+| Messages | 20 million × 40 = 800 million a day ≈ 9,000 a second, about **30,000 at peak** | Writes are steady and large |
+| Connections | about 8 million at peak, at 100,000 per gateway (<L id="12.01" />) | About **80 gateway servers** plus headroom |
+| Storage | 800 million × 300 bytes ≈ 240 GB a day, about **90 TB a year** | A store that partitions by conversation |
+| Deliveries | Most chats are one-to-one; groups multiply each message by their size | Fan-out per message, bounded at 500 |
+
+## 3. Entities and API
+
+```text
+Conversation { id, members[], last_seq }
+Message      { conversation_id, seq, client_msg_id, sender_id, body, sent_at }     primary key (conversation_id, seq)
+ReadState    { user_id, conversation_id, read_up_to_seq }
+
+WebSocket ← { type: "send", conversation_id, client_msg_id, body }
+          → { type: "ack", client_msg_id, seq }
+          → { type: "message", conversation_id, seq, sender_id, body }
+GET /conversations/{id}/messages?after_seq=N&limit=100                  catch up after being offline
+```
+
+## 4. High-level design
+
+<Arch
+  title="Snip Bio chat"
+  nodes={[
+    { id: "ana", label: "Ana's phone", kind: "client", x: 0, y: 0 },
+    { id: "ben", label: "Ben's phone", kind: "client", x: 0, y: 2 },
+    { id: "gw1", label: "Gateway 1", kind: "lb", sub: "WebSockets", x: 1, y: 0 },
+    { id: "gw2", label: "Gateway 2", kind: "lb", sub: "WebSockets", x: 1, y: 2 },
+    { id: "chat", label: "Chat service", kind: "service", sub: "by conversation", x: 2, y: 1 },
+    { id: "store", label: "Message store", kind: "db", sub: "by conversation", x: 3, y: 1 },
+    { id: "reg", label: "Connection registry", kind: "cache", sub: "user → gateway", x: 2, y: 0 },
+    { id: "push", label: "Push", kind: "external", sub: "APNs, FCM", x: 2, y: 2 },
+  ]}
+  edges={[
+    { from: "ana", to: "gw1", both: true },
+    { from: "ben", to: "gw2", both: true },
+    { from: "gw1", to: "chat", label: "send" },
+    { from: "chat", to: "store", label: "seq + write" },
+    { from: "chat", to: "reg", label: "where is Ben?" },
+    { from: "chat", to: "gw2", label: "deliver" },
+    { from: "chat", to: "push", label: "if offline", dashed: true },
+  ]}
+  steps={[
+    { caption: "Each phone holds a WebSocket to a gateway. On connect, the gateway records user → gateway in the registry, with a TTL refreshed by heartbeats.", edges: ["ana>gw1", "ben>gw2"] },
+    { caption: "Ana sends a message with an ID her phone generated. The gateway forwards it to the chat service instance that owns the conversation.", edges: ["gw1>chat"] },
+    { caption: "The chat service gives it the conversation's next sequence number and stores it. Only then does it acknowledge to Ana: one tick.", edges: ["chat>store"] },
+    { caption: "It looks up each member's gateways in the registry and sends the message there; Ben's gateway writes it to his socket.", edges: ["chat>reg", "chat>gw2"] },
+    { caption: "Members with no live connection get a push notification instead. When their app opens, it asks for everything after the last sequence number it has.", edges: ["chat>push"] },
+  ]}
+  caption="Store first, then deliver: a message exists once it has a sequence number, whatever happens to the connections."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="Putting messages in one order">
+  <Option grade="bad" name="Sort by the sender's timestamp">
+    Phones' clocks are wrong by seconds or hours (<L id="05.06" />). Two members would see different orders, and a
+    reply could appear above its question.
+  </Option>
+  <Option grade="good" name="Sort by server time or a Snowflake ID">
+    Better, but two servers' clocks differ by milliseconds, so near-simultaneous messages in a group can still swap,
+    and there's no way to spot a missing message.
+  </Option>
+  <Option grade="great" name="A sequence number per conversation">
+    One owner per conversation assigns 1, 2, 3… as it stores each message. Every member sees the same order, and a gap
+    tells a device it missed something. A client-generated message ID makes retries safe.
+  </Option>
+</DeepDive>
+
+```ts
+export async function sendMessage(db: pg.Pool, conversationId: number, clientMsgId: string, senderId: number, body: string) {
+  const client = await db.connect();
+  try {
+    const dup = await client.query("SELECT seq FROM messages WHERE conversation_id = $1 AND client_msg_id = $2", [
+      conversationId,
+      clientMsgId,
+    ]);
+    if (dup.rowCount) return Number(dup.rows[0].seq); // a retry: same message, same number
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      "UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq",
+      [conversationId],
+    );
+    const seq = Number(rows[0].last_seq);
+    await client.query(
+      "INSERT INTO messages (conversation_id, seq, client_msg_id, sender_id, body) VALUES ($1, $2, $3, $4, $5)",
+      [conversationId, seq, clientMsgId, senderId, body],
+    );
+    await client.query("COMMIT");
+    return seq;
+  } catch (err: any) {
+    await client.query("ROLLBACK"); // also undoes the sequence increment, so no gap
+    if (err.code === "23505") return sendMessage(db, conversationId, clientMsgId, senderId, body); // raced a retry
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+The `messages` table has `PRIMARY KEY (conversation_id, seq)` and `UNIQUE (conversation_id, client_msg_id)`. Tested on
+Postgres 16: 50 messages sent to one conversation at once got sequence numbers 1 to 50 with no gaps. Retrying message
+7 twice at the same moment returned its original number both times. A new message sent three times at once (a phone
+retrying on a flaky network) was stored once, as number 51, and the counter stayed at 51: the losing attempts rolled
+back their increments. 500 messages into one conversation took 120 ms; the row lock on the conversation serialises
+its writes, which is fine for a group of 500 and a reason to avoid one counter for a channel of millions.
+
+<DeepDive title="Catching up a device that was offline">
+  <Option grade="bad" name="Deliver only to connected devices">
+    Anything sent while a phone is in a tunnel is lost to it.
+  </Option>
+  <Option grade="good" name="Queue undelivered messages per device">
+    Works, but every message becomes a write per recipient device, and a lost queue loses messages.
+  </Option>
+  <Option grade="great" name="Every device remembers the last sequence number it has, per conversation">
+    On reconnect, it asks for messages after that number, a keyset query on the partition (<L id="05.07" />). The
+    message store is the only source of truth; live delivery is just a fast path, and a gap in sequence numbers
+    triggers the same catch-up.
+  </Option>
+</DeepDive>
+
+<DeepDive title="Storing 90 TB a year">
+  <Option grade="bad" name="One relational table, one server">
+    The table and its indexes outgrow memory within months.
+  </Option>
+  <Option grade="good" name="A relational database sharded by conversation">
+    Works, with the conversation's messages on one shard; large, old conversations make shards uneven.
+  </Option>
+  <Option grade="great" name="A wide-column store partitioned by conversation and time bucket">
+    The dominant query is "the latest messages in conversation X, then earlier ones", which reads one partition in
+    order. Bucketing by time keeps a decade-old group's partitions bounded (<L id="04.11" />), and writes are
+    append-heavy, which suits an LSM engine (<L id="09.03" />).
+  </Option>
+</DeepDive>
+
+**Receipts and presence.** "Read" isn't a flag per message per reader: it's one number per member per conversation,
+`read_up_to_seq`, updated as they scroll. "Delivered" works the same way. Presence uses heartbeats with a timeout and
+is shown only to people who have the chat open (<L id="12.02" />).
+
+**Very large groups.** Above a few thousand members, fan-out per message becomes the cost. Systems like Slack route
+each channel to a stateful channel server that pushes to the gateways subscribed to it.
+
+## 6. Wrap-up
+
+What breaks first: **reconnect storms** when a gateway restarts and 100,000 clients reconnect at once, so clients
+back off with jitter and gateways drain slowly (<L id="12.01" />); then **hot conversations**, a single group whose
+owner instance and partition get every write.
+
+<Levels
+  junior={[
+    "Uses WebSockets and a database of messages",
+    "Delivers to online users and stores for offline ones",
+  ]}
+  mid={[
+    "Finds the recipient's gateway through a registry",
+    "Orders by a per-conversation sequence and deduplicates retries",
+    "Sends push notifications to offline users",
+  ]}
+  senior={[
+    "Syncs devices from their last sequence number, with the store as the source of truth",
+    "Partitions storage by conversation and time bucket",
+    "Models receipts as a number per member and plans for reconnect storms and huge groups",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Slack"
+    system="Real-time messaging"
+    year={2023}
+    href="https://slack.engineering/real-time-messaging/"
+    source="Real-time Messaging"
+    found="Persistent WebSockets terminate on gateway servers; stateful channel servers, found by consistent hashing, fan messages out to them."
+  >
+    Every Slack client keeps a persistent WebSocket to Slack's servers. Clients connect to gateway servers in the
+    nearest region, which track each user's channel subscriptions. Channel servers are stateful and in memory; each
+    owns a subset of channels, assigned by consistent hashing. When a message arrives, its channel server sends it to
+    every gateway subscribed to that channel, and Slack says messages are delivered across the world in about 500 ms.
+  </Seen>
+  <Seen
+    company="Discord"
+    system="Message storage"
+    year={2017}
+    href="https://discord.com/blog/how-discord-stores-billions-of-messages"
+    source="How Discord Stores Billions of Messages"
+    found="Messages partitioned by channel and a time bucket, because every query reads one channel."
+  >
+    Discord started on MongoDB. By late 2015 it had 100 million stored messages, and once data and indexes no longer
+    fit in RAM, latencies became unpredictable. It chose Cassandra after listing its requirements, and partitioned
+    messages by channel and a time bucket, since every query operates on a channel.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Ben's phone has messages 1 to 40 of a group, then loses signal. Messages 41 to 47 arrive while he's offline, and when he reconnects the live connection delivers 48. What should his app do?"
+  options={[
+    { text: "Show 48; the others are lost", why: "They're stored; nothing about the connection loss affects them." },
+    { text: "Notice the gap after 40 and fetch messages after sequence 40 before showing 48 in place", correct: true, why: "Sequence numbers make gaps visible, and the store answers 'everything after 40' with one keyset query." },
+    { text: "Ask every member's phone to resend", why: "The server's store is the source of truth; phones don't need to hold each other's messages." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Ordering by device clocks.** Assign a sequence number per conversation on the server.</li>
+    <li>**Delivering before storing.** A crash in between loses a message that looked sent.</li>
+    <li>**No client message ID.** Retries on flaky networks create duplicates.</li>
+    <li>**A receipt row per message per reader.** Store how far each member has read.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Gateways hold WebSockets; a registry says which gateway holds each user.</li>
+    <li>Each conversation's owner assigns sequence numbers as it stores messages; client IDs make retries safe.</li>
+    <li>Devices catch up by asking for messages after their last sequence number; push wakes offline users.</li>
+    <li>Messages are partitioned by conversation and time bucket; receipts are one number per member.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a chat application like WhatsApp.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you order messages in a group?", "What happens when a user is offline?", "How do read receipts work?"]}
+>
+  <p>Clients hold WebSockets to gateway servers, around 100,000 each, and a registry with TTLs maps users to gateways. A send goes to the chat service instance that owns the conversation, which assigns the next sequence number and stores the message, deduplicating by a client-generated message ID, before acknowledging. It then looks up members' gateways and delivers; members with no connection get a push notification.</p>
+  <p>Every device tracks the last sequence number it has per conversation and, on reconnect or on seeing a gap, fetches everything after it, so the store is the source of truth and live delivery is a fast path. Messages are partitioned by conversation and time bucket in a wide-column store, at about 90 TB a year for 800 million messages a day. Read and delivered receipts are a single number per member per conversation, and presence uses heartbeats with a timeout.</p>
+</InterviewCard>

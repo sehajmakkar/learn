@@ -1,0 +1,263 @@
+export const meta = {
+  summary: "A home feed for 50 million daily users: posting, a hybrid of push and pull, feeds of IDs hydrated from caches, cursors that don't repeat posts while new ones arrive (tested), follows and unfollows, deletions, and where ranking fits.",
+  uses: ["12.03", "12.04", "07.09", "05.07", "05.05", "06.05"],
+  usedIn: [],
+};
+
+<BeforeYouStart>
+  <L id="12.03" /> compared push, pull and hybrid feeds and tested a hybrid. This lesson is the whole system around
+  it: the graph (<L id="12.04" />), storage, the read path and pagination (<L id="05.07" />).
+</BeforeYouStart>
+
+## The prompt
+
+"Design the news feed" (Facebook, X, Instagram) is one of the most asked questions because the obvious design fails
+in two opposite ways: build feeds on write and celebrities break you; build them on read and every app open is a
+query against hundreds of accounts.
+
+<DesignIt
+  id="sd-15-08-news-feed"
+  minutes={25}
+  levels={["mid", "senior"]}
+  patterns={["fan-out", "caching", "pagination", "denormalisation"]}
+  rubric={[
+    "Estimates for reads, posts and fan-out writes, showing that reads dominate",
+    "A hybrid: push for most authors, pull for those with huge followings",
+    "Feeds store post IDs, hydrated in a batch from a post cache",
+    "Pagination with a cursor that doesn't repeat or skip posts",
+    "What happens on follow, unfollow and delete",
+    "Feeds only for active users, with a fallback for the rest",
+    "Where ranking fits, as a step after gathering candidates",
+  ]}
+>
+  Snip Bio's app opens on a home feed: links posted by the creators you follow, newest first. There are 50 million
+  daily users, each opening the app about 10 times a day; 5 million posts a day; most users follow 20 to 300
+  creators; most creators have a few hundred followers and a few have millions. The feed must load in under 200 ms.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional:** post a link (with text and an image); follow and unfollow; read the home feed, newest first, with
+infinite scroll.
+
+**Non-functional:** feed loads in under 200 ms at p99; a new post appears in followers' feeds within a few seconds
+(a minute is acceptable for the largest creators); a deleted post disappears at once.
+
+**Out of scope:** comments, likes, search, ads.
+
+## 2. Estimates
+
+| | Value | What it decides |
+| --- | --- | --- |
+| Feed reads | 500 million a day ≈ 6,000 a second, about **20,000 at peak** | Reads must be one cheap lookup |
+| Posts | 5 million a day ≈ 60 a second | Writing a post is easy |
+| Fan-out writes | 60 posts × 300 followers ≈ **18,000 feed inserts a second** | Push is affordable for typical authors |
+| One celebrity post | 5 million followers in one go | Push breaks; pull these authors |
+| Feed storage | 50 million active users × 500 IDs × 8 bytes ≈ **200 GB** | A Redis cluster, not a database table |
+
+## 3. Entities and API
+
+```text
+Post    { id (Snowflake), author_id, text, image_key, created_at, deleted? }
+Follow  { follower_id, author_id, created_at }        stored both ways (12.04)
+Feed    { user_id → list of post IDs, newest first, capped at 500 }
+
+POST /posts                     { text, image_key }       →  201 { id }
+GET  /feed?limit=20&before=ID                             →  200 { posts: [...], next: ID }
+PUT  /follows/{author_id}       DELETE /follows/{author_id}
+```
+
+Post IDs are Snowflake IDs (<L id="05.05" />): unique, and ordered by time, so the cursor is just an ID.
+
+## 4. High-level design
+
+<Arch
+  title="Snip Bio's feed"
+  nodes={[
+    { id: "app", label: "App", kind: "client", x: 0, y: 1 },
+    { id: "post", label: "Post service", kind: "service", x: 1, y: 0 },
+    { id: "posts", label: "Posts", kind: "db", sub: "+ post cache", x: 2, y: 0 },
+    { id: "fan", label: "Fan-out workers", kind: "worker", x: 2, y: 1 },
+    { id: "graph", label: "Follow graph", kind: "db", x: 3, y: 1 },
+    { id: "feeds", label: "Feed cache", kind: "cache", sub: "IDs per user", x: 3, y: 2 },
+    { id: "feed", label: "Feed service", kind: "service", sub: "merge, hydrate", x: 1, y: 2 },
+  ]}
+  edges={[
+    { from: "app", to: "post" },
+    { from: "post", to: "posts" },
+    { from: "posts", to: "fan", label: "post.created", dashed: true },
+    { from: "fan", to: "graph", label: "followers" },
+    { from: "fan", to: "feeds", label: "push ID" },
+    { from: "app", to: "feed" },
+    { from: "feed", to: "feeds" },
+    { from: "feed", to: "posts", label: "batch get" },
+  ]}
+  steps={[
+    { caption: "Posting writes one row and emits an event through the outbox (07.06). The image was already uploaded directly to object storage (13.01).", edges: ["app>post", "post>posts"] },
+    { caption: "Fan-out workers look up the author's followers in pages. For ordinary authors, they push the post ID onto each active follower's feed list, capped at 500.", edges: ["posts>fan", "fan>graph", "fan>feeds"] },
+    { caption: "Authors with more than 100,000 followers are skipped: their posts are pulled at read time instead.", nodes: ["fan"] },
+    { caption: "Reading: the feed service takes the user's pushed IDs, adds recent posts from the few big authors they follow, and merges them newest first.", edges: ["app>feed", "feed>feeds"] },
+    { caption: "It fetches the 20 posts it needs in one batch from the post cache, drops deleted ones and blocked authors, and returns them with a cursor.", edges: ["feed>posts"] },
+  ]}
+  caption="Writes pay for most users' feeds in advance; reads pay only for the handful of big accounts."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="Push, pull, or both?">
+  <Option grade="bad" name="Pull for everyone">
+    Every app open queries up to 300 authors' recent posts and merges them: 20,000 reads a second times hundreds of
+    lookups.
+  </Option>
+  <Option grade="good" name="Push for everyone">
+    Reads are one list lookup. But a creator with 5 million followers makes 5 million writes per post, and the last
+    followers see it minutes later.
+  </Option>
+  <Option grade="great" name="Hybrid, and only for active users">
+    Push for authors under a follower threshold, pull for the few above it, and merge at read time (<L id="12.03" />).
+    Skip pushing to users inactive for 30 days; when one returns, build their feed by pulling, once.
+  </Option>
+</DeepDive>
+
+<DeepDive title="What goes in a feed, and how it's read">
+  <Option grade="bad" name="Full post copies in every feed">
+    Edits and deletions would have to be applied to millions of copies, and 200 GB becomes many terabytes.
+  </Option>
+  <Option grade="good" name="IDs in the feed, then one query per post">
+    Small feeds and fresh content, but 20 round trips per page: the N+1 problem.
+  </Option>
+  <Option grade="great" name="IDs in the feed, hydrated in one batch from a post cache">
+    One multi-get for the page's 20 posts and their authors. Deleted posts are filtered here, so deletion is
+    immediate without touching any feed. Popular posts are hot keys; coalesce identical reads (<L id="06.05" />).
+  </Option>
+</DeepDive>
+
+<DeepDive title="Infinite scroll while new posts arrive">
+  <Option grade="bad" name="OFFSET and LIMIT">
+    Five new posts arrive while the user reads page 1; page 2 at offset 20 now starts five posts earlier, and they
+    see five posts twice.
+  </Option>
+  <Option grade="good" name="A cursor on created_at">
+    New posts no longer shift pages, but two posts in the same millisecond can be skipped or repeated at a page
+    boundary.
+  </Option>
+  <Option grade="great" name="A cursor on the post ID">
+    Snowflake IDs are unique and time-ordered: "posts older than ID X" is exact (<L id="05.07" />). The same post
+    arriving by push and by pull is removed in the merge.
+  </Option>
+</DeepDive>
+
+```ts
+export type FeedPost = { id: bigint; author: string }; // Snowflake IDs: bigger is newer
+
+export function feedPage(pushed: FeedPost[], pulled: FeedPost[][], limit = 20, before?: bigint) {
+  const seen = new Set<bigint>();
+  const merged = [...pushed, ...pulled.flat()]
+    .filter((p) => (before === undefined || p.id < before) && !seen.has(p.id) && seen.add(p.id))
+    .sort((a, b) => (b.id > a.id ? 1 : b.id < a.id ? -1 : 0))
+    .slice(0, limit);
+  const next = merged.length === limit ? merged[merged.length - 1].id : undefined;
+  return { posts: merged, next }; // the client sends `next` back as `before`
+}
+```
+
+Tested with 60 posts, a third of them from a pulled celebrity and one of those also pushed (the author had just
+crossed the threshold): paging 20 at a time returned all 60 posts across the pages, each exactly once, strictly
+newest first, even though five new posts arrived after the first page. The new posts weren't shown in that scroll;
+they appear at the top on the next refresh.
+
+**Follows, unfollows and deletes.** A new follow backfills the author's last few posts into the follower's feed in
+the background. An unfollow doesn't rewrite the feed: the read path filters out authors the user no longer follows,
+and the entries age out. A deleted post is filtered during hydration.
+
+**Ranking.** If the feed isn't chronological, gather a few hundred candidates the same way, score them with a model,
+and sort. Fan-out gathers; ranking orders. Cursors then point into a ranked list saved for that session.
+
+## 6. Wrap-up
+
+What breaks first: **fan-out lag** when many large-but-not-huge authors post at once, so fan-out workers get their
+own autoscaling queue and the threshold is tuned by measuring; then the **feed cache's memory** as active users grow,
+handled by capping lengths and evicting inactive users' feeds.
+
+<Levels
+  junior={[
+    "Stores posts and follows; builds the feed by querying followed authors",
+  ]}
+  mid={[
+    "Precomputes feeds by fan-out on write and explains the celebrity problem",
+    "Stores IDs and hydrates from a cache",
+    "Uses cursor pagination",
+  ]}
+  senior={[
+    "Uses a hybrid with a threshold and skips inactive users",
+    "Handles follow, unfollow and delete without rewriting feeds",
+    "Places ranking after candidate generation and sizes the feed cache",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Yahoo! Research"
+    system="Feeding Frenzy"
+    year={2010}
+    href="http://jeffterrace.com/docs/feeding-frenzy-sigmod10-web.pdf"
+    source="Feeding Frenzy: Selectively Materializing Users' Event Feeds (SIGMOD 2010)"
+    found="Decide push or pull for each producer-consumer pair from their relative event and query rates; the hybrid gives the lowest load."
+  >
+    The paper defines push as writing events into materialized per-consumer feeds, and pull as fetching from
+    per-producer event stores at query time. It notes that fan-outs and update rates are highly skewed, and shows the
+    global cost is minimised by deciding for each producer-consumer pair based on the ratio of the producer's update
+    rate to the consumer's query rate; on Yahoo's PNUTS, this hybrid gave the lowest system load.
+  </Seen>
+  <Seen
+    company="Facebook"
+    system="TAO"
+    year={2013}
+    href="https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf"
+    source="TAO: Facebook's Distributed Data Store for the Social Graph (USENIX ATC 2013)"
+    found="The graph a feed is built from: objects and associations on sharded MySQL behind a cache; 99.8% of requests are reads."
+  >
+    TAO serves the social graph with a simple data model of objects and associations, implemented over sharded MySQL
+    with a geographically distributed, graph-aware cache. The paper reports that TAO processes a billion reads and
+    millions of writes each second, and that in a sample of requests 99.8% were reads.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="Snip Bio's feed uses ?page=2 with OFFSET 20. Users report seeing the same posts again while scrolling. What's happening?"
+  options={[
+    { text: "The feed cache is returning stale data", why: "Even with perfectly fresh data, offsets shift when new posts arrive." },
+    { text: "New posts at the top push older ones down, so offset 20 now includes posts already shown; use a cursor on the post ID", correct: true, why: "A cursor says 'older than this post', which doesn't move when new posts arrive." },
+    { text: "Two fan-out workers pushed the same post", why: "Possible, and the merge should deduplicate, but it doesn't explain repeats on every scroll." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**Pushing celebrity posts to millions of feeds.** Pull those authors at read time.</li>
+    <li>**Copying posts into feeds.** Store IDs and hydrate, so edits and deletions just work.</li>
+    <li>**Offset pagination.** Use the post ID as the cursor.</li>
+    <li>**Maintaining feeds nobody reads.** Skip inactive users and rebuild on return.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>Reads dominate: precompute most feeds by pushing IDs, and pull the few huge authors at read time.</li>
+    <li>Feeds hold capped lists of IDs; pages are hydrated in one batch from a post cache.</li>
+    <li>Cursor on the Snowflake post ID, and deduplicate when merging push and pull.</li>
+    <li>Follows backfill, unfollows and deletes are filtered at read time, and ranking orders the gathered candidates.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a news feed like Facebook's or X's home timeline.", level: "Senior", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you handle celebrities?", "How do you paginate?", "What happens when someone deletes a post?"]}
+>
+  <p>Reads dominate: 50 million daily users opening the app ten times a day is about 20,000 feed reads a second at peak, against 60 posts a second. So I'd precompute feeds: when someone posts, fan-out workers push the post ID onto each active follower's capped feed list in Redis, about 18,000 inserts a second. Authors with huge followings are excluded and pulled at read time, then merged with the pushed IDs.</p>
+  <p>Feeds store IDs, not content; a page's 20 posts are fetched in one batch from a post cache, which filters deleted posts and blocked authors. Pagination uses the Snowflake post ID as a cursor, so new posts don't cause repeats, and the merge removes duplicates. New follows backfill a few posts, unfollows are filtered at read time, inactive users' feeds aren't maintained, and ranking, if needed, scores the gathered candidates before returning them.</p>
+</InterviewCard>

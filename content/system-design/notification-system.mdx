@@ -1,0 +1,279 @@
+export const meta = {
+  summary: "A notification platform every team sends through: one API, templates, user preferences and quiet hours in each person's time zone (tested), separate lanes so a marketing blast never delays a login code, sending each notification once per channel (tested), and push providers that are best-effort by design.",
+  uses: ["12.08", "07.09", "07.03", "07.07", "14.03", "14.09"],
+  usedIn: [],
+};
+
+<BeforeYouStart>
+  <L id="12.08" /> showed one event fanning out to a million phones. This lesson designs the platform underneath it:
+  the service every other team calls to notify anyone of anything. It relies on fan-out (<L id="07.09" />) and
+  consumers that are safe to repeat (<L id="07.03" />).
+</BeforeYouStart>
+
+## The prompt
+
+Every product grows notifications team by team: one sends emails directly, another calls a push provider, a third
+has its own SMS account. Then users get the same alert three times, at 3 a.m., with no way to turn it off. "Design a
+notification system" asks for the shared platform that fixes that.
+
+<DesignIt
+  id="sd-15-07-notification-system"
+  minutes={20}
+  levels={["mid", "senior"]}
+  patterns={["queues", "fan-out", "idempotency", "priorities"]}
+  rubric={[
+    "One API for every team, with templates, channels and an idempotency key",
+    "Per-user preferences, quiet hours in the user's time zone, and frequency caps",
+    "Separate lanes for urgent and bulk notifications",
+    "Each notification sent at most once per channel, even when events are redelivered",
+    "Retries, provider limits and a second provider for critical channels",
+    "Device tokens kept clean and delivery results tracked",
+    "Large audiences expanded in batches, not in the request",
+  ]}
+>
+  Snip's teams need to notify users by push, email, SMS and in-app messages: login codes, "your link is trending",
+  weekly reports, product news. Design a notification service they all call. Assume 50 million notifications a day,
+  bursts of a few million when a campaign goes out, and login codes that must arrive within seconds.
+</DesignIt>
+
+## 1. Requirements
+
+**Functional**
+
+- One <Term t="api">API</Term>: send a notification of a given type to a user, a list of users or a segment, now or at a set time.
+- Templates per type and channel, filled with data from the caller.
+- Users control which types they get on which channels; quiet hours in their own time zone.
+- Delivery status per notification and channel.
+
+**Non-functional**
+
+- Login codes and security alerts delivered within seconds, even during a campaign.
+- No user gets the same notification twice on one channel.
+- Bulk sends spread out within the providers' limits.
+
+## 2. Estimates
+
+- **Rate:** 50 million a day is about 600 a second on average; a campaign to 5 million users, spread over 10
+  minutes, is about **8,000 a second** on top.
+- **Delivery log:** 50 million rows a day at about 300 bytes is 15 GB a day; kept 90 days, about **1.4 TB**.
+- **Device tokens:** 40 million users × 1.5 devices = 60 million tokens: a table, not a big-data problem.
+
+## 3. Entities and API
+
+```text
+POST /notifications
+  { idempotency_key, type: "link.trending", to: { user_id } | { segment },
+    data: { code, clicks }, channels?: [...], send_at? }                  →  202 { notification_id }
+
+Preferences { user_id, type, channel → on/off, quiet_hours: 22–07, time_zone }
+Device      { user_id, platform, token, last_seen }
+Delivery    { notification_id, channel, status, provider_id, sent_at }   primary key (notification_id, channel)
+```
+
+Callers say **what** happened and to whom; the platform decides **whether**, **how** and **when** to tell them.
+
+## 4. High-level design
+
+<Arch
+  title="Snip's notification platform"
+  nodes={[
+    { id: "caller", label: "Product services", kind: "service", x: 0, y: 1 },
+    { id: "api", label: "Notification API", kind: "service", sub: "validate, dedupe", x: 1, y: 1 },
+    { id: "expand", label: "Expander", kind: "worker", sub: "segments → batches", x: 1, y: 2 },
+    { id: "decide", label: "Decider", kind: "worker", sub: "preferences, caps, timing", x: 2, y: 1 },
+    { id: "prefs", label: "Preferences + devices", kind: "db", x: 2, y: 0 },
+    { id: "urgent", label: "Urgent lane", kind: "queue", x: 3, y: 0 },
+    { id: "bulk", label: "Bulk lane", kind: "queue", x: 3, y: 2 },
+    { id: "senders", label: "Channel senders", kind: "worker", sub: "push, email, SMS", x: 4, y: 1 },
+    { id: "prov", label: "Providers", kind: "external", sub: "APNs, FCM, email, SMS", x: 5, y: 1 },
+  ]}
+  edges={[
+    { from: "caller", to: "api" },
+    { from: "api", to: "expand", label: "segments", dashed: true },
+    { from: "api", to: "decide" },
+    { from: "expand", to: "decide" },
+    { from: "decide", to: "prefs" },
+    { from: "decide", to: "urgent" },
+    { from: "decide", to: "bulk" },
+    { from: "urgent", to: "senders" },
+    { from: "bulk", to: "senders" },
+    { from: "senders", to: "prov" },
+  ]}
+  steps={[
+    { caption: "A service calls the API with an idempotency key; a retried call returns the first notification's ID instead of creating another (03.10).", edges: ["caller>api"] },
+    { caption: "A notification to a segment goes to the expander, which pages through recipients in batches of 1,000 (12.08).", edges: ["api>expand", "expand>decide"] },
+    { caption: "The decider applies each user's preferences, quiet hours and frequency caps, renders the templates, and picks channels and devices.", edges: ["api>decide", "decide>prefs"] },
+    { caption: "Urgent types (login codes, security alerts) go to the urgent lane; everything else to the bulk lane. Each lane has its own queues and workers.", edges: ["decide>urgent", "decide>bulk"] },
+    { caption: "Channel senders claim each (notification, channel) before sending, pace themselves to each provider's limits, and record the result.", edges: ["urgent>senders", "bulk>senders", "senders>prov"] },
+  ]}
+  caption="The platform turns 'something happened to this user' into zero or more sends, each in the right lane, once."
+/>
+
+## 5. Deep dives
+
+<DeepDive title="A campaign must never delay a login code">
+  <Option grade="bad" name="One queue for everything">
+    A 5-million-user campaign is queued at 10:00; a login code queued at 10:01 waits behind it. The user gives up
+    signing in.
+  </Option>
+  <Option grade="good" name="A priority field on one queue">
+    Better, but workers busy with slow bulk sends and a provider throttling bulk traffic still slow everything down.
+  </Option>
+  <Option grade="great" name="Separate lanes, per channel, with their own workers and limits">
+    Urgent and bulk notifications use different queues and worker pools, and each channel has its own, so a slow
+    email provider never holds up push. The same isolation as multi-tenancy (<L id="14.09" />): one noisy workload
+    can't starve another.
+  </Option>
+</DeepDive>
+
+<DeepDive title="Sending once, when events arrive twice">
+  <Option grade="bad" name="Send, then record that you sent">
+    A worker crashes between the two; the queue redelivers the event (<L id="07.03" />), and the user gets it again.
+  </Option>
+  <Option grade="good" name="Idempotency keys at the API">
+    Stops duplicate requests from callers, but not duplicates created inside the pipeline by redelivery.
+  </Option>
+  <Option grade="great" name="Claim each (notification, channel) before sending">
+    Insert a delivery row keyed by notification and channel first; only the worker whose insert succeeds sends. A
+    worker that crashes after claiming leaves a row stuck in `sending`; a sweeper retries urgent ones (better twice
+    than never for a login code) and drops stale bulk ones.
+  </Option>
+</DeepDive>
+
+```ts
+export async function deliverOnce(db: pg.Pool, notificationId: string, channel: string, send: () => Promise<void>) {
+  const claimed = await db.query(
+    `INSERT INTO deliveries (notification_id, channel, status) VALUES ($1, $2, 'sending')
+     ON CONFLICT DO NOTHING RETURNING notification_id`,
+    [notificationId, channel],
+  );
+  if (claimed.rowCount === 0) return "duplicate"; // a redelivered event: someone already has it
+  await send();
+  await db.query(`UPDATE deliveries SET status = 'sent', sent_at = now() WHERE notification_id = $1 AND channel = $2`, [
+    notificationId,
+    channel,
+  ]);
+  return "sent";
+}
+
+/** Quiet hours in the user's own time zone, which may wrap past midnight (22 → 7). */
+export function inQuietHours(now: Date, timeZone: string, startHour: number, endHour: number) {
+  const hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hourCycle: "h23", timeZone }).format(now));
+  return startHour <= endHour ? hour >= startHour && hour < endHour : hour >= startHour || hour < endHour;
+}
+```
+
+Tested on Postgres 16: the same event delivered to five workers at once produced one send and four duplicates; the
+same notification on the email channel was sent separately, as it should be. At 17:30 UTC, quiet hours of 22:00 to
+07:00 were in force for a user in Kolkata (23:00 there) and not for one in London; in Kolkata, 06:59 was still quiet
+and 07:00 wasn't.
+
+<DeepDive title="Respecting the user">
+  <Option grade="bad" name="Every team checks preferences itself">
+    Some forget, each stores settings differently, and "turn off marketing" means six settings pages.
+  </Option>
+  <Option grade="good" name="A central preferences service, checked before sending">
+    One place for opt-outs per type and channel. But it doesn't stop ten legitimate notifications in an hour.
+  </Option>
+  <Option grade="great" name="Preferences, quiet hours, frequency caps and digests in one decider">
+    The decider holds bulk notifications during quiet hours (urgent ones go through), caps how many of each kind a user
+    gets per day, and rolls the excess into a digest. Legal opt-outs, such as for marketing email, are enforced here
+    too, so no caller can bypass them.
+  </Option>
+</DeepDive>
+
+**Providers are best-effort.** Apple's and Google's push services may reorder notifications, keep only a limited
+number for an offline device, and drop some; they report tokens that are no longer valid, and senders must delete
+those tokens or keep paying to send to dead devices. For SMS and email, a second provider behind a circuit breaker
+(<L id="08.09" />) keeps login codes working when one provider has an outage. Anything that must be seen, like a
+security alert, also goes to an in-app inbox stored by Snip itself.
+
+## 6. Wrap-up
+
+What breaks first: **campaign spikes** that hit provider limits, so bulk senders pace themselves with token buckets
+per provider (<L id="14.03" />); then the **delivery log**, which grows fastest and is partitioned by day and expired
+after 90 days (<L id="14.11" />).
+
+<Levels
+  junior={[
+    "A queue between the API and workers that call the providers",
+    "Stores device tokens and user preferences",
+  ]}
+  mid={[
+    "Separates urgent from bulk traffic",
+    "Applies preferences and quiet hours in the user's time zone",
+    "Makes sends idempotent per notification and channel",
+  ]}
+  senior={[
+    "Isolates lanes per channel and adds provider failover",
+    "Handles crashed sends differently for urgent and bulk",
+    "Treats push as best-effort and keeps an in-app inbox for what must be seen",
+  ]}
+/>
+
+<SeenInProduction>
+  <Seen
+    company="Apple"
+    system="Apple Push Notification service"
+    year="Docs"
+    href="https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns"
+    source="Sending notification requests to APNs (Apple Developer documentation)"
+    found="Push is best-effort: notifications may be reordered, and an offline device gets at most one stored notification per app."
+  >
+    APNs is described as a best-effort service that may reorder notifications sent to the same device token. If it
+    can't deliver a notification immediately, it may store it for up to 30 days, depending on the expiration you set,
+    but it stores only one notification per app (bundle ID), usually the latest. Payloads are limited to 4 KB, and an
+    `apns-collapse-id` of up to 64 bytes merges repeated notifications into one.
+  </Seen>
+  <Seen
+    company="Google"
+    system="Firebase Cloud Messaging"
+    year="Docs"
+    href="https://firebase.google.com/docs/cloud-messaging/customize-messages/collapsible-message-types"
+    source="Collapsible and non-collapsible messages (Firebase documentation)"
+    found="Messages that supersede each other share a collapse key, so an offline device receives only the newest."
+  >
+    A collapsible message may be replaced by a newer message if it hasn't been delivered yet, while each non-collapsible
+    message is delivered individually. FCM can store four different collapsible messages per device, each with a
+    different collapse key. Delivery order isn't guaranteed, and the maximum payload is 4,096 bytes.
+  </Seen>
+</SeenInProduction>
+
+<Quiz
+  question="A worker claims (notification 81, push), sends the push, then crashes before marking it sent. The event is redelivered. What happens with Snip's design?"
+  options={[
+    { text: "The push is sent again", why: "The claim row already exists, so the redelivered event's insert does nothing and it's treated as a duplicate." },
+    { text: "Nothing is sent again; the row stays in 'sending' until a sweeper decides, by urgency, whether to retry", correct: true, why: "The claim prevents duplicates. A crash after claiming means the platform can't know if the send happened, so it chooses: retry urgent ones, drop stale bulk ones." },
+    { text: "The provider deduplicates it", why: "Push providers don't guarantee that; the platform has to." },
+  ]}
+/>
+
+<Mistakes>
+  <ul>
+    <li>**One queue for login codes and campaigns.** Separate lanes, separate workers.</li>
+    <li>**Quiet hours in server time.** Use each user's time zone.</li>
+    <li>**Recording after sending.** Claim first, so redelivered events are recognised.</li>
+    <li>**Assuming push is delivered.** It's best-effort; keep an in-app copy of what matters.</li>
+  </ul>
+</Mistakes>
+
+## Recap
+
+<Recap>
+  <ul>
+    <li>One platform: callers say what happened; it decides whether, how and when to notify.</li>
+    <li>A decider applies preferences, quiet hours, caps and digests; urgent and bulk use separate lanes.</li>
+    <li>A delivery row per notification and channel, claimed before sending, prevents duplicates.</li>
+    <li>Providers are best-effort and rate limited: pace sends, clean tokens, fail over, and keep an in-app inbox.</li>
+  </ul>
+</Recap>
+
+## Interview questions
+
+<InterviewCard
+  q={{ q: "Design a notification system that supports push, email and SMS.", level: "Mid", frequency: 3, importance: "Must-know", kind: "Design" }}
+  followUps={["How do you keep a marketing campaign from delaying password resets?", "How do you avoid sending duplicates?", "How do you handle a provider outage?"]}
+>
+  <p>Services call one API with a notification type, recipients, data and an idempotency key; it returns quickly and the work happens in queues. Segments are expanded in batches. A decider checks each user's preferences per type and channel, quiet hours in their time zone and frequency caps, renders templates and picks devices. Urgent types like login codes go to a separate lane from bulk, with separate queues and workers per channel, so campaigns and slow providers can't delay them.</p>
+  <p>Senders claim a delivery row keyed by notification and channel before sending, so redelivered events are skipped, and a sweeper resolves rows left mid-send, retrying urgent ones. Senders pace themselves to provider limits, retry with backoff, remove invalid device tokens, and fail over to a second SMS or email provider behind a circuit breaker. Delivery results are logged by day and expired after a retention period.</p>
+</InterviewCard>
